@@ -1,0 +1,1345 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# dependencies = [
+#   "textual>=0.89.0",
+# ]
+# ///
+"""ThreadHop — cross-session context manager for Claude Code"""
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from rich.console import Group
+from rich.markdown import Markdown
+from rich.markup import escape
+from rich.text import Text
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Vertical, VerticalScroll
+from textual.widgets import Footer, Header, ListItem, ListView, Static, TextArea
+from textual.worker import Worker
+
+
+def get_available_themes():
+    """Get themes dynamically from Textual"""
+    try:
+        from textual.theme import BUILTIN_THEMES
+
+        return list(BUILTIN_THEMES.keys())
+    except:
+        return ["textual-dark", "textual-light"]
+
+
+def load_config():
+    try:
+        if CONFIG_FILE.exists():
+            return json.loads(CONFIG_FILE.read_text())
+    except:
+        pass
+    return {"theme": "textual-dark", "session_names": {}, "session_order": []}
+
+
+def save_config(config):
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        CONFIG_FILE.write_text(json.dumps(config, indent=2))
+    except:
+        pass
+
+
+# --- Configuration ---
+DISPLAY_NAME_WIDTH = 22
+MAX_SESSIONS = 50
+REFRESH_INTERVAL = 5
+SPINNER_INTERVAL = 0.25
+
+# --- Paths ---
+CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
+CONFIG_DIR = Path.home() / ".config" / "threadhop"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+# --- Internal constants ---
+SPINNER_FRAMES = ["◐", "◓", "◑", "◒"]
+
+# Regex to strip <system-reminder>...</system-reminder> blocks from text
+SYSTEM_REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
+
+
+def format_age(timestamp: float) -> str:
+    """Format a timestamp as a human-readable age string."""
+    age = datetime.now().timestamp() - timestamp
+    if age < 60:
+        return f"{int(age)}s"
+    elif age < 3600:
+        return f"{int(age / 60)}m"
+    elif age < 86400:
+        return f"{int(age / 3600)}h"
+    else:
+        return f"{int(age / 86400)}d"
+
+
+class SessionItem(ListItem):
+    """A session in the list"""
+
+    def __init__(
+        self,
+        session_data: dict,
+        custom_name: str | None = None,
+        is_unread: bool = False,
+        spinner_frame: int = 0,
+    ):
+        self.session_data = session_data
+        self.custom_name = custom_name
+        self.is_unread = is_unread
+        self.spinner_frame = spinner_frame
+        super().__init__()
+
+    def compose(self) -> ComposeResult:
+        age_str = format_age(self.session_data["modified"])
+        project = self.session_data["project"]
+        is_working = self.session_data.get("is_working", False)
+        is_active = self.session_data.get("is_active", False)
+
+        if is_working:
+            status = SPINNER_FRAMES[self.spinner_frame % len(SPINNER_FRAMES)]
+        elif is_active:
+            status = "●"
+        else:
+            status = "○"
+
+        # Priority: custom name (from our config) > session title (from JSONL) > project path
+        title = self.session_data.get("title", "")
+        if self.custom_name:
+            display = self.custom_name
+        elif title:
+            display = title
+        else:
+            display = project
+        display = f"{display[:DISPLAY_NAME_WIDTH]:<{DISPLAY_NAME_WIDTH}}"
+
+        label = Static(f"{status} {display} {age_str:>4}", classes="session-label")
+        if self.is_unread:
+            label.add_class("unread")
+        if is_working:
+            label.add_class("working")
+        elif is_active:
+            label.add_class("active")
+        yield label
+
+    def update_spinner(self, frame: int) -> None:
+        """Update spinner animation frame"""
+        if not self.session_data.get("is_working"):
+            return
+        self.spinner_frame = frame
+        status = SPINNER_FRAMES[frame % len(SPINNER_FRAMES)]
+        age_str = format_age(self.session_data["modified"])
+
+        title = self.session_data.get("title", "")
+        if self.custom_name:
+            display = self.custom_name
+        elif title:
+            display = title
+        else:
+            display = self.session_data["project"]
+        display = f"{display[:DISPLAY_NAME_WIDTH]:<{DISPLAY_NAME_WIDTH}}"
+
+        try:
+            label = self.query_one(".session-label", Static)
+            label.update(f"{status} {display} {age_str:>4}")
+        except:
+            pass
+
+
+
+class UserMessage(Static):
+    """A user message in the transcript"""
+    pass
+
+
+class AssistantMessage(Static):
+    """An assistant message in the transcript"""
+    pass
+
+
+class ToolMessage(Static):
+    """A tool call/result in the transcript"""
+    pass
+
+
+class TranscriptView(VerticalScroll):
+    """Shows full conversation from selected session"""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.current_path = None
+        self._last_mtime = 0
+
+    async def load_transcript(self, session_path: Path, force: bool = False):
+        """Load and display full conversation from transcript"""
+        if not session_path or not session_path.exists():
+            await self._clear_and_show("No transcript available")
+            return
+
+        try:
+            mtime = session_path.stat().st_mtime
+            if (
+                not force
+                and session_path == self.current_path
+                and mtime == self._last_mtime
+            ):
+                return
+            self._last_mtime = mtime
+        except:
+            pass
+
+        self.current_path = session_path
+
+        messages = self._parse_messages(session_path)
+
+        # Remove all existing message widgets (await ensures completion)
+        await self._remove_all_messages()
+
+        if not messages:
+            await self.mount(AssistantMessage("No messages yet"))
+            return
+
+        # Build widgets with visual boundaries
+        widgets = []
+        tool_batch = []
+
+        def flush_tools():
+            if not tool_batch:
+                return
+            lines = Text()
+            for j, (tr, tc) in enumerate(tool_batch):
+                if tr == "tool":
+                    lines.append("⚙ ", style="dim yellow")
+                    lines.append(str(tc) if tc else "", style="dim")
+                else:
+                    lines.append("  ↳ ", style="dim green")
+                    lines.append(str(tc) if tc else "", style="dim green")
+                if j < len(tool_batch) - 1:
+                    lines.append("\n")
+            widgets.append(ToolMessage(lines))
+            tool_batch.clear()
+
+        for role, content in messages:
+            if role in ("tool", "tool_result"):
+                tool_batch.append((role, content))
+                continue
+
+            flush_tools()
+
+            if role == "user":
+                user_text = Text()
+                user_text.append("You\n", style="bold cyan")
+                user_text.append(str(content) if content else "")
+                widgets.append(UserMessage(user_text))
+            else:
+                header = Text()
+                header.append("Claude\n", style="bold green")
+                renderables = [header]
+                if content:
+                    try:
+                        renderables.append(Markdown(str(content)))
+                    except:
+                        renderables.append(Text(str(content)))
+                widgets.append(AssistantMessage(Group(*renderables)))
+
+        flush_tools()
+
+        # Await mount to ensure all widgets are in the DOM before scrolling
+        await self.mount_all(widgets)
+        self.scroll_end(animate=False)
+
+    async def _remove_all_messages(self):
+        """Remove all message widgets, awaiting completion"""
+        existing = list(self.children)
+        if existing:
+            await self.remove_children()
+
+    async def _clear_and_show(self, text: str):
+        await self._remove_all_messages()
+        await self.mount(AssistantMessage(text))
+
+    def _parse_messages(self, session_path: Path) -> list[tuple[str, str]]:
+        """Parse JSONL file and extract displayable messages"""
+        messages = []
+        try:
+            with open(session_path) as f:
+                for line in f:
+                    try:
+                        msg = json.loads(line)
+                        msg_type = msg.get("type")
+
+                        # Only process user and assistant messages
+                        if msg_type not in ("user", "assistant"):
+                            continue
+
+                        if msg_type == "user":
+                            tool_result = msg.get("toolUseResult")
+                            if tool_result and isinstance(tool_result, dict):
+                                result_info = self._format_tool_result(tool_result)
+                                if result_info:
+                                    messages.append(("tool_result", result_info))
+                            elif "toolUseResult" not in msg:
+                                content = msg.get("message", {}).get("content", "")
+                                if isinstance(content, list):
+                                    text_parts = [
+                                        b.get("text", "")
+                                        for b in content
+                                        if b.get("type") == "text"
+                                    ]
+                                    content = " ".join(text_parts)
+                                if content and isinstance(content, str):
+                                    # Strip system-reminder tags
+                                    content = SYSTEM_REMINDER_RE.sub("", content).strip()
+                                    if content:
+                                        messages.append(("user", content))
+
+                        elif msg_type == "assistant":
+                            content = msg.get("message", {}).get("content", [])
+                            if isinstance(content, list):
+                                text_parts = []
+                                for block in content:
+                                    if block.get("type") == "text":
+                                        text = block.get("text", "")
+                                        # Strip system-reminder tags
+                                        text = SYSTEM_REMINDER_RE.sub("", text).strip()
+                                        if text:
+                                            text_parts.append(text)
+                                    elif block.get("type") == "tool_use":
+                                        tool_name = block.get("name", "Unknown")
+                                        tool_input = block.get("input", {})
+                                        tool_desc = self._format_tool_use(
+                                            tool_name, tool_input
+                                        )
+                                        messages.append(("tool", tool_desc))
+                                if text_parts:
+                                    messages.append(
+                                        ("assistant", " ".join(text_parts))
+                                    )
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+        except Exception:
+            pass
+        return messages
+
+    def _format_tool_use(self, tool_name: str, tool_input: dict) -> str:
+        """Format tool use for display"""
+        if tool_name == "Read":
+            path = tool_input.get("file_path", "")
+            return f"Reading {Path(path).name}" if path else "Reading file"
+        elif tool_name == "Write":
+            path = tool_input.get("file_path", "")
+            return f"Writing {Path(path).name}" if path else "Writing file"
+        elif tool_name == "Edit":
+            path = tool_input.get("file_path", "")
+            return f"Editing {Path(path).name}" if path else "Editing file"
+        elif tool_name == "Bash":
+            cmd = tool_input.get("command", "")
+            short_cmd = cmd.split()[0] if cmd else "command"
+            return f"Running {short_cmd}"
+        elif tool_name == "Glob":
+            pattern = tool_input.get("pattern", "")
+            return f"Searching for {pattern}" if pattern else "Searching files"
+        elif tool_name == "Grep":
+            pattern = tool_input.get("pattern", "")
+            return f"Searching for '{pattern}'" if pattern else "Searching content"
+        elif tool_name == "Agent":
+            desc = tool_input.get("description", "")
+            return f"Agent: {desc}" if desc else "Running agent"
+        elif tool_name == "WebFetch":
+            url = tool_input.get("url", "")
+            return f"Fetching {url[:50]}..." if len(url) > 50 else f"Fetching {url}"
+        elif tool_name == "WebSearch":
+            query = tool_input.get("query", "")
+            return f"Searching web for '{query}'"
+        elif tool_name == "TodoWrite":
+            return "Updating todo list"
+        else:
+            return f"{tool_name}"
+
+    def _format_tool_result(self, result: dict) -> str | None:
+        """Format tool result for display"""
+        if isinstance(result, str):
+            if "Error" in result:
+                return f"Error: {result[:80]}..."
+            return None
+
+        if "numFiles" in result:
+            num = result.get("numFiles", 0)
+            return f"Found {num} file{'s' if num != 1 else ''}"
+
+        if "additions" in result or "deletions" in result:
+            add = result.get("additions", 0)
+            delete = result.get("deletions", 0)
+            return f"+{add}/-{delete} lines"
+
+        if "numLines" in result:
+            return f"{result['numLines']} lines"
+
+        if "numMatches" in result:
+            return f"{result['numMatches']} matches"
+
+        if "status" in result:
+            status = result.get("status", "")
+            if status == "completed":
+                return "Completed"
+            return status
+
+        return None
+
+
+class ClaudeSessions(App):
+    """Cross-session context manager for Claude Code"""
+
+    TITLE = "ThreadHop"
+    ENABLE_COMMAND_PALETTE = False
+
+    CSS = """
+    Screen {
+        layout: grid;
+        grid-size: 2 2;
+        grid-columns: 36 1fr;
+        grid-rows: 1fr auto;
+        grid-gutter: 0;
+    }
+
+    #session-list {
+        height: 100%;
+        border: solid $primary;
+        border-title-color: $text;
+    }
+
+    #transcript-scroll {
+        height: 100%;
+        border: solid $secondary;
+        border-title-color: $text;
+    }
+
+    #input-container {
+        column-span: 2;
+        border: solid $accent;
+        height: auto;
+        min-height: 3;
+        max-height: 10;
+    }
+
+    #reply-input {
+        background: $surface;
+        height: auto;
+        min-height: 1;
+        max-height: 8;
+    }
+
+    #reply-input:focus {
+        background: $boost;
+    }
+
+    UserMessage {
+        padding: 1 1;
+        margin: 1 0 0 0;
+        background: $primary-background 15%;
+        border-left: thick $accent;
+    }
+
+    AssistantMessage {
+        padding: 1 1;
+        margin: 1 0 0 0;
+        border-left: thick $success;
+    }
+
+    ToolMessage {
+        padding: 0 1 0 3;
+    }
+
+    .session-label {
+        padding: 0 1;
+    }
+
+    .session-label.unread {
+        color: $warning;
+        text-style: bold;
+    }
+
+    .session-label.active {
+        color: $accent;
+    }
+
+    .session-label.working {
+        color: $success;
+    }
+
+    ListView > ListItem.--highlight {
+        background: $boost;
+    }
+
+    ListView:focus > ListItem.--highlight {
+        background: $accent;
+    }
+
+    ToastRack {
+        margin-bottom: 2;
+    }
+    """
+
+    BINDINGS = [
+        Binding("q", "maybe_quit", "Quit"),
+        Binding("r", "maybe_refresh", "Refresh"),
+        Binding("t", "toggle_theme_next", "Theme"),
+        Binding("T", "toggle_theme_prev", "Theme Prev", show=False),
+        Binding("n", "rename_session", "Rename"),
+        Binding("g", "copy_session_id", "Copy ID"),
+        Binding("enter", "start_reply_or_send", "Reply/Send", show=True, priority=True),
+        Binding("alt+enter", "insert_newline", "Newline", show=False),
+        Binding("/", "start_reply", "Reply", show=False),
+        Binding("escape", "cancel_reply", "Cancel", show=False),
+        Binding("right", "focus_transcript", "Transcript", show=False),
+        Binding("left", "focus_list", "Sessions", show=False),
+        Binding("l", "focus_transcript", "Transcript", show=False),
+        Binding("h", "focus_list", "Sessions", show=False),
+        Binding("j", "cursor_down", "Down", show=False),
+        Binding("k", "cursor_up", "Up", show=False),
+        Binding("J", "move_session_down", "Move Down", show=False),
+        Binding("K", "move_session_up", "Move Up", show=False),
+        Binding("shift+down", "move_session_down", "Move Down", show=False),
+        Binding("shift+up", "move_session_up", "Move Up", show=False),
+        Binding("alt+j", "nav_down_from_reply", "Nav Down", show=False),
+        Binding("alt+k", "nav_up_from_reply", "Nav Up", show=False),
+        Binding("pageup", "scroll_transcript_up", "PgUp", show=False, priority=True),
+        Binding(
+            "pagedown", "scroll_transcript_down", "PgDn", show=False, priority=True
+        ),
+        Binding("home", "scroll_transcript_home", "Top", show=False, priority=True),
+        Binding("end", "scroll_transcript_end", "Bottom", show=False, priority=True),
+    ]
+
+    def __init__(self, project_filter: str | None = None, days: int = 10):
+        super().__init__()
+        self.project_filter = project_filter
+        self.days_filter = days
+        self.sessions = []
+        self._selected_session_id = None
+        self._spinner_frame = 0
+        self._renaming_session_id = None
+        self.config = load_config()
+        if "session_names" not in self.config:
+            self.config["session_names"] = {}
+        if "session_order" not in self.config:
+            self.config["session_order"] = []
+        saved_theme = self.config.get("theme", "textual-dark")
+        themes = get_available_themes()
+        if saved_theme in themes:
+            self.theme = saved_theme
+
+    def notify(self, message, **kwargs):
+        if str(message).strip().lower() == "ok":
+            return
+        super().notify(message, **kwargs)
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield ListView(id="session-list")
+        yield TranscriptView(id="transcript-scroll")
+        yield Vertical(TextArea(id="reply-input"), id="input-container")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.update_titles()
+        self.load_sessions()
+        self.query_one("#session-list", ListView).focus()
+        self.set_interval(REFRESH_INTERVAL, self.auto_refresh_background)
+        self._spinner_frame = 0
+        self.set_interval(SPINNER_INTERVAL, self.animate_spinners)
+
+    def update_titles(self) -> None:
+        filter_info = ""
+        if self.project_filter:
+            # Show just the last part of the project dir name for readability
+            short_name = self.project_filter.rsplit("-", 1)[-1]
+            filter_info += f" [{short_name}]"
+        else:
+            filter_info += " [all]"
+        filter_info += f" ({self.days_filter}d)"
+        self.query_one("#session-list").border_title = (
+            f"Sessions{filter_info} [J/K]reorder"
+        )
+        self.query_one("#transcript-scroll").border_title = "Transcript"
+        self.query_one("#input-container").border_title = (
+            "Reply (Enter=send, Alt+Enter=newline, Alt+J/K=nav, Esc=cancel)"
+        )
+
+    def animate_spinners(self) -> None:
+        self._spinner_frame = (self._spinner_frame + 1) % len(SPINNER_FRAMES)
+        list_view = self.query_one("#session-list", ListView)
+        for item in list_view.children:
+            if isinstance(item, SessionItem):
+                item.update_spinner(self._spinner_frame)
+
+    def auto_refresh_background(self) -> None:
+        self.run_worker(
+            self._gather_session_data, exclusive=True, group="refresh", thread=True
+        )
+
+    def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
+        if (
+            event.worker.group == "refresh"
+            and event.worker.is_finished
+            and not event.worker.is_cancelled
+        ):
+            if event.worker.result:
+                self._apply_session_data(event.worker.result)
+
+    def _get_active_claude_sessions(self) -> set[str]:
+        """Detect which session IDs have a running claude process on macOS/Linux.
+
+        Returns a set of active session IDs by scanning running claude processes.
+        For `claude -r <id>`, we get the ID directly from args.
+        For `claude -r` (no ID) or `claude -c`, we match by CWD to find the
+        most recent session in that project.
+        """
+        active_ids = set()
+        cwd_pids = {}  # pid -> cwd for processes without explicit session IDs
+
+        try:
+            # Get all claude CLI processes (not Claude.app, not Windsurf extension)
+            result = subprocess.run(
+                ["ps", "-eo", "pid,args"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in result.stdout.strip().split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(None, 1)
+                if len(parts) < 2:
+                    continue
+                pid_str, args = parts
+                # Only match CLI claude, not Claude.app or IDE extensions
+                if "/Claude.app/" in args or "/native-binary/" in args:
+                    continue
+                # Match: "claude -r <id>" or "claude --resume <id>"
+                if "claude" not in args:
+                    continue
+                # Check if it's an interactive session (has -r/--resume or -c/--continue)
+                arg_parts = args.split()
+                is_interactive = False
+                explicit_id = None
+                for i, a in enumerate(arg_parts):
+                    if a in ("-r", "--resume") and "-p" not in arg_parts:
+                        is_interactive = True
+                        # Check if next arg is a session ID (UUID format)
+                        if i + 1 < len(arg_parts):
+                            candidate = arg_parts[i + 1]
+                            if len(candidate) == 36 and candidate.count("-") == 4:
+                                explicit_id = candidate
+                    elif a in ("-c", "--continue") and "-p" not in arg_parts:
+                        is_interactive = True
+
+                if not is_interactive:
+                    # Also detect bare "claude" (new interactive session)
+                    if arg_parts[-1] == "claude" or (
+                        len(arg_parts) >= 1 and arg_parts[0].endswith("/claude")
+                        and "-p" not in arg_parts and "--print" not in arg_parts
+                    ):
+                        is_interactive = True
+
+                if not is_interactive:
+                    continue
+
+                if explicit_id:
+                    active_ids.add(explicit_id)
+                else:
+                    try:
+                        cwd_pids[int(pid_str)] = None
+                    except ValueError:
+                        pass
+
+            # For processes without explicit IDs, get their CWD via lsof
+            if cwd_pids:
+                pid_list = ",".join(str(p) for p in cwd_pids)
+                result = subprocess.run(
+                    ["lsof", "-a", "-d", "cwd", "-p", pid_list, "-Fn"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                current_pid = None
+                for line in result.stdout.strip().split("\n"):
+                    if line.startswith("p"):
+                        current_pid = int(line[1:])
+                    elif line.startswith("n") and current_pid:
+                        cwd_pids[current_pid] = line[1:]
+
+                # Match CWD to most recent session in that project
+                for pid, cwd in cwd_pids.items():
+                    if not cwd:
+                        continue
+                    project_dir_name = cwd.replace("/", "-")
+                    project_path = CLAUDE_PROJECTS / project_dir_name
+                    if project_path.is_dir():
+                        # Find most recently modified JSONL
+                        best = None
+                        best_mtime = 0
+                        for jf in project_path.glob("*.jsonl"):
+                            if jf.name.startswith("agent-"):
+                                continue
+                            mt = jf.stat().st_mtime
+                            if mt > best_mtime:
+                                best_mtime = mt
+                                best = jf.stem
+                        if best:
+                            active_ids.add(best)
+        except Exception:
+            pass
+
+        return active_ids
+
+    def _gather_session_data(self) -> dict:
+        """Gather session data from JSONL files"""
+        sessions = []
+        cutoff = (
+            datetime.now() - timedelta(days=self.days_filter)
+        ).timestamp()
+        active_session_ids = self._get_active_claude_sessions()
+
+        try:
+            for project_dir in CLAUDE_PROJECTS.iterdir():
+                if not project_dir.is_dir():
+                    continue
+                project_name = project_dir.name
+
+                # Project filter: substring match on directory name
+                if self.project_filter:
+                    if self.project_filter.lower() not in project_name.lower():
+                        continue
+
+                for jsonl in project_dir.glob("*.jsonl"):
+                    if jsonl.name.startswith("agent-"):
+                        continue
+                    stat = jsonl.stat()
+
+                    # Days filter: skip files older than cutoff
+                    if stat.st_mtime < cutoff:
+                        continue
+
+                    custom_title = None
+                    ai_title = None
+                    first_user_msg = None
+                    session_cwd = None
+                    is_working = False
+                    last_msg_type = None
+                    has_pending_tool = False
+
+                    try:
+                        with open(jsonl) as f:
+                            for line in f:
+                                try:
+                                    msg = json.loads(line)
+                                    msg_type = msg.get("type")
+                                    if msg_type == "custom-title":
+                                        custom_title = msg.get("customTitle", "")
+                                    elif msg_type == "ai-title":
+                                        ai_title = msg.get("aiTitle", "")
+                                    elif msg_type == "user" and not first_user_msg:
+                                        if "toolUseResult" not in msg:
+                                            content = msg.get("message", {}).get(
+                                                "content", ""
+                                            )
+                                            if isinstance(content, str) and content.strip():
+                                                first_user_msg = content.strip()[:50]
+                                            elif isinstance(content, list):
+                                                text_parts = [
+                                                    b.get("text", "")
+                                                    for b in content
+                                                    if isinstance(b, dict)
+                                                    and b.get("type") == "text"
+                                                ]
+                                                text = " ".join(text_parts).strip()
+                                                text = SYSTEM_REMINDER_RE.sub("", text).strip()
+                                                if text:
+                                                    first_user_msg = text[:50]
+                                    if "cwd" in msg and not session_cwd:
+                                        session_cwd = msg.get("cwd")
+                                    if msg_type == "assistant":
+                                        content = msg.get("message", {}).get(
+                                            "content", []
+                                        )
+                                        has_pending_tool = any(
+                                            b.get("type") == "tool_use"
+                                            for b in content
+                                            if isinstance(b, dict)
+                                        )
+                                        last_msg_type = "assistant"
+                                    elif msg_type == "user":
+                                        if msg.get("toolUseResult"):
+                                            has_pending_tool = False
+                                            last_msg_type = "tool_result"
+                                        else:
+                                            last_msg_type = "user"
+                                except:
+                                    pass
+                        # Session is "active" if a claude process is running for it
+                        session_id = jsonl.stem
+                        has_process = session_id in active_session_ids
+                        # "Working" = active process AND currently processing
+                        recently_modified = (
+                            datetime.now().timestamp() - stat.st_mtime < 300
+                        )
+                        is_working = has_process and recently_modified and (
+                            (has_pending_tool and last_msg_type == "assistant")
+                            or last_msg_type == "user"
+                        )
+                    except:
+                        pass
+
+                    # Title priority: custom > ai > first message
+                    session_title = custom_title or ai_title or first_user_msg
+                    if session_cwd:
+                        project_name = session_cwd.replace(str(Path.home()), "~")
+
+                    sessions.append(
+                        {
+                            "path": str(jsonl),
+                            "project": project_name,
+                            "cwd": session_cwd,
+                            "session_id": jsonl.stem,
+                            "modified": stat.st_mtime,
+                            "title": session_title,
+                            "first_user_msg": first_user_msg,
+                            "is_active": has_process,
+                            "is_working": is_working,
+                        }
+                    )
+        except:
+            pass
+
+        return {"sessions": sessions}
+
+    def _apply_session_data(self, data: dict, force_rebuild: bool = False) -> None:
+        self.sessions = data["sessions"]
+
+        for s in self.sessions:
+            s["path"] = Path(s["path"])
+
+        self._apply_stable_ordering()
+        self._update_session_list(force_rebuild)
+        self.refresh_transcript()
+
+    def _apply_stable_ordering(self) -> None:
+        if "session_order" not in self.config:
+            self.config["session_order"] = []
+
+        saved_order = self.config["session_order"]
+        session_map = {s["session_id"]: s for s in self.sessions}
+        current_ids = set(session_map.keys())
+        saved_ids = set(saved_order)
+
+        new_ids = current_ids - saved_ids
+        new_sessions = [session_map[sid] for sid in new_ids]
+        new_sessions.sort(key=lambda x: x["modified"], reverse=True)
+        new_order = [s["session_id"] for s in new_sessions]
+
+        existing_order = [sid for sid in saved_order if sid in current_ids]
+        final_order = new_order + existing_order
+
+        if final_order != saved_order:
+            self.config["session_order"] = final_order
+            save_config(self.config)
+
+        order_index = {sid: i for i, sid in enumerate(final_order)}
+        self.sessions.sort(key=lambda x: order_index.get(x["session_id"], 999999))
+
+    def _update_session_list(self, force_rebuild: bool = False) -> None:
+        display_sessions = self.sessions[:MAX_SESSIONS]
+
+        list_view = self.query_one("#session-list", ListView)
+        current_ids = [
+            item.session_data.get("session_id")
+            for item in list_view.children
+            if isinstance(item, SessionItem)
+        ]
+        new_ids = [s.get("session_id") for s in display_sessions]
+
+        if force_rebuild or current_ids != new_ids:
+            current_session_id = self._selected_session_id
+            if (
+                not current_session_id
+                and list_view.highlighted_child
+                and isinstance(list_view.highlighted_child, SessionItem)
+            ):
+                current_session_id = list_view.highlighted_child.session_data.get(
+                    "session_id"
+                )
+
+            list_view.clear()
+            new_index = 0
+            for i, session in enumerate(display_sessions):
+                session_id = session.get("session_id", "")
+                custom_name = self.config.get("session_names", {}).get(session_id)
+                last_viewed = self.config.get("last_viewed", {}).get(session_id, 0)
+                is_unread = session["modified"] > last_viewed
+                list_view.append(
+                    SessionItem(session, custom_name, is_unread, self._spinner_frame)
+                )
+                if session_id == current_session_id:
+                    new_index = i
+
+            if display_sessions:
+                target_index = min(new_index, len(display_sessions) - 1)
+
+                def restore_highlight():
+                    list_view.index = target_index
+
+                self.call_after_refresh(restore_highlight)
+        else:
+            session_map = {s.get("session_id"): s for s in display_sessions}
+            for item in list_view.children:
+                if isinstance(item, SessionItem):
+                    sid = item.session_data.get("session_id")
+                    if sid in session_map:
+                        new_is_working = session_map[sid].get("is_working", False)
+                        old_is_working = item.session_data.get("is_working", False)
+                        if new_is_working != old_is_working:
+                            item.session_data["is_working"] = new_is_working
+                            try:
+                                label = item.query_one(".session-label", Static)
+                                if new_is_working:
+                                    label.add_class("working")
+                                    item.update_spinner(self._spinner_frame)
+                                else:
+                                    label.remove_class("working")
+                                    session = item.session_data
+                                    status = "●" if session.get("is_active") else "○"
+                                    age_str = format_age(session["modified"])
+                                    title = session.get("title", "")
+                                    if item.custom_name:
+                                        display = item.custom_name
+                                    elif title:
+                                        display = title
+                                    else:
+                                        display = session["project"]
+                                    display = f"{display[:DISPLAY_NAME_WIDTH]:<{DISPLAY_NAME_WIDTH}}"
+                                    label.update(
+                                        f"{status} {display} {age_str:>4}"
+                                    )
+                            except:
+                                pass
+
+    def refresh_transcript(self) -> None:
+        list_view = self.query_one("#session-list", ListView)
+        if list_view.highlighted_child and isinstance(
+            list_view.highlighted_child, SessionItem
+        ):
+            transcript = self.query_one("#transcript-scroll", TranscriptView)
+            # Schedule the async load
+            self.call_later(
+                transcript.load_transcript,
+                list_view.highlighted_child.session_data["path"],
+            )
+
+    def load_sessions(self, force_rebuild: bool = False) -> None:
+        data = self._gather_session_data()
+        self._apply_session_data(data, force_rebuild)
+
+    async def on_list_view_selected(self, event: ListView.Selected) -> None:
+        if isinstance(event.item, SessionItem):
+            transcript = self.query_one("#transcript-scroll", TranscriptView)
+            await transcript.load_transcript(event.item.session_data["path"])
+
+    async def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
+        if isinstance(event.item, SessionItem):
+            session_id = event.item.session_data.get("session_id")
+            self._selected_session_id = session_id
+            transcript = self.query_one("#transcript-scroll", TranscriptView)
+            await transcript.load_transcript(event.item.session_data["path"])
+
+            if "last_viewed" not in self.config:
+                self.config["last_viewed"] = {}
+            self.config["last_viewed"][session_id] = datetime.now().timestamp()
+            save_config(self.config)
+
+            if event.item.is_unread:
+                event.item.is_unread = False
+                label = event.item.query_one(".session-label", Static)
+                label.remove_class("unread")
+
+    def action_refresh(self) -> None:
+        self.load_sessions()
+        self.notify("Refreshed session list")
+
+    def action_toggle_theme_next(self) -> None:
+        if not self._input_has_focus():
+            self._cycle_theme(1)
+
+    def action_toggle_theme_prev(self) -> None:
+        if not self._input_has_focus():
+            self._cycle_theme(-1)
+
+    def _cycle_theme(self, direction: int) -> None:
+        themes = get_available_themes()
+        try:
+            current_idx = themes.index(self.theme)
+            next_idx = (current_idx + direction) % len(themes)
+        except ValueError:
+            next_idx = 0
+        self.theme = themes[next_idx]
+        self.config["theme"] = self.theme
+        save_config(self.config)
+        self.notify(f"Theme: {self.theme}")
+
+    def action_rename_session(self) -> None:
+        if self._input_has_focus():
+            return
+        list_view = self.query_one("#session-list", ListView)
+        if not list_view.highlighted_child or not isinstance(
+            list_view.highlighted_child, SessionItem
+        ):
+            return
+
+        session = list_view.highlighted_child.session_data
+        session_id = session.get("session_id", "")
+        current_name = self.config.get("session_names", {}).get(session_id, "")
+
+        text_area = self.query_one("#reply-input", TextArea)
+        text_area.clear()
+        text_area.insert(current_name)
+        text_area.focus()
+        self.notify(f"Renaming session (current: {current_name or 'auto'})")
+        self._renaming_session_id = session_id
+
+    def action_copy_session_id(self) -> None:
+        """Copy 'claude -r <session_id>' to clipboard"""
+        list_view = self.query_one("#session-list", ListView)
+        if not list_view.highlighted_child or not isinstance(
+            list_view.highlighted_child, SessionItem
+        ):
+            return
+        session_id = list_view.highlighted_child.session_data.get("session_id", "")
+        cmd = f"claude -r {session_id}"
+        try:
+            if sys.platform == "darwin":
+                subprocess.run(["pbcopy"], input=cmd.encode(), check=True)
+            else:
+                subprocess.run(
+                    ["xclip", "-selection", "clipboard"],
+                    input=cmd.encode(),
+                    check=True,
+                )
+            self.notify(f"Copied: {cmd}")
+        except Exception:
+            # Fallback: just show the command
+            self.notify(f"Resume: {cmd}", timeout=10)
+
+    def _input_has_focus(self) -> bool:
+        return self.query_one("#reply-input", TextArea).has_focus
+
+    def action_maybe_quit(self) -> None:
+        if not self._input_has_focus():
+            self.exit()
+
+    def action_maybe_refresh(self) -> None:
+        if not self._input_has_focus():
+            self.load_sessions()
+            self.notify("Refreshed session list")
+
+    def action_start_reply(self) -> None:
+        """Focus the reply input"""
+        text_area = self.query_one("#reply-input", TextArea)
+        if not text_area.has_focus:
+            list_view = self.query_one("#session-list", ListView)
+            if list_view.highlighted_child and isinstance(
+                list_view.highlighted_child, SessionItem
+            ):
+                self._selected_session_id = (
+                    list_view.highlighted_child.session_data.get("session_id")
+                )
+            text_area.focus()
+
+    def action_start_reply_or_send(self) -> None:
+        """If in list/transcript, go to reply. If in reply, send message."""
+        text_area = self.query_one("#reply-input", TextArea)
+        if text_area.has_focus:
+            self._submit_reply()
+        else:
+            list_view = self.query_one("#session-list", ListView)
+            if list_view.highlighted_child and isinstance(
+                list_view.highlighted_child, SessionItem
+            ):
+                self._selected_session_id = (
+                    list_view.highlighted_child.session_data.get("session_id")
+                )
+            text_area.focus()
+
+    def action_insert_newline(self) -> None:
+        text_area = self.query_one("#reply-input", TextArea)
+        if text_area.has_focus:
+            text_area.insert("\n")
+
+    def action_cancel_reply(self) -> None:
+        text_area = self.query_one("#reply-input", TextArea)
+        text_area.clear()
+        self._renaming_session_id = None
+        self.query_one("#session-list", ListView).focus()
+
+    def action_nav_down_from_reply(self) -> None:
+        list_view = self.query_one("#session-list", ListView)
+        list_view.action_cursor_down()
+        if list_view.highlighted_child and isinstance(
+            list_view.highlighted_child, SessionItem
+        ):
+            self._selected_session_id = list_view.highlighted_child.session_data.get(
+                "session_id"
+            )
+
+    def action_nav_up_from_reply(self) -> None:
+        list_view = self.query_one("#session-list", ListView)
+        list_view.action_cursor_up()
+        if list_view.highlighted_child and isinstance(
+            list_view.highlighted_child, SessionItem
+        ):
+            self._selected_session_id = list_view.highlighted_child.session_data.get(
+                "session_id"
+            )
+
+    def _submit_reply(self) -> None:
+        """Send message to selected session via claude CLI"""
+        text_area = self.query_one("#reply-input", TextArea)
+        input_text = text_area.text.strip()
+
+        # Check if we're in rename mode
+        if self._renaming_session_id:
+            session_id = self._renaming_session_id
+            self._renaming_session_id = None
+            if input_text:
+                self.config["session_names"][session_id] = input_text
+            else:
+                self.config["session_names"].pop(session_id, None)
+            save_config(self.config)
+            text_area.clear()
+            self.query_one("#session-list", ListView).focus()
+            self.load_sessions(force_rebuild=True)
+            self.notify(
+                f"Renamed to: {input_text}" if input_text else "Name cleared"
+            )
+            return
+
+        if not input_text:
+            return
+
+        # Find the selected session
+        list_view = self.query_one("#session-list", ListView)
+        if not list_view.highlighted_child or not isinstance(
+            list_view.highlighted_child, SessionItem
+        ):
+            self.notify("No session selected", severity="error")
+            return
+
+        session = list_view.highlighted_child.session_data
+        session_id = session.get("session_id", "")
+        session_cwd = session.get("cwd")
+
+        # Clear input and show sending state
+        text_area.clear()
+        text_area.focus()
+        self.notify("Sending...", timeout=2)
+
+        # Mark session as working immediately
+        session["is_working"] = True
+        if isinstance(list_view.highlighted_child, SessionItem):
+            list_view.highlighted_child.session_data["is_working"] = True
+            try:
+                label = list_view.highlighted_child.query_one(".session-label", Static)
+                label.add_class("working")
+                list_view.highlighted_child.update_spinner(self._spinner_frame)
+            except:
+                pass
+
+        # Run claude CLI in background worker
+        # --resume requires running from the project's CWD
+        def send_message():
+            cmd = ["claude", "-p", "--resume", session_id]
+            result = subprocess.run(
+                cmd,
+                input=input_text,
+                capture_output=True,
+                text=True,
+                cwd=session_cwd or None,
+                timeout=300,
+            )
+            return result
+
+        def on_reply_done(worker: Worker) -> None:
+            if worker.is_finished and not worker.is_cancelled:
+                result = worker.result
+                if result and result.returncode == 0:
+                    self.notify("Sent", timeout=2)
+                else:
+                    err = result.stderr[:100] if result else "Unknown error"
+                    self.notify(f"Send failed: {err}", severity="error")
+                # Refresh transcript to show new messages
+                self.set_timer(1.0, self.refresh_transcript)
+
+        worker = self.run_worker(send_message, thread=True, group="reply")
+        worker.on_state_changed = lambda _: (
+            on_reply_done(worker) if worker.is_finished else None
+        )
+
+    def action_focus_transcript(self) -> None:
+        self.query_one("#transcript-scroll", TranscriptView).focus()
+
+    def action_focus_list(self) -> None:
+        self.query_one("#session-list", ListView).focus()
+
+    def action_cursor_down(self) -> None:
+        if self._input_has_focus():
+            return
+        self.query_one("#session-list", ListView).action_cursor_down()
+
+    def action_cursor_up(self) -> None:
+        if self._input_has_focus():
+            return
+        self.query_one("#session-list", ListView).action_cursor_up()
+
+    def action_move_session_up(self) -> None:
+        if not self._input_has_focus():
+            self._move_session(-1)
+
+    def action_move_session_down(self) -> None:
+        if not self._input_has_focus():
+            self._move_session(1)
+
+    def _move_session(self, direction: int) -> None:
+        list_view = self.query_one("#session-list", ListView)
+        if not list_view.highlighted_child or not isinstance(
+            list_view.highlighted_child, SessionItem
+        ):
+            return
+
+        session_id = list_view.highlighted_child.session_data.get("session_id")
+        if not session_id:
+            return
+
+        order = self.config.get("session_order", [])
+        if session_id not in order:
+            return
+
+        visible_ids = [s["session_id"] for s in self.sessions[:MAX_SESSIONS]]
+        if session_id not in visible_ids:
+            return
+
+        visible_idx = visible_ids.index(session_id)
+        target_visible_idx = visible_idx + direction
+
+        if target_visible_idx < 0 or target_visible_idx >= len(visible_ids):
+            return
+
+        swap_with_id = visible_ids[target_visible_idx]
+
+        current_order_idx = order.index(session_id)
+        swap_order_idx = order.index(swap_with_id)
+        order[current_order_idx], order[swap_order_idx] = (
+            order[swap_order_idx],
+            order[current_order_idx],
+        )
+
+        self.config["session_order"] = order
+        save_config(self.config)
+
+        order_index = {sid: i for i, sid in enumerate(order)}
+        self.sessions.sort(key=lambda x: order_index.get(x["session_id"], 999999))
+
+        self._selected_session_id = session_id
+        self._update_session_list(force_rebuild=True)
+
+        def restore_position():
+            for i, item in enumerate(list_view.children):
+                if (
+                    isinstance(item, SessionItem)
+                    and item.session_data.get("session_id") == session_id
+                ):
+                    list_view.index = i
+                    break
+
+        self.call_after_refresh(restore_position)
+
+    def action_scroll_transcript_up(self) -> None:
+        self.query_one("#transcript-scroll", TranscriptView).scroll_page_up(
+            animate=False
+        )
+
+    def action_scroll_transcript_down(self) -> None:
+        self.query_one("#transcript-scroll", TranscriptView).scroll_page_down(
+            animate=False
+        )
+
+    def action_scroll_transcript_home(self) -> None:
+        self.query_one("#transcript-scroll", TranscriptView).scroll_home(
+            animate=False
+        )
+
+    def action_scroll_transcript_end(self) -> None:
+        self.query_one("#transcript-scroll", TranscriptView).scroll_end(
+            animate=False
+        )
+
+
+def detect_project_from_cwd() -> str | None:
+    """Auto-detect project by matching CWD to Claude's project directory names.
+
+    Claude stores sessions in ~/.claude/projects/ with directory names like
+    -Users-jane-Projects-my-app (CWD with / replaced by -).
+    We check the CWD and its parents until we find a match.
+    """
+    cwd = Path.cwd()
+    # Try CWD and its parents (e.g. if in a subdirectory of the project)
+    for path in [cwd, *cwd.parents]:
+        project_dir_name = str(path).replace("/", "-")
+        if (CLAUDE_PROJECTS / project_dir_name).is_dir():
+            return project_dir_name
+        if path == Path.home():
+            break
+    return None
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="TUI transcript viewer for Claude Code sessions"
+    )
+    parser.add_argument(
+        "--project",
+        type=str,
+        default=None,
+        help="Filter sessions by project (substring match on directory name)",
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=10,
+        help="Show sessions from the last N days (default: 10)",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        default=False,
+        help="Show all projects (ignore CWD auto-detection)",
+    )
+    args = parser.parse_args()
+
+    project = args.project
+    if not project and not args.all:
+        # Auto-detect from CWD
+        detected = detect_project_from_cwd()
+        if detected:
+            project = detected
+
+    app = ClaudeSessions(project_filter=project, days=args.days)
+    app.run()
+
+
+if __name__ == "__main__":
+    main()
