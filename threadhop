@@ -294,6 +294,10 @@ class TranscriptView(VerticalScroll):
         # of the next load_transcript() call so the target widget exists
         # by the time we try to scroll to it.
         self._pending_scroll_uuid: str | None = None
+        # Search terms to inline-highlight when _scroll_to_uuid runs.
+        # Populated alongside _pending_scroll_uuid by the search dismiss
+        # handler so the match position is visible inside long messages.
+        self._pending_scroll_terms: list[str] | None = None
 
     def _get_message_widgets(self):
         """Return all message widgets in order."""
@@ -733,35 +737,63 @@ class TranscriptView(VerticalScroll):
         # message as usual.
         if self._pending_scroll_uuid is not None:
             target = self._pending_scroll_uuid
+            terms = self._pending_scroll_terms
             self._pending_scroll_uuid = None
-            self._scroll_to_uuid(target)
+            self._pending_scroll_terms = None
+            self._scroll_to_uuid(target, terms)
         else:
             self.scroll_end(animate=False)
 
-    def queue_scroll_to_uuid(self, uuid: str) -> None:
+    def queue_scroll_to_uuid(
+        self,
+        uuid: str,
+        search_terms: list[str] | None = None,
+    ) -> None:
         """Remember a uuid to scroll into view on the next load_transcript().
 
-        Called by the search dismiss handler before (or in place of)
-        switching sessions. If the transcript is already loaded,
-        _scroll_to_uuid can be called directly instead.
+        When ``search_terms`` is supplied, every occurrence of each term
+        in the target widget gets highlighted so the match is visible
+        inside long messages.
         """
         self._pending_scroll_uuid = uuid
+        self._pending_scroll_terms = search_terms
 
-    def _scroll_to_uuid(self, uuid: str) -> bool:
-        """Scroll the widget with matching _uuid into view and flash-highlight.
+    def _scroll_to_uuid(
+        self,
+        uuid: str,
+        search_terms: list[str] | None = None,
+    ) -> bool:
+        """Scroll to the widget with matching ``_uuid``.
 
-        Returns True if a match was found and scrolled to. We can't
-        scroll to the exact matched token within the message because
-        Rich-rendered Static widgets don't expose per-line positions to
-        Textual — so we scroll the widget's top near the viewport top
-        (with a small offset so the message header isn't flush against
-        the border) and let the flash highlight + the widget itself
-        guide the reader's eye.
+        If ``search_terms`` are supplied, the widget's content is
+        rebuilt with each term highlighted in black-on-yellow so the
+        exact match position is visible even inside long messages. We
+        also try to scroll past the widget's top proportionally to the
+        first match's line offset in the raw text, so a match deep in
+        a long message isn't hidden below the fold. Approximate — line
+        wrapping means it can overshoot or undershoot by a few rows.
         """
         for widget in self._get_message_widgets():
             if getattr(widget, "_uuid", None) == uuid:
+                match_line = 0
+                if search_terms:
+                    # Rebuild with highlights and get back the exact
+                    # rendered-line offset of the first match (computed
+                    # by Rich at the widget's current width).
+                    match_line = self._rebuild_widget_with_highlights(
+                        widget, search_terms
+                    )
                 widget.scroll_visible(animate=False, top=True)
                 widget.add_class("message-selected")
+
+                if match_line > 2:
+                    # A couple lines of breathing room so the message
+                    # header / preceding context stays visible above
+                    # the match.
+                    self.scroll_to(
+                        y=self.scroll_y + match_line - 2,
+                        animate=False,
+                    )
 
                 def clear_flash(w=widget):
                     try:
@@ -772,6 +804,98 @@ class TranscriptView(VerticalScroll):
                 self.set_timer(1.5, clear_flash)
                 return True
         return False
+
+    def _rebuild_widget_with_highlights(
+        self,
+        widget,
+        search_terms: list[str],
+    ) -> int:
+        """Re-render a message widget with search terms highlighted inline.
+
+        Returns the 0-based rendered-line index of the first search
+        match in the rebuilt widget, computed by Rich at the widget's
+        current width. Returns 0 if the widget is empty or the line
+        count couldn't be computed.
+
+        Trade-off: AssistantMessage originally renders its body through
+        Rich's Markdown. To inject highlights reliably we replace the
+        Markdown block with a plain Text body for the single widget —
+        that loses fenced-code / heading formatting on the jumped-to
+        message, but gains a precise visual anchor at the match. The
+        formatting comes back on the next transcript reload.
+        """
+        raw = getattr(widget, "_raw_text", "") or ""
+        if not raw:
+            return 0
+
+        body = Text(raw)
+        for term in search_terms:
+            if not term:
+                continue
+            try:
+                body.highlight_regex(
+                    rf"(?i){re.escape(term)}",
+                    style="bold black on yellow",
+                )
+            except Exception:
+                continue
+
+        if isinstance(widget, UserMessage):
+            new_renderable = Text.assemble(
+                Text("You\n", style="bold cyan"),
+                body,
+            )
+        elif isinstance(widget, AssistantMessage):
+            new_renderable = Group(
+                Text("Claude\n", style="bold green"),
+                body,
+            )
+        else:
+            # ToolMessage: body is already a simple Text block.
+            new_renderable = body
+
+        try:
+            widget.update(new_renderable)
+        except Exception:
+            pass
+
+        # Compute the rendered-line offset of the first match using
+        # Rich's own renderer at the widget's current width. This is
+        # the same layout engine Textual uses internally, so the line
+        # count reflects the actual on-screen layout (wrap, padding,
+        # indentation). Widget padding added by CSS isn't counted here
+        # — that introduces a ±1 row error we absorb with the -2 line
+        # breathing-room offset in the caller.
+        width = widget.size.width
+        if width <= 0:
+            width = self.size.width or 80
+        try:
+            from rich.console import Console
+
+            console = Console(
+                width=width,
+                color_system=None,
+                legacy_windows=False,
+                force_terminal=False,
+                record=False,
+                tab_size=4,
+            )
+            options = console.options.update_width(width)
+            lines = console.render_lines(new_renderable, options, pad=False)
+            lowest = -1
+            for term in search_terms:
+                if not term:
+                    continue
+                needle = term.lower()
+                for i, line in enumerate(lines):
+                    line_text = "".join(s.text for s in line).lower()
+                    if needle in line_text:
+                        if lowest < 0 or i < lowest:
+                            lowest = i
+                        break
+            return max(lowest, 0)
+        except Exception:
+            return 0
 
     async def _remove_all_messages(self):
         """Remove all message widgets, awaiting completion"""
@@ -1338,12 +1462,17 @@ class SearchScreen(ModalScreen):
         lv.index = new_idx
 
     def _open_selected(self) -> None:
-        """Dismiss with (session_id, uuid) from the highlighted result.
+        """Dismiss with (session_id, uuid, search_terms).
 
         Reads ``children[index]`` directly rather than ``highlighted_child``
         because ``highlighted_child`` may not be synchronously up to date
         after a programmatic ``index`` change — the reactive update lands
         on the next message cycle, not before we're called.
+
+        ``search_terms`` is the raw query parsed into prefix-stripped
+        words so the caller can inline-highlight matches in the target
+        widget. Filter tokens (``project:``, ``user:``, ``assistant:``)
+        are not included.
         """
         lv = self.query_one("#search-results", ListView)
         if not lv.children:
@@ -1352,9 +1481,19 @@ class SearchScreen(ModalScreen):
         if idx < 0 or idx >= len(lv.children):
             idx = 0
         item = lv.children[idx]
-        if isinstance(item, SearchResultItem):
-            row = item.result
-            self.dismiss((row["session_id"], row["uuid"]))
+        if not isinstance(item, SearchResultItem):
+            return
+
+        raw_query = ""
+        try:
+            raw_query = self.query_one("#search-input", Input).value or ""
+        except Exception:
+            pass
+        fts_expr, _role, _project = _build_fts_query(raw_query)
+        terms = [t.rstrip("*") for t in fts_expr.split() if t]
+
+        row = item.result
+        self.dismiss((row["session_id"], row["uuid"], terms))
 
 
 class ClaudeSessions(App):
@@ -2251,13 +2390,23 @@ class ClaudeSessions(App):
         """Dismiss callback: the user either selected a row or pressed Esc."""
         if result is None:
             return
+        # Legacy 2-tuple tolerated so stale callers don't break.
         try:
-            session_id, message_uuid = result
+            if len(result) == 3:
+                session_id, message_uuid, terms = result
+            else:
+                session_id, message_uuid = result
+                terms = None
         except (TypeError, ValueError):
             return
-        self._jump_to_search_result(session_id, message_uuid)
+        self._jump_to_search_result(session_id, message_uuid, terms)
 
-    def _jump_to_search_result(self, session_id: str, message_uuid: str) -> None:
+    def _jump_to_search_result(
+        self,
+        session_id: str,
+        message_uuid: str,
+        search_terms: list[str] | None = None,
+    ) -> None:
         """Switch to ``session_id`` and scroll its transcript to ``message_uuid``.
 
         Three cases:
@@ -2286,13 +2435,14 @@ class ClaudeSessions(App):
             # Case 1 & 2: session is in the sidebar.
             if list_view.index == target_idx:
                 transcript._pending_scroll_uuid = None
-                if not transcript._scroll_to_uuid(message_uuid):
+                transcript._pending_scroll_terms = None
+                if not transcript._scroll_to_uuid(message_uuid, search_terms):
                     self.notify(
                         "Message not found in loaded transcript",
                         severity="warning",
                     )
             else:
-                transcript.queue_scroll_to_uuid(message_uuid)
+                transcript.queue_scroll_to_uuid(message_uuid, search_terms)
                 list_view.index = target_idx
             list_view.focus()
             return
@@ -2315,7 +2465,7 @@ class ClaudeSessions(App):
             return
 
         self._selected_session_id = session_id
-        transcript.queue_scroll_to_uuid(message_uuid)
+        transcript.queue_scroll_to_uuid(message_uuid, search_terms)
         # load_transcript is async; schedule and let the pending scroll
         # fire at the end of the load.
         self.call_later(transcript.load_transcript, session_path)
