@@ -24,6 +24,11 @@ from textual.containers import Vertical, VerticalScroll
 from textual.widgets import Footer, Header, ListItem, ListView, Static, TextArea
 from textual.worker import Worker
 
+# Local package: SQLite DB module (init, migrations, session helpers).
+# Imported as a relative module because db.py sits next to this script.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import db  # noqa: E402
+
 
 def get_available_themes():
     """Get themes dynamically from Textual"""
@@ -35,20 +40,72 @@ def get_available_themes():
         return ["textual-dark", "textual-light"]
 
 
-def load_config():
+# App-level keys that live in config.json post-migration. Session-level
+# state (session_names, session_order, last_viewed) lives in SQLite per
+# ADR-001. Anything unknown is preserved on save so future settings
+# (sidebar_width, user-added keys) don't get silently dropped.
+APP_CONFIG_KEYS = {"theme", "sidebar_width"}
+
+
+def load_config(conn):
+    """Return the combined in-memory config.
+
+    App-level keys (`theme`, `sidebar_width`) come from config.json.
+    Session-level keys (`session_names`, `session_order`, `last_viewed`)
+    come from the SQLite `sessions` table — this is the ADR-001 split.
+
+    The returned dict keeps the same shape the TUI has always read so
+    the read paths (SessionItem construction, unread detection, reorder
+    logic) stay unchanged; only the persistence layer moved.
+    """
+    # 1. App-level from JSON.
+    config: dict = {}
     try:
         if CONFIG_FILE.exists():
-            return json.loads(CONFIG_FILE.read_text())
-    except:
+            raw = json.loads(CONFIG_FILE.read_text())
+            if isinstance(raw, dict):
+                config.update(raw)
+    except (OSError, json.JSONDecodeError):
         pass
-    return {"theme": "textual-dark", "session_names": {}, "session_order": []}
+
+    # Strip any legacy session-level keys that may linger (old config,
+    # partially-migrated state). SQLite is the source of truth now.
+    for key in ("session_names", "session_order", "last_viewed"):
+        config.pop(key, None)
+
+    config.setdefault("theme", "textual-dark")
+
+    # 2. Session-level from SQLite.
+    try:
+        config["session_names"] = db.get_custom_names(conn)
+        config["session_order"] = db.get_session_order(conn)
+        config["last_viewed"] = db.get_last_viewed(conn)
+    except Exception:
+        # A broken DB shouldn't prevent the app from starting; fall back
+        # to empty session state and let the user keep browsing.
+        config["session_names"] = {}
+        config["session_order"] = []
+        config["last_viewed"] = {}
+
+    return config
 
 
-def save_config(config):
+def save_app_config(config):
+    """Persist only app-level keys (theme, sidebar_width, unknown extras)
+    to config.json.
+
+    Session-level keys are deliberately excluded — they live in SQLite
+    now and are written through at each mutation site (rename, reorder,
+    view) rather than dumped wholesale here.
+    """
     try:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        CONFIG_FILE.write_text(json.dumps(config, indent=2))
-    except:
+        app_only = {
+            k: v for k, v in config.items()
+            if k not in ("session_names", "session_order", "last_viewed")
+        }
+        CONFIG_FILE.write_text(json.dumps(app_only, indent=2))
+    except OSError:
         pass
 
 
@@ -528,7 +585,20 @@ class ClaudeSessions(App):
         self._selected_session_id = None
         self._spinner_frame = 0
         self._renaming_session_id = None
-        self.config = load_config()
+
+        # Open the SQLite store and run the one-time config.json → SQLite
+        # migration (ADR-001). Both calls are idempotent — init_db applies
+        # pending schema migrations, and migrate_config_json_to_sqlite is
+        # guarded by a settings flag so only the first ever launch does
+        # real work.
+        self.conn = db.init_db()
+        db.migrate_config_json_to_sqlite(
+            self.conn, CONFIG_FILE, CLAUDE_PROJECTS
+        )
+
+        self.config = load_config(self.conn)
+        # Defensive defaults: load_config always returns these, but guard
+        # in case a future code path bypasses it.
         if "session_names" not in self.config:
             self.config["session_names"] = {}
         if "session_order" not in self.config:
@@ -826,6 +896,28 @@ class ClaudeSessions(App):
         for s in self.sessions:
             s["path"] = Path(s["path"])
 
+        # Keep the `sessions` table in step with the filesystem scan so
+        # user actions (rename, reorder, last_viewed) that target any
+        # currently-visible session can UPDATE a row that actually exists.
+        # upsert_session intentionally leaves user-owned columns
+        # (custom_name, sort_order, last_viewed, status) alone.
+        try:
+            with db.transaction(self.conn):
+                for s in self.sessions:
+                    db.upsert_session(
+                        self.conn,
+                        session_id=s["session_id"],
+                        session_path=str(s["path"]),
+                        project=s.get("project"),
+                        cwd=s.get("cwd"),
+                        modified_at=s.get("modified"),
+                    )
+        except Exception:
+            # A DB hiccup shouldn't break the TUI — we'll retry on the
+            # next refresh tick. Reads still work because the TUI uses
+            # in-memory self.sessions for display.
+            pass
+
         self._apply_stable_ordering()
         self._update_session_list(force_rebuild)
         self.refresh_transcript()
@@ -849,7 +941,11 @@ class ClaudeSessions(App):
 
         if final_order != saved_order:
             self.config["session_order"] = final_order
-            save_config(self.config)
+            # Session ordering lives in SQLite per ADR-001.
+            try:
+                db.set_session_order(self.conn, final_order)
+            except Exception:
+                pass
 
         order_index = {sid: i for i, sid in enumerate(final_order)}
         self.sessions.sort(key=lambda x: order_index.get(x["session_id"], 999999))
@@ -960,8 +1056,13 @@ class ClaudeSessions(App):
 
             if "last_viewed" not in self.config:
                 self.config["last_viewed"] = {}
-            self.config["last_viewed"][session_id] = datetime.now().timestamp()
-            save_config(self.config)
+            now_ts = datetime.now().timestamp()
+            self.config["last_viewed"][session_id] = now_ts
+            # last_viewed lives in SQLite per ADR-001.
+            try:
+                db.set_last_viewed(self.conn, session_id, now_ts)
+            except Exception:
+                pass
 
             if event.item.is_unread:
                 event.item.is_unread = False
@@ -989,7 +1090,8 @@ class ClaudeSessions(App):
             next_idx = 0
         self.theme = themes[next_idx]
         self.config["theme"] = self.theme
-        save_config(self.config)
+        # Theme stays in config.json (app-level setting per ADR-001).
+        save_app_config(self.config)
         self.notify(f"Theme: {self.theme}")
 
     def action_rename_session(self) -> None:
@@ -1119,7 +1221,11 @@ class ClaudeSessions(App):
                 self.config["session_names"][session_id] = input_text
             else:
                 self.config["session_names"].pop(session_id, None)
-            save_config(self.config)
+            # Custom names live in SQLite per ADR-001.
+            try:
+                db.set_custom_name(self.conn, session_id, input_text or None)
+            except Exception:
+                pass
             text_area.clear()
             self.query_one("#session-list", ListView).focus()
             self.load_sessions(force_rebuild=True)
@@ -1248,7 +1354,11 @@ class ClaudeSessions(App):
         )
 
         self.config["session_order"] = order
-        save_config(self.config)
+        # Manual reorder lives in SQLite per ADR-001.
+        try:
+            db.set_session_order(self.conn, order)
+        except Exception:
+            pass
 
         order_index = {sid: i for i, sid in enumerate(order)}
         self.sessions.sort(key=lambda x: order_index.get(x["session_id"], 999999))
