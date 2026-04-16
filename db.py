@@ -31,7 +31,7 @@ DB_PATH = DB_DIR / "sessions.db"
 # --- Schema version ---
 # Each migration N in MIGRATIONS moves the DB from version N to N+1.
 # The DB's current version lives in PRAGMA user_version.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 # --- Migrations -----------------------------------------------------------
@@ -83,9 +83,82 @@ def _migration_001_initial(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_002_messages(conn: sqlite3.Connection) -> None:
+    """Phase 2: messages table + FTS5 index.
+
+    Schema per ADR-003 in docs/DESIGN-DECISIONS.md. The indexer merges
+    consecutive assistant JSONL lines that share the same `message.id`
+    into one row before insertion — see `indexer.parse_messages`.
+
+    FTS5 uses external content (`content='messages'`) so the `text`
+    column isn't stored twice. The three triggers below keep the FTS
+    shadow table in sync on any write to `messages`. The `porter`
+    stemmer lets "running" match "run" (ADR-002).
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS messages (
+            uuid         TEXT PRIMARY KEY,
+            session_id   TEXT NOT NULL,
+            role         TEXT NOT NULL,       -- 'user' | 'assistant'
+            text         TEXT NOT NULL,
+            timestamp    TEXT,
+            cwd          TEXT,
+            parent_uuid  TEXT,
+            is_sidechain INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)"
+    )
+
+    # External-content FTS5: the virtual table stores tokens only and
+    # uses `messages.rowid` to retrieve the text. The triggers below
+    # mirror INSERT / DELETE / UPDATE on messages into the FTS index.
+    conn.execute(
+        """
+        CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+            text,
+            content='messages',
+            content_rowid='rowid',
+            tokenize='porter unicode61'
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+            INSERT INTO messages_fts(rowid, text) VALUES (new.rowid, new.text);
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+            INSERT INTO messages_fts(messages_fts, rowid, text)
+            VALUES ('delete', old.rowid, old.text);
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+            INSERT INTO messages_fts(messages_fts, rowid, text)
+            VALUES ('delete', old.rowid, old.text);
+            INSERT INTO messages_fts(rowid, text) VALUES (new.rowid, new.text);
+        END
+        """
+    )
+
+
 # Ordered list; MIGRATIONS[i] moves schema from version i to i+1.
 MIGRATIONS: list = [
     _migration_001_initial,
+    _migration_002_messages,
 ]
 
 assert len(MIGRATIONS) == SCHEMA_VERSION, (
@@ -120,6 +193,12 @@ def connect(db_path: Path | str | None = None) -> sqlite3.Connection:
     # safe against crashes (only loses uncommitted transactions on power loss).
     conn.execute("PRAGMA synchronous = NORMAL")
     conn.execute("PRAGMA foreign_keys = ON")
+    # Required for `INSERT OR REPLACE` on tables with AFTER DELETE triggers
+    # (e.g., messages → messages_fts sync). With the default OFF, REPLACE
+    # silently skips delete triggers, causing the FTS shadow to accumulate
+    # stale entries that still match queries. See:
+    # https://www.sqlite.org/lang_conflict.html#the_replace_algorithm
+    conn.execute("PRAGMA recursive_triggers = ON")
     return conn
 
 
