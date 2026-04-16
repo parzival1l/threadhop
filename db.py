@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
@@ -31,7 +32,7 @@ DB_PATH = DB_DIR / "sessions.db"
 # --- Schema version ---
 # Each migration N in MIGRATIONS moves the DB from version N to N+1.
 # The DB's current version lives in PRAGMA user_version.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 # --- Migrations -----------------------------------------------------------
@@ -155,10 +156,44 @@ def _migration_002_messages(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_003_index_state(conn: sqlite3.Connection) -> None:
+    """Task #9: incremental indexing support.
+
+    - ``index_state``: tracks byte offset per session so the refresh
+      cycle only parses newly-appended JSONL bytes.
+    - ``messages.message_id``: stores the Claude API ``message.id``
+      (shared across streaming chunks).  Needed for cross-batch chunk
+      merging — when an assistant response spans two refresh cycles,
+      the second batch must look up and UPDATE the row created by the
+      first batch.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS index_state (
+            session_id       TEXT PRIMARY KEY,
+            file_path        TEXT NOT NULL,
+            last_byte_offset INTEGER NOT NULL DEFAULT 0,
+            last_indexed_at  REAL NOT NULL
+        )
+        """
+    )
+
+    # ALTER TABLE doesn't support IF NOT EXISTS, so guard with a
+    # column-presence check to keep the migration idempotent.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
+    if "message_id" not in cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN message_id TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_message_id "
+            "ON messages(message_id)"
+        )
+
+
 # Ordered list; MIGRATIONS[i] moves schema from version i to i+1.
 MIGRATIONS: list = [
     _migration_001_initial,
     _migration_002_messages,
+    _migration_003_index_state,
 ]
 
 assert len(MIGRATIONS) == SCHEMA_VERSION, (
@@ -486,6 +521,56 @@ def get_session_statuses(conn: sqlite3.Connection) -> dict[str, str]:
         "SELECT session_id, status FROM sessions"
     ).fetchall()
     return {r["session_id"]: r["status"] for r in rows}
+
+
+# --- Index-state helpers ---------------------------------------------------
+
+def get_index_state(
+    conn: sqlite3.Connection,
+    session_id: str,
+) -> dict | None:
+    """Return the index state for a session, or None if never indexed."""
+    return query_one(
+        conn,
+        "SELECT * FROM index_state WHERE session_id = ?",
+        (session_id,),
+    )
+
+
+def upsert_index_state(
+    conn: sqlite3.Connection,
+    session_id: str,
+    file_path: str,
+    last_byte_offset: int,
+    last_indexed_at: float,
+) -> None:
+    """Insert or update the index state for a session."""
+    conn.execute(
+        """
+        INSERT INTO index_state (
+            session_id, file_path, last_byte_offset, last_indexed_at
+        ) VALUES (?, ?, ?, ?)
+        ON CONFLICT(session_id) DO UPDATE SET
+            file_path        = excluded.file_path,
+            last_byte_offset = excluded.last_byte_offset,
+            last_indexed_at  = excluded.last_indexed_at
+        """,
+        (session_id, file_path, last_byte_offset, last_indexed_at),
+    )
+
+
+def delete_index_state(conn: sqlite3.Connection, session_id: str) -> None:
+    """Remove the index state for a session (used on truncation/rotation)."""
+    conn.execute("DELETE FROM index_state WHERE session_id = ?", (session_id,))
+
+
+def delete_session_messages(conn: sqlite3.Connection, session_id: str) -> None:
+    """Delete all indexed messages for a session.
+
+    The FTS table is kept in sync automatically via the ``messages_ad``
+    trigger created in migration 002.
+    """
+    conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
 
 
 # --- One-time config.json → SQLite migration (ADR-001) --------------------
