@@ -249,23 +249,35 @@ class SessionStatusHeader(ListItem):
         yield Static(f"── {label} ", classes="status-header")
 
 
-class UserMessage(Static):
+class _SelectableMessage(Static):
+    """Base for message widgets that participate in selection mode.
+
+    can_focus is deliberately False — focus stays on the parent
+    TranscriptView so its on_key handler receives all keypresses.
+    Highlighting is driven purely by the .message-selected CSS class.
+    """
+    can_focus = False
+
+
+class UserMessage(_SelectableMessage):
     """A user message in the transcript"""
-    can_focus = True
+    pass
 
 
-class AssistantMessage(Static):
+class AssistantMessage(_SelectableMessage):
     """An assistant message in the transcript"""
-    can_focus = True
+    pass
 
 
-class ToolMessage(Static):
+class ToolMessage(_SelectableMessage):
     """A tool call/result in the transcript"""
-    can_focus = True
+    pass
 
 
 class TranscriptView(VerticalScroll):
     """Shows full conversation from selected session"""
+
+    can_focus = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -291,11 +303,11 @@ class TranscriptView(VerticalScroll):
             event.stop()
             event.prevent_default()
         elif self._selection_mode:
-            if event.key == "j":
+            if event.key in ("j", "down"):
                 self._select_next()
                 event.stop()
                 event.prevent_default()
-            elif event.key == "k":
+            elif event.key in ("k", "up"):
                 self._select_previous()
                 event.stop()
                 event.prevent_default()
@@ -309,9 +321,10 @@ class TranscriptView(VerticalScroll):
         if not messages:
             return
         self._selection_mode = True
-        self._selected_index = 0
+        # Start at the last message — recent context is usually what you want
+        self._selected_index = len(messages) - 1
         self._update_selection(messages)
-        self.border_title = "Transcript [SELECT]"
+        self.app.notify("Selection mode: j/k to navigate, m or Esc to exit")
 
     def _exit_selection_mode(self):
         self._clear_selection()
@@ -342,6 +355,10 @@ class TranscriptView(VerticalScroll):
                 widget.scroll_visible()
             else:
                 widget.remove_class("message-selected")
+        # Update position counter in border title
+        total = len(messages)
+        pos = self._selected_index + 1
+        self.border_title = f"Transcript ── SELECT {pos}/{total} (j/k move, m/Esc exit)"
 
     def _clear_selection(self):
         for widget in self._get_message_widgets():
@@ -677,9 +694,13 @@ class ClaudeSessions(App):
         background: $accent;
     }
 
-    .message-selected {
-        background: $accent 25%;
+    /* Selection highlight — must override per-type border-left */
+    UserMessage.message-selected,
+    AssistantMessage.message-selected,
+    ToolMessage.message-selected {
+        background: $warning 20%;
         border-left: thick $warning;
+        tint: $warning 8%;
     }
 
     ToastRack {
