@@ -135,6 +135,10 @@ STATUS_LABELS: dict[str, str] = {
 }
 STATUS_RANK: dict[str, int] = {s: i for i, s in enumerate(STATUS_ORDER)}
 
+# Cycleable statuses for s/S keybinds (ADR-004, task #4).
+# "archived" is excluded — it gets its own keybind in task #5.
+STATUS_CYCLE: list[str] = [s for s in STATUS_ORDER if s != "archived"]
+
 # Regex to strip <system-reminder>...</system-reminder> blocks from text
 SYSTEM_REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
 
@@ -198,6 +202,8 @@ class SessionItem(ListItem):
             label.add_class("working")
         elif is_active:
             label.add_class("active")
+        if self.session_data.get("status") == "archived":
+            label.add_class("archived")
         yield label
 
     def update_spinner(self, frame: int) -> None:
@@ -579,6 +585,11 @@ class ClaudeSessions(App):
         color: $success;
     }
 
+    .session-label.archived {
+        color: $text-muted;
+        text-style: italic;
+    }
+
     ListView > ListItem.--highlight {
         background: $boost;
     }
@@ -615,12 +626,16 @@ class ClaudeSessions(App):
         Binding("shift+up", "move_session_up", "Move Up", show=False),
         Binding("alt+j", "nav_down_from_reply", "Nav Down", show=False),
         Binding("alt+k", "nav_up_from_reply", "Nav Up", show=False),
+        Binding("a", "archive_session", "Archive", show=False),
+        Binding("A", "toggle_archive_view", "Show Archived", show=False),
         Binding("pageup", "scroll_transcript_up", "PgUp", show=False, priority=True),
         Binding(
             "pagedown", "scroll_transcript_down", "PgDn", show=False, priority=True
         ),
         Binding("home", "scroll_transcript_home", "Top", show=False, priority=True),
         Binding("end", "scroll_transcript_end", "Bottom", show=False, priority=True),
+        Binding("s", "cycle_status_forward", "Status", show=False),
+        Binding("S", "cycle_status_backward", "Status Back", show=False),
     ]
 
     def __init__(self, project_filter: str | None = None, days: int = 10):
@@ -631,6 +646,7 @@ class ClaudeSessions(App):
         self._selected_session_id = None
         self._spinner_frame = 0
         self._renaming_session_id = None
+        self._show_archived = False
 
         # Open the SQLite store and run the one-time config.json → SQLite
         # migration (ADR-001). Both calls are idempotent — init_db applies
@@ -1018,7 +1034,16 @@ class ClaudeSessions(App):
         )
 
     def _update_session_list(self, force_rebuild: bool = False) -> None:
-        display_sessions = self.sessions[:MAX_SESSIONS]
+        all_sessions = self.sessions[:MAX_SESSIONS]
+
+        # Split into active (non-archived) and archived groups.
+        active_sessions = [s for s in all_sessions if s.get("status") != "archived"]
+        archived_sessions = [s for s in all_sessions if s.get("status") == "archived"]
+
+        if self._show_archived:
+            display_sessions = active_sessions + archived_sessions
+        else:
+            display_sessions = active_sessions
 
         # Bucket sessions by status. Preserve the in-memory order inside
         # each bucket — the sort in _apply_stable_ordering already put them
@@ -1504,6 +1529,114 @@ class ClaudeSessions(App):
                     break
 
         self.call_after_refresh(restore_position)
+
+    def action_cycle_status_forward(self) -> None:
+        if not self._input_has_focus():
+            self._cycle_session_status(1)
+
+    def action_cycle_status_backward(self) -> None:
+        if not self._input_has_focus():
+            self._cycle_session_status(-1)
+
+    def _cycle_session_status(self, direction: int) -> None:
+        list_view = self.query_one("#session-list", ListView)
+        if not list_view.highlighted_child or not isinstance(
+            list_view.highlighted_child, SessionItem
+        ):
+            return
+
+        session = list_view.highlighted_child.session_data
+        session_id = session.get("session_id")
+        if not session_id:
+            return
+
+        current_status = session.get("status", "active")
+        try:
+            idx = STATUS_CYCLE.index(current_status)
+        except ValueError:
+            # Status not in cycle (e.g. archived) — don't cycle it.
+            return
+
+        new_status = STATUS_CYCLE[(idx + direction) % len(STATUS_CYCLE)]
+
+        # Persist to SQLite immediately.
+        try:
+            db.set_session_status(self.conn, session_id, new_status)
+        except Exception:
+            self.notify("Failed to update status", severity="error")
+            return
+
+        # Update in-memory state and re-render.
+        session["status"] = new_status
+        self._selected_session_id = session_id
+        self._update_session_list(force_rebuild=True)
+
+        # Restore highlight to the same session after rebuild.
+        def restore_position():
+            for i, item in enumerate(list_view.children):
+                if (
+                    isinstance(item, SessionItem)
+                    and item.session_data.get("session_id") == session_id
+                ):
+                    list_view.index = i
+                    break
+
+        self.call_after_refresh(restore_position)
+        self.notify(f"Status: {STATUS_LABELS.get(new_status, new_status)}")
+
+    def action_archive_session(self) -> None:
+        """Toggle selected session between archived and active status"""
+        if self._input_has_focus():
+            return
+        list_view = self.query_one("#session-list", ListView)
+        if not list_view.highlighted_child or not isinstance(
+            list_view.highlighted_child, SessionItem
+        ):
+            return
+        session = list_view.highlighted_child.session_data
+        session_id = session.get("session_id")
+        if not session_id:
+            return
+        current_status = session.get("status", "active")
+        if current_status == "archived":
+            new_status = "active"
+        else:
+            new_status = "archived"
+        try:
+            db.set_session_status(self.conn, session_id, new_status)
+        except Exception:
+            self.notify("Failed to update session status", severity="error")
+            return
+        # Update in-memory status and re-render.
+        session["status"] = new_status
+        self._selected_session_id = session_id
+        self._update_session_list(force_rebuild=True)
+
+        def restore_position():
+            for i, item in enumerate(list_view.children):
+                if (
+                    isinstance(item, SessionItem)
+                    and item.session_data.get("session_id") == session_id
+                ):
+                    list_view.index = i
+                    break
+
+        self.call_after_refresh(restore_position)
+        if new_status == "archived":
+            self.notify("Session archived")
+        else:
+            self.notify("Session restored")
+
+    def action_toggle_archive_view(self) -> None:
+        """Toggle visibility of archived sessions in the sidebar"""
+        if self._input_has_focus():
+            return
+        self._show_archived = not self._show_archived
+        if self._show_archived:
+            self.notify("Showing archived sessions")
+        else:
+            self.notify("Hiding archived sessions")
+        self._update_session_list(force_rebuild=True)
 
     def action_scroll_transcript_up(self) -> None:
         self.query_one("#transcript-scroll", TranscriptView).scroll_page_up(
