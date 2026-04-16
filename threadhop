@@ -251,17 +251,17 @@ class SessionStatusHeader(ListItem):
 
 class UserMessage(Static):
     """A user message in the transcript"""
-    pass
+    can_focus = True
 
 
 class AssistantMessage(Static):
     """An assistant message in the transcript"""
-    pass
+    can_focus = True
 
 
 class ToolMessage(Static):
     """A tool call/result in the transcript"""
-    pass
+    can_focus = True
 
 
 class TranscriptView(VerticalScroll):
@@ -271,9 +271,87 @@ class TranscriptView(VerticalScroll):
         super().__init__(*args, **kwargs)
         self.current_path = None
         self._last_mtime = 0
+        self._selection_mode = False
+        self._selected_index = -1
+
+    def _get_message_widgets(self):
+        """Return all message widgets in order."""
+        return [
+            c for c in self.children
+            if isinstance(c, (UserMessage, AssistantMessage, ToolMessage))
+        ]
+
+    def on_key(self, event) -> None:
+        """Handle keys for message selection mode."""
+        if event.key == "m":
+            if self._selection_mode:
+                self._exit_selection_mode()
+            else:
+                self._enter_selection_mode()
+            event.stop()
+            event.prevent_default()
+        elif self._selection_mode:
+            if event.key == "j":
+                self._select_next()
+                event.stop()
+                event.prevent_default()
+            elif event.key == "k":
+                self._select_previous()
+                event.stop()
+                event.prevent_default()
+            elif event.key == "escape":
+                self._exit_selection_mode()
+                event.stop()
+                event.prevent_default()
+
+    def _enter_selection_mode(self):
+        messages = self._get_message_widgets()
+        if not messages:
+            return
+        self._selection_mode = True
+        self._selected_index = 0
+        self._update_selection(messages)
+        self.border_title = "Transcript [SELECT]"
+
+    def _exit_selection_mode(self):
+        self._clear_selection()
+        self._selection_mode = False
+        self._selected_index = -1
+        self.border_title = "Transcript"
+
+    def _select_next(self):
+        messages = self._get_message_widgets()
+        if not messages:
+            return
+        self._selected_index = min(self._selected_index + 1, len(messages) - 1)
+        self._update_selection(messages)
+
+    def _select_previous(self):
+        messages = self._get_message_widgets()
+        if not messages:
+            return
+        self._selected_index = max(self._selected_index - 1, 0)
+        self._update_selection(messages)
+
+    def _update_selection(self, messages=None):
+        if messages is None:
+            messages = self._get_message_widgets()
+        for i, widget in enumerate(messages):
+            if i == self._selected_index:
+                widget.add_class("message-selected")
+                widget.scroll_visible()
+            else:
+                widget.remove_class("message-selected")
+
+    def _clear_selection(self):
+        for widget in self._get_message_widgets():
+            widget.remove_class("message-selected")
 
     async def load_transcript(self, session_path: Path, force: bool = False):
         """Load and display full conversation from transcript"""
+        if self._selection_mode:
+            self._exit_selection_mode()
+
         if not session_path or not session_path.exists():
             await self._clear_and_show("No transcript available")
             return
@@ -597,6 +675,11 @@ class ClaudeSessions(App):
 
     ListView:focus > ListItem.--highlight {
         background: $accent;
+    }
+
+    .message-selected {
+        background: $accent 25%;
+        border-left: thick $warning;
     }
 
     ToastRack {
