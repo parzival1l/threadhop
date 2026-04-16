@@ -24,6 +24,12 @@ from textual.containers import Vertical, VerticalScroll
 from textual.widgets import Footer, Header, ListItem, ListView, Static, TextArea
 from textual.worker import Worker
 
+# Local package: SQLite DB module (init, migrations, session helpers).
+# Imported as a relative module because db.py sits next to this script.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import db  # noqa: E402
+import indexer  # noqa: E402
+
 
 def get_available_themes():
     """Get themes dynamically from Textual"""
@@ -35,20 +41,72 @@ def get_available_themes():
         return ["textual-dark", "textual-light"]
 
 
-def load_config():
+# App-level keys that live in config.json post-migration. Session-level
+# state (session_names, session_order, last_viewed) lives in SQLite per
+# ADR-001. Anything unknown is preserved on save so future settings
+# (sidebar_width, user-added keys) don't get silently dropped.
+APP_CONFIG_KEYS = {"theme", "sidebar_width"}
+
+
+def load_config(conn):
+    """Return the combined in-memory config.
+
+    App-level keys (`theme`, `sidebar_width`) come from config.json.
+    Session-level keys (`session_names`, `session_order`, `last_viewed`)
+    come from the SQLite `sessions` table — this is the ADR-001 split.
+
+    The returned dict keeps the same shape the TUI has always read so
+    the read paths (SessionItem construction, unread detection, reorder
+    logic) stay unchanged; only the persistence layer moved.
+    """
+    # 1. App-level from JSON.
+    config: dict = {}
     try:
         if CONFIG_FILE.exists():
-            return json.loads(CONFIG_FILE.read_text())
-    except:
+            raw = json.loads(CONFIG_FILE.read_text())
+            if isinstance(raw, dict):
+                config.update(raw)
+    except (OSError, json.JSONDecodeError):
         pass
-    return {"theme": "textual-dark", "session_names": {}, "session_order": []}
+
+    # Strip any legacy session-level keys that may linger (old config,
+    # partially-migrated state). SQLite is the source of truth now.
+    for key in ("session_names", "session_order", "last_viewed"):
+        config.pop(key, None)
+
+    config.setdefault("theme", "textual-dark")
+
+    # 2. Session-level from SQLite.
+    try:
+        config["session_names"] = db.get_custom_names(conn)
+        config["session_order"] = db.get_session_order(conn)
+        config["last_viewed"] = db.get_last_viewed(conn)
+    except Exception:
+        # A broken DB shouldn't prevent the app from starting; fall back
+        # to empty session state and let the user keep browsing.
+        config["session_names"] = {}
+        config["session_order"] = []
+        config["last_viewed"] = {}
+
+    return config
 
 
-def save_config(config):
+def save_app_config(config):
+    """Persist only app-level keys (theme, sidebar_width, unknown extras)
+    to config.json.
+
+    Session-level keys are deliberately excluded — they live in SQLite
+    now and are written through at each mutation site (rename, reorder,
+    view) rather than dumped wholesale here.
+    """
     try:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        CONFIG_FILE.write_text(json.dumps(config, indent=2))
-    except:
+        app_only = {
+            k: v for k, v in config.items()
+            if k not in ("session_names", "session_order", "last_viewed")
+        }
+        CONFIG_FILE.write_text(json.dumps(app_only, indent=2))
+    except OSError:
         pass
 
 
@@ -65,6 +123,22 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 
 # --- Internal constants ---
 SPINNER_FRAMES = ["◐", "◓", "◑", "◒"]
+
+# Display order + labels for status-grouped sidebar (ADR-004). Keep in sync
+# with db.SESSION_STATUS_ORDER.
+STATUS_ORDER: list[str] = db.SESSION_STATUS_ORDER
+STATUS_LABELS: dict[str, str] = {
+    "active":      "Active",
+    "in_progress": "In Progress",
+    "in_review":   "In Review",
+    "done":        "Done",
+    "archived":    "Archived",
+}
+STATUS_RANK: dict[str, int] = {s: i for i, s in enumerate(STATUS_ORDER)}
+
+# Cycleable statuses for s/S keybinds (ADR-004, task #4).
+# "archived" is excluded — it gets its own keybind in task #5.
+STATUS_CYCLE: list[str] = [s for s in STATUS_ORDER if s != "archived"]
 
 # Regex to strip <system-reminder>...</system-reminder> blocks from text
 SYSTEM_REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
@@ -129,6 +203,8 @@ class SessionItem(ListItem):
             label.add_class("working")
         elif is_active:
             label.add_class("active")
+        if self.session_data.get("status") == "archived":
+            label.add_class("archived")
         yield label
 
     def update_spinner(self, frame: int) -> None:
@@ -156,17 +232,44 @@ class SessionItem(ListItem):
 
 
 
-class UserMessage(Static):
+class SessionStatusHeader(ListItem):
+    """Non-selectable divider between status groups in the sidebar (ADR-004).
+
+    Rendered as a dim rule with the status label. `disabled=True` tells
+    ListView to skip over it when the cursor moves with j/k — so users see
+    the grouping but never land on a header.
+    """
+
+    def __init__(self, status: str):
+        self.status = status
+        super().__init__(disabled=True)
+
+    def compose(self) -> ComposeResult:
+        label = STATUS_LABELS.get(self.status, self.status)
+        yield Static(f"── {label} ", classes="status-header")
+
+
+class _SelectableMessage(Static):
+    """Base for message widgets that participate in selection mode.
+
+    can_focus is deliberately False — focus stays on the parent
+    TranscriptView so its on_key handler receives all keypresses.
+    Highlighting is driven purely by the .message-selected CSS class.
+    """
+    can_focus = False
+
+
+class UserMessage(_SelectableMessage):
     """A user message in the transcript"""
     pass
 
 
-class AssistantMessage(Static):
+class AssistantMessage(_SelectableMessage):
     """An assistant message in the transcript"""
     pass
 
 
-class ToolMessage(Static):
+class ToolMessage(_SelectableMessage):
     """A tool call/result in the transcript"""
     pass
 
@@ -174,14 +277,130 @@ class ToolMessage(Static):
 class TranscriptView(VerticalScroll):
     """Shows full conversation from selected session"""
 
+    can_focus = True
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.current_path = None
         self._last_mtime = 0
+        self._selection_mode = False
+        self._selected_index = -1
+        self._range_anchor = -1  # -1 = no range; >= 0 = anchor index
+
+    def _get_message_widgets(self):
+        """Return all message widgets in order."""
+        return [
+            c for c in self.children
+            if isinstance(c, (UserMessage, AssistantMessage, ToolMessage))
+        ]
+
+    def on_key(self, event) -> None:
+        """Handle keys for message selection mode."""
+        if event.key == "m":
+            if self._selection_mode:
+                self._exit_selection_mode()
+            else:
+                self._enter_selection_mode()
+            event.stop()
+            event.prevent_default()
+        elif self._selection_mode:
+            if event.key in ("j", "down"):
+                self._select_next()
+                event.stop()
+                event.prevent_default()
+            elif event.key in ("k", "up"):
+                self._select_previous()
+                event.stop()
+                event.prevent_default()
+            elif event.key == "v":
+                self._toggle_range()
+                event.stop()
+                event.prevent_default()
+            elif event.key == "escape":
+                self._exit_selection_mode()
+                event.stop()
+                event.prevent_default()
+
+    def _enter_selection_mode(self):
+        messages = self._get_message_widgets()
+        if not messages:
+            return
+        self._selection_mode = True
+        self._range_anchor = -1
+        # Start at the last message — recent context is usually what you want
+        self._selected_index = len(messages) - 1
+        self._update_selection(messages)
+        self.app.notify("Selection mode: j/k move, v range, m/Esc exit")
+
+    def _exit_selection_mode(self):
+        self._clear_selection()
+        self._selection_mode = False
+        self._selected_index = -1
+        self._range_anchor = -1
+        self.border_title = "Transcript"
+
+    def _toggle_range(self):
+        if self._range_anchor >= 0:
+            # Deactivate range, keep cursor where it is
+            self._range_anchor = -1
+            self.app.notify("Range cancelled")
+        else:
+            self._range_anchor = self._selected_index
+            self.app.notify("Range started — move j/k to extend, v to cancel")
+        self._update_selection()
+
+    def _select_next(self):
+        messages = self._get_message_widgets()
+        if not messages:
+            return
+        self._selected_index = min(self._selected_index + 1, len(messages) - 1)
+        self._update_selection(messages)
+
+    def _select_previous(self):
+        messages = self._get_message_widgets()
+        if not messages:
+            return
+        self._selected_index = max(self._selected_index - 1, 0)
+        self._update_selection(messages)
+
+    def _get_selected_range(self) -> tuple[int, int]:
+        """Return (start, end) indices of the current selection (inclusive)."""
+        if self._range_anchor >= 0:
+            lo = min(self._range_anchor, self._selected_index)
+            hi = max(self._range_anchor, self._selected_index)
+            return (lo, hi)
+        return (self._selected_index, self._selected_index)
+
+    def _update_selection(self, messages=None):
+        if messages is None:
+            messages = self._get_message_widgets()
+        lo, hi = self._get_selected_range()
+        for i, widget in enumerate(messages):
+            if lo <= i <= hi:
+                widget.add_class("message-selected")
+            else:
+                widget.remove_class("message-selected")
+        # Scroll the cursor (not the anchor) into view
+        if 0 <= self._selected_index < len(messages):
+            messages[self._selected_index].scroll_visible()
+        # Update border title with position info
+        total = len(messages)
+        pos = self._selected_index + 1
+        count = hi - lo + 1
+        if count > 1:
+            self.border_title = f"Transcript ── SELECT {pos}/{total} ({count} selected)"
+        else:
+            self.border_title = f"Transcript ── SELECT {pos}/{total} (j/k move, v range)"
+
+    def _clear_selection(self):
+        for widget in self._get_message_widgets():
+            widget.remove_class("message-selected")
 
     async def load_transcript(self, session_path: Path, force: bool = False):
         """Load and display full conversation from transcript"""
         if not session_path or not session_path.exists():
+            if self._selection_mode:
+                self._exit_selection_mode()
             await self._clear_and_show("No transcript available")
             return
 
@@ -192,10 +411,15 @@ class TranscriptView(VerticalScroll):
                 and session_path == self.current_path
                 and mtime == self._last_mtime
             ):
+                # File unchanged — keep selection mode alive
                 return
             self._last_mtime = mtime
         except:
             pass
+
+        # Transcript is actually reloading — exit selection mode now
+        if self._selection_mode:
+            self._exit_selection_mode()
 
         self.current_path = session_path
 
@@ -463,6 +687,23 @@ class ClaudeSessions(App):
         padding: 0 1;
     }
 
+    .status-header {
+        padding: 0 1;
+        color: $text-muted;
+        text-style: italic;
+    }
+
+    /* Keep header backgrounds flat so a disabled header can't be mistaken
+       for a focusable row, even if Textual briefly parks the cursor on it
+       before the disabled-skip logic fires. */
+    SessionStatusHeader, SessionStatusHeader:disabled {
+        background: transparent;
+    }
+
+    ListView:focus > SessionStatusHeader.--highlight {
+        background: transparent;
+    }
+
     .session-label.unread {
         color: $warning;
         text-style: bold;
@@ -476,12 +717,26 @@ class ClaudeSessions(App):
         color: $success;
     }
 
+    .session-label.archived {
+        color: $text-muted;
+        text-style: italic;
+    }
+
     ListView > ListItem.--highlight {
         background: $boost;
     }
 
     ListView:focus > ListItem.--highlight {
         background: $accent;
+    }
+
+    /* Selection highlight — must override per-type border-left */
+    UserMessage.message-selected,
+    AssistantMessage.message-selected,
+    ToolMessage.message-selected {
+        background: $warning 20%;
+        border-left: thick $warning;
+        tint: $warning 8%;
     }
 
     ToastRack {
@@ -512,13 +767,24 @@ class ClaudeSessions(App):
         Binding("shift+up", "move_session_up", "Move Up", show=False),
         Binding("alt+j", "nav_down_from_reply", "Nav Down", show=False),
         Binding("alt+k", "nav_up_from_reply", "Nav Up", show=False),
+        Binding("a", "archive_session", "Archive", show=False),
+        Binding("A", "toggle_archive_view", "Show Archived", show=False),
         Binding("pageup", "scroll_transcript_up", "PgUp", show=False, priority=True),
         Binding(
             "pagedown", "scroll_transcript_down", "PgDn", show=False, priority=True
         ),
         Binding("home", "scroll_transcript_home", "Top", show=False, priority=True),
         Binding("end", "scroll_transcript_end", "Bottom", show=False, priority=True),
+        Binding("s", "cycle_status_forward", "Status", show=False),
+        Binding("S", "cycle_status_backward", "Status Back", show=False),
+        Binding("left_square_bracket", "shrink_sidebar", "Narrow", show=False),
+        Binding("right_square_bracket", "grow_sidebar", "Widen", show=False),
     ]
+
+    SIDEBAR_MIN = 20
+    SIDEBAR_MAX = 60
+    SIDEBAR_STEP = 4
+    SIDEBAR_DEFAULT = 36
 
     def __init__(self, project_filter: str | None = None, days: int = 10):
         super().__init__()
@@ -528,7 +794,21 @@ class ClaudeSessions(App):
         self._selected_session_id = None
         self._spinner_frame = 0
         self._renaming_session_id = None
-        self.config = load_config()
+        self._show_archived = False
+
+        # Open the SQLite store and run the one-time config.json → SQLite
+        # migration (ADR-001). Both calls are idempotent — init_db applies
+        # pending schema migrations, and migrate_config_json_to_sqlite is
+        # guarded by a settings flag so only the first ever launch does
+        # real work.
+        self.conn = db.init_db()
+        db.migrate_config_json_to_sqlite(
+            self.conn, CONFIG_FILE, CLAUDE_PROJECTS
+        )
+
+        self.config = load_config(self.conn)
+        # Defensive defaults: load_config always returns these, but guard
+        # in case a future code path bypasses it.
         if "session_names" not in self.config:
             self.config["session_names"] = {}
         if "session_order" not in self.config:
@@ -551,6 +831,11 @@ class ClaudeSessions(App):
         yield Footer()
 
     def on_mount(self) -> None:
+        # Apply persisted sidebar width (defaults to CSS value of 36).
+        width = self.config.get("sidebar_width", self.SIDEBAR_DEFAULT)
+        width = max(self.SIDEBAR_MIN, min(self.SIDEBAR_MAX, int(width)))
+        self._apply_sidebar_width(width)
+
         self.update_titles()
         self.load_sessions()
         self.query_one("#session-list", ListView).focus()
@@ -808,6 +1093,7 @@ class ClaudeSessions(App):
                             "project": project_name,
                             "cwd": session_cwd,
                             "session_id": jsonl.stem,
+                            "created": stat.st_ctime,
                             "modified": stat.st_mtime,
                             "title": session_title,
                             "first_user_msg": first_user_msg,
@@ -818,6 +1104,18 @@ class ClaudeSessions(App):
         except:
             pass
 
+        # --- Incremental indexing (task #9) ---
+        # Piggyback on the 5s refresh cycle: for each discovered session,
+        # index only the bytes appended since the last run.  Errors in one
+        # session's indexing must not affect others or the refresh cycle.
+        for s in sessions:
+            try:
+                indexer.index_session_incremental(
+                    self.conn, s["session_id"], s["path"],
+                )
+            except Exception:
+                pass
+
         return {"sessions": sessions}
 
     def _apply_session_data(self, data: dict, force_rebuild: bool = False) -> None:
@@ -825,6 +1123,40 @@ class ClaudeSessions(App):
 
         for s in self.sessions:
             s["path"] = Path(s["path"])
+
+        # Keep the `sessions` table in step with the filesystem scan so
+        # user actions (rename, reorder, last_viewed) that target any
+        # currently-visible session can UPDATE a row that actually exists.
+        # upsert_session intentionally leaves user-owned columns
+        # (custom_name, sort_order, last_viewed, status) alone.
+        try:
+            with db.transaction(self.conn):
+                for s in self.sessions:
+                    db.upsert_session(
+                        self.conn,
+                        session_id=s["session_id"],
+                        session_path=str(s["path"]),
+                        project=s.get("project"),
+                        cwd=s.get("cwd"),
+                        created_at=s.get("created"),
+                        modified_at=s.get("modified"),
+                    )
+        except Exception:
+            # A DB hiccup shouldn't break the TUI — we'll retry on the
+            # next refresh tick. Reads still work because the TUI uses
+            # in-memory self.sessions for display.
+            pass
+
+        # Stamp each session dict with its persisted status so the UI can
+        # group by it. Read in bulk after the upsert so new sessions get
+        # the DEFAULT 'active' from the column definition.
+        try:
+            statuses = db.get_session_statuses(self.conn)
+            for s in self.sessions:
+                s["status"] = statuses.get(s["session_id"], "active")
+        except Exception:
+            for s in self.sessions:
+                s.setdefault("status", "active")
 
         self._apply_stable_ordering()
         self._update_session_list(force_rebuild)
@@ -849,23 +1181,85 @@ class ClaudeSessions(App):
 
         if final_order != saved_order:
             self.config["session_order"] = final_order
-            save_config(self.config)
+            # Session ordering lives in SQLite per ADR-001.
+            try:
+                db.set_session_order(self.conn, final_order)
+            except Exception:
+                pass
 
         order_index = {sid: i for i, sid in enumerate(final_order)}
-        self.sessions.sort(key=lambda x: order_index.get(x["session_id"], 999999))
+        # Primary key: status rank (ADR-004 grouping). Secondary key: the
+        # user's manual sort order. An unknown status sorts after all known
+        # ones so a typo or future value never vanishes from the list.
+        self.sessions.sort(
+            key=lambda x: (
+                STATUS_RANK.get(x.get("status", "active"), len(STATUS_ORDER)),
+                order_index.get(x["session_id"], 999999),
+            )
+        )
 
     def _update_session_list(self, force_rebuild: bool = False) -> None:
-        display_sessions = self.sessions[:MAX_SESSIONS]
+        all_sessions = self.sessions[:MAX_SESSIONS]
+
+        # Split into active (non-archived) and archived groups.
+        active_sessions = [s for s in all_sessions if s.get("status") != "archived"]
+        archived_sessions = [s for s in all_sessions if s.get("status") == "archived"]
+
+        if self._show_archived:
+            display_sessions = active_sessions + archived_sessions
+        else:
+            display_sessions = active_sessions
+
+        # Bucket sessions by status. Preserve the in-memory order inside
+        # each bucket — the sort in _apply_stable_ordering already put them
+        # in the right order.
+        groups: dict[str, list[dict]] = {}
+        for s in display_sessions:
+            groups.setdefault(s.get("status", "active"), []).append(s)
+
+        # Build a flat (kind, value) plan for the ListView children. Headers
+        # interleave with sessions; only non-empty groups get a header, so
+        # the sidebar never shows an empty "Done" divider.
+        plan: list[tuple[str, object]] = []
+        for status in STATUS_ORDER:
+            bucket = groups.get(status)
+            if not bucket:
+                continue
+            plan.append(("header", status))
+            for s in bucket:
+                plan.append(("session", s))
+        # Catch-all for statuses outside STATUS_ORDER (shouldn't happen, but
+        # safe): render them under their raw label at the bottom.
+        for status, bucket in groups.items():
+            if status in STATUS_RANK or not bucket:
+                continue
+            plan.append(("header", status))
+            for s in bucket:
+                plan.append(("session", s))
 
         list_view = self.query_one("#session-list", ListView)
-        current_ids = [
-            item.session_data.get("session_id")
-            for item in list_view.children
-            if isinstance(item, SessionItem)
-        ]
-        new_ids = [s.get("session_id") for s in display_sessions]
 
-        if force_rebuild or current_ids != new_ids:
+        # Build fingerprints that capture both structure (headers) and
+        # order (session ids). Any change — status flip, new session,
+        # reorder, header added/removed — triggers a full rebuild.
+        def _fingerprint_children() -> list[tuple[str, str]]:
+            out: list[tuple[str, str]] = []
+            for item in list_view.children:
+                if isinstance(item, SessionStatusHeader):
+                    out.append(("h", item.status))
+                elif isinstance(item, SessionItem):
+                    out.append(("s", item.session_data.get("session_id", "")))
+            return out
+
+        new_fp: list[tuple[str, str]] = [
+            ("h", val) if kind == "header" else ("s", val.get("session_id", ""))  # type: ignore[union-attr]
+            for kind, val in plan
+        ]
+        current_fp = _fingerprint_children()
+
+        if force_rebuild or current_fp != new_fp:
+            # Preserve selection across rebuild. Prefer the explicit
+            # tracker; fall back to whatever is currently highlighted.
             current_session_id = self._selected_session_id
             if (
                 not current_session_id
@@ -877,23 +1271,37 @@ class ClaudeSessions(App):
                 )
 
             list_view.clear()
-            new_index = 0
-            for i, session in enumerate(display_sessions):
-                session_id = session.get("session_id", "")
+            target_index: int | None = None
+            first_session_index: int | None = None
+            for i, (kind, val) in enumerate(plan):
+                if kind == "header":
+                    list_view.append(SessionStatusHeader(val))  # type: ignore[arg-type]
+                    continue
+                session = val  # type: ignore[assignment]
+                session_id = session.get("session_id", "")  # type: ignore[union-attr]
                 custom_name = self.config.get("session_names", {}).get(session_id)
                 last_viewed = self.config.get("last_viewed", {}).get(session_id, 0)
-                is_unread = session["modified"] > last_viewed
+                is_unread = session["modified"] > last_viewed  # type: ignore[index]
                 list_view.append(
-                    SessionItem(session, custom_name, is_unread, self._spinner_frame)
+                    SessionItem(session, custom_name, is_unread, self._spinner_frame)  # type: ignore[arg-type]
                 )
+                if first_session_index is None:
+                    first_session_index = i
                 if session_id == current_session_id:
-                    new_index = i
+                    target_index = i
 
-            if display_sessions:
-                target_index = min(new_index, len(display_sessions) - 1)
+            # If the previously-selected session is gone, land on the first
+            # real session (skip headers — they're disabled so a header
+            # index would just get bounced past anyway, but being explicit
+            # avoids a visible flicker).
+            if target_index is None:
+                target_index = first_session_index
+
+            if target_index is not None:
+                final_index = target_index
 
                 def restore_highlight():
-                    list_view.index = target_index
+                    list_view.index = final_index
 
                 self.call_after_refresh(restore_highlight)
         else:
@@ -960,13 +1368,24 @@ class ClaudeSessions(App):
 
             if "last_viewed" not in self.config:
                 self.config["last_viewed"] = {}
-            self.config["last_viewed"][session_id] = datetime.now().timestamp()
-            save_config(self.config)
+            now_ts = datetime.now().timestamp()
+            self.config["last_viewed"][session_id] = now_ts
+            # last_viewed lives in SQLite per ADR-001.
+            try:
+                db.set_last_viewed(self.conn, session_id, now_ts)
+            except Exception:
+                pass
 
             if event.item.is_unread:
                 event.item.is_unread = False
-                label = event.item.query_one(".session-label", Static)
-                label.remove_class("unread")
+                # query_one can race with mount: a freshly-appended
+                # SessionItem may not have composed its Static child yet
+                # when the highlight watcher fires.
+                try:
+                    label = event.item.query_one(".session-label", Static)
+                    label.remove_class("unread")
+                except Exception:
+                    pass
 
     def action_refresh(self) -> None:
         self.load_sessions()
@@ -989,7 +1408,8 @@ class ClaudeSessions(App):
             next_idx = 0
         self.theme = themes[next_idx]
         self.config["theme"] = self.theme
-        save_config(self.config)
+        # Theme stays in config.json (app-level setting per ADR-001).
+        save_app_config(self.config)
         self.notify(f"Theme: {self.theme}")
 
     def action_rename_session(self) -> None:
@@ -1119,7 +1539,11 @@ class ClaudeSessions(App):
                 self.config["session_names"][session_id] = input_text
             else:
                 self.config["session_names"].pop(session_id, None)
-            save_config(self.config)
+            # Custom names live in SQLite per ADR-001.
+            try:
+                db.set_custom_name(self.conn, session_id, input_text or None)
+            except Exception:
+                pass
             text_area.clear()
             self.query_one("#session-list", ListView).focus()
             self.load_sessions(force_rebuild=True)
@@ -1248,7 +1672,11 @@ class ClaudeSessions(App):
         )
 
         self.config["session_order"] = order
-        save_config(self.config)
+        # Manual reorder lives in SQLite per ADR-001.
+        try:
+            db.set_session_order(self.conn, order)
+        except Exception:
+            pass
 
         order_index = {sid: i for i, sid in enumerate(order)}
         self.sessions.sort(key=lambda x: order_index.get(x["session_id"], 999999))
@@ -1266,6 +1694,136 @@ class ClaudeSessions(App):
                     break
 
         self.call_after_refresh(restore_position)
+
+    def action_cycle_status_forward(self) -> None:
+        if not self._input_has_focus():
+            self._cycle_session_status(1)
+
+    def action_cycle_status_backward(self) -> None:
+        if not self._input_has_focus():
+            self._cycle_session_status(-1)
+
+    def _cycle_session_status(self, direction: int) -> None:
+        list_view = self.query_one("#session-list", ListView)
+        if not list_view.highlighted_child or not isinstance(
+            list_view.highlighted_child, SessionItem
+        ):
+            return
+
+        session = list_view.highlighted_child.session_data
+        session_id = session.get("session_id")
+        if not session_id:
+            return
+
+        current_status = session.get("status", "active")
+        try:
+            idx = STATUS_CYCLE.index(current_status)
+        except ValueError:
+            # Status not in cycle (e.g. archived) — don't cycle it.
+            return
+
+        new_status = STATUS_CYCLE[(idx + direction) % len(STATUS_CYCLE)]
+
+        # Persist to SQLite immediately.
+        try:
+            db.set_session_status(self.conn, session_id, new_status)
+        except Exception:
+            self.notify("Failed to update status", severity="error")
+            return
+
+        # Update in-memory state and re-render.
+        session["status"] = new_status
+        self._selected_session_id = session_id
+        self._update_session_list(force_rebuild=True)
+
+        # Restore highlight to the same session after rebuild.
+        def restore_position():
+            for i, item in enumerate(list_view.children):
+                if (
+                    isinstance(item, SessionItem)
+                    and item.session_data.get("session_id") == session_id
+                ):
+                    list_view.index = i
+                    break
+
+        self.call_after_refresh(restore_position)
+        self.notify(f"Status: {STATUS_LABELS.get(new_status, new_status)}")
+
+    def action_archive_session(self) -> None:
+        """Toggle selected session between archived and active status"""
+        if self._input_has_focus():
+            return
+        list_view = self.query_one("#session-list", ListView)
+        if not list_view.highlighted_child or not isinstance(
+            list_view.highlighted_child, SessionItem
+        ):
+            return
+        session = list_view.highlighted_child.session_data
+        session_id = session.get("session_id")
+        if not session_id:
+            return
+        current_status = session.get("status", "active")
+        if current_status == "archived":
+            new_status = "active"
+        else:
+            new_status = "archived"
+        try:
+            db.set_session_status(self.conn, session_id, new_status)
+        except Exception:
+            self.notify("Failed to update session status", severity="error")
+            return
+        # Update in-memory status and re-render.
+        session["status"] = new_status
+        self._selected_session_id = session_id
+        self._update_session_list(force_rebuild=True)
+
+        def restore_position():
+            for i, item in enumerate(list_view.children):
+                if (
+                    isinstance(item, SessionItem)
+                    and item.session_data.get("session_id") == session_id
+                ):
+                    list_view.index = i
+                    break
+
+        self.call_after_refresh(restore_position)
+        if new_status == "archived":
+            self.notify("Session archived")
+        else:
+            self.notify("Session restored")
+
+    def action_toggle_archive_view(self) -> None:
+        """Toggle visibility of archived sessions in the sidebar"""
+        if self._input_has_focus():
+            return
+        self._show_archived = not self._show_archived
+        if self._show_archived:
+            self.notify("Showing archived sessions")
+        else:
+            self.notify("Hiding archived sessions")
+        self._update_session_list(force_rebuild=True)
+
+    def _apply_sidebar_width(self, width: int) -> None:
+        """Set grid columns to the given sidebar width."""
+        self.screen.styles.grid_columns = f"{width} 1fr"
+
+    def action_shrink_sidebar(self) -> None:
+        if self._input_has_focus():
+            return
+        current = self.config.get("sidebar_width", self.SIDEBAR_DEFAULT)
+        new_width = max(self.SIDEBAR_MIN, int(current) - self.SIDEBAR_STEP)
+        self._apply_sidebar_width(new_width)
+        self.config["sidebar_width"] = new_width
+        save_app_config(self.config)
+
+    def action_grow_sidebar(self) -> None:
+        if self._input_has_focus():
+            return
+        current = self.config.get("sidebar_width", self.SIDEBAR_DEFAULT)
+        new_width = min(self.SIDEBAR_MAX, int(current) + self.SIDEBAR_STEP)
+        self._apply_sidebar_width(new_width)
+        self.config["sidebar_width"] = new_width
+        save_app_config(self.config)
 
     def action_scroll_transcript_up(self) -> None:
         self.query_one("#transcript-scroll", TranscriptView).scroll_page_up(
