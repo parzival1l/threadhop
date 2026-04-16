@@ -135,6 +135,10 @@ STATUS_LABELS: dict[str, str] = {
 }
 STATUS_RANK: dict[str, int] = {s: i for i, s in enumerate(STATUS_ORDER)}
 
+# Cycleable statuses for s/S keybinds (ADR-004, task #4).
+# "archived" is excluded — it gets its own keybind in task #5.
+STATUS_CYCLE: list[str] = [s for s in STATUS_ORDER if s != "archived"]
+
 # Regex to strip <system-reminder>...</system-reminder> blocks from text
 SYSTEM_REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
 
@@ -621,6 +625,8 @@ class ClaudeSessions(App):
         ),
         Binding("home", "scroll_transcript_home", "Top", show=False, priority=True),
         Binding("end", "scroll_transcript_end", "Bottom", show=False, priority=True),
+        Binding("s", "cycle_status_forward", "Status", show=False),
+        Binding("S", "cycle_status_backward", "Status Back", show=False),
     ]
 
     def __init__(self, project_filter: str | None = None, days: int = 10):
@@ -1504,6 +1510,60 @@ class ClaudeSessions(App):
                     break
 
         self.call_after_refresh(restore_position)
+
+    def action_cycle_status_forward(self) -> None:
+        if not self._input_has_focus():
+            self._cycle_session_status(1)
+
+    def action_cycle_status_backward(self) -> None:
+        if not self._input_has_focus():
+            self._cycle_session_status(-1)
+
+    def _cycle_session_status(self, direction: int) -> None:
+        list_view = self.query_one("#session-list", ListView)
+        if not list_view.highlighted_child or not isinstance(
+            list_view.highlighted_child, SessionItem
+        ):
+            return
+
+        session = list_view.highlighted_child.session_data
+        session_id = session.get("session_id")
+        if not session_id:
+            return
+
+        current_status = session.get("status", "active")
+        try:
+            idx = STATUS_CYCLE.index(current_status)
+        except ValueError:
+            # Status not in cycle (e.g. archived) — don't cycle it.
+            return
+
+        new_status = STATUS_CYCLE[(idx + direction) % len(STATUS_CYCLE)]
+
+        # Persist to SQLite immediately.
+        try:
+            db.set_session_status(self.conn, session_id, new_status)
+        except Exception:
+            self.notify("Failed to update status", severity="error")
+            return
+
+        # Update in-memory state and re-render.
+        session["status"] = new_status
+        self._selected_session_id = session_id
+        self._update_session_list(force_rebuild=True)
+
+        # Restore highlight to the same session after rebuild.
+        def restore_position():
+            for i, item in enumerate(list_view.children):
+                if (
+                    isinstance(item, SessionItem)
+                    and item.session_data.get("session_id") == session_id
+                ):
+                    list_view.index = i
+                    break
+
+        self.call_after_refresh(restore_position)
+        self.notify(f"Status: {STATUS_LABELS.get(new_status, new_status)}")
 
     def action_scroll_transcript_up(self) -> None:
         self.query_one("#transcript-scroll", TranscriptView).scroll_page_up(
