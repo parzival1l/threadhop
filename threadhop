@@ -22,7 +22,7 @@ from rich.markup import escape
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Footer, Header, Input, ListItem, ListView, Static, TextArea
 from textual.worker import Worker
@@ -314,6 +314,17 @@ class TranscriptView(VerticalScroll):
         # the refresh would reload whatever the sidebar highlights and
         # yank the user back to the original view.
         self._foreign_session_path: Path | None = None
+
+        # Find-in-transcript state (Ctrl+F-style persistent bar).
+        # Non-empty _find_query means find mode is active — all
+        # transcript reloads re-apply highlights across every matching
+        # message widget, and n/N navigation cycles _find_current
+        # through _find_matches (widget-index positions). Cleared by
+        # App._close_find which also force-reloads to drop the inline
+        # highlight rewrites and restore Markdown formatting.
+        self._find_query: str = ""
+        self._find_matches: list[int] = []
+        self._find_current: int = -1
 
     def _get_message_widgets(self):
         """Return all message widgets in order."""
@@ -750,13 +761,22 @@ class TranscriptView(VerticalScroll):
 
         # Decide the post-mount scroll behavior, in priority order:
         #
-        # 1. Search just handed us a jump-to-source → honor it.
-        # 2. A previous jump is still "active" (highlight state survived
+        # 1. Find mode is active → re-apply highlights across every
+        #    matching widget and park the cursor on the current match
+        #    (or the pending jump-target uuid, if any).
+        # 2. Search just handed us a jump-to-source → honor it.
+        # 3. A previous jump is still "active" (highlight state survived
         #    into this reload, e.g. the 5-second refresh hit while the
         #    user is still reading a match) → re-apply the highlight
         #    so it isn't lost on every tick.
-        # 3. Normal reload → scroll to the bottom (live tail).
-        if self._pending_scroll_uuid is not None:
+        # 4. Normal reload → scroll to the bottom (live tail).
+        if self._find_query:
+            target_uuid = self._pending_scroll_uuid
+            self._pending_scroll_uuid = None
+            self._pending_scroll_terms = None
+            self._apply_find_highlights(self._find_query, anchor_uuid=target_uuid)
+            self._report_find_status()
+        elif self._pending_scroll_uuid is not None:
             target = self._pending_scroll_uuid
             terms = self._pending_scroll_terms
             self._pending_scroll_uuid = None
@@ -933,6 +953,138 @@ class TranscriptView(VerticalScroll):
             return max(lowest, 0)
         except Exception:
             return 0
+
+    def activate_find(
+        self,
+        query: str,
+        anchor_uuid: str | None = None,
+    ) -> tuple[int, int]:
+        """Turn on find mode for ``query`` and return ``(current, total)``.
+
+        Walks every message widget, rebuilding any that contain the term
+        so matches are visible inline, and records the list of matching
+        widget indices in ``_find_matches``. If ``anchor_uuid`` is given
+        and belongs to a matching widget, cursor starts on that match —
+        otherwise on the first match. ``current`` is 1-based (0 if no
+        matches); ``total`` is the number of matching widgets.
+        """
+        self._find_query = query or ""
+        if not self._find_query.strip():
+            self._find_matches = []
+            self._find_current = -1
+            return 0, 0
+        self._apply_find_highlights(self._find_query, anchor_uuid=anchor_uuid)
+        total = len(self._find_matches)
+        current = (self._find_current + 1) if self._find_current >= 0 else 0
+        return current, total
+
+    def next_match(self) -> tuple[int, int]:
+        """Advance to the next match (wraps). ``(0, 0)`` when none exist."""
+        if not self._find_matches:
+            return 0, 0
+        self._find_current = (self._find_current + 1) % len(self._find_matches)
+        self._scroll_to_match_index(self._find_current)
+        return self._find_current + 1, len(self._find_matches)
+
+    def prev_match(self) -> tuple[int, int]:
+        """Step back to the previous match (wraps). ``(0, 0)`` when none."""
+        if not self._find_matches:
+            return 0, 0
+        self._find_current = (self._find_current - 1) % len(self._find_matches)
+        self._scroll_to_match_index(self._find_current)
+        return self._find_current + 1, len(self._find_matches)
+
+    def clear_find_state(self) -> None:
+        """Drop find mode state. Caller must force-reload the transcript
+        to restore the pre-highlight rendering (Markdown, etc.)."""
+        self._find_query = ""
+        self._find_matches = []
+        self._find_current = -1
+
+    def _apply_find_highlights(
+        self,
+        query: str,
+        anchor_uuid: str | None = None,
+    ) -> None:
+        """Highlight every occurrence of ``query`` across all messages
+        and rebuild ``_find_matches`` / ``_find_current``.
+
+        Case-insensitive substring match against each widget's
+        ``_raw_text``. When ``anchor_uuid`` lands on a matching widget
+        the cursor snaps there; otherwise we clamp the previous cursor
+        into range (so widget-add on reload doesn't yank focus) or fall
+        back to the first match.
+        """
+        if not query:
+            self._find_matches = []
+            self._find_current = -1
+            return
+
+        try:
+            pattern = re.compile(re.escape(query), re.IGNORECASE)
+        except re.error:
+            self._find_matches = []
+            self._find_current = -1
+            return
+
+        widgets = self._get_message_widgets()
+        matches: list[int] = []
+        for idx, widget in enumerate(widgets):
+            raw = getattr(widget, "_raw_text", "") or ""
+            if not raw:
+                continue
+            if not pattern.search(raw):
+                continue
+            matches.append(idx)
+            self._rebuild_widget_with_highlights(widget, [query])
+
+        self._find_matches = matches
+
+        if not matches:
+            self._find_current = -1
+            return
+
+        anchor_pos = -1
+        if anchor_uuid:
+            for pos, idx in enumerate(matches):
+                if idx < len(widgets) and getattr(widgets[idx], "_uuid", None) == anchor_uuid:
+                    anchor_pos = pos
+                    break
+
+        if anchor_pos >= 0:
+            self._find_current = anchor_pos
+        elif self._find_current >= 0:
+            self._find_current = min(self._find_current, len(matches) - 1)
+        else:
+            self._find_current = 0
+
+        self._scroll_to_match_index(self._find_current)
+
+    def _scroll_to_match_index(self, match_pos: int) -> None:
+        """Scroll so the widget at ``_find_matches[match_pos]`` is on screen."""
+        if not self._find_matches:
+            return
+        if match_pos < 0 or match_pos >= len(self._find_matches):
+            return
+        widgets = self._get_message_widgets()
+        widget_idx = self._find_matches[match_pos]
+        if widget_idx >= len(widgets):
+            return
+        widget = widgets[widget_idx]
+        try:
+            widget.scroll_visible(animate=False, top=True)
+        except Exception:
+            pass
+
+    def _report_find_status(self) -> None:
+        """Push the current match counter to the find bar."""
+        try:
+            find_bar = self.app.query_one("#find-bar", FindBar)
+        except Exception:
+            return
+        total = len(self._find_matches)
+        current = self._find_current + 1 if total else 0
+        find_bar.update_status(current, total, bool(self._find_query.strip()))
 
     async def _remove_all_messages(self):
         """Remove all message widgets, awaiting completion"""
@@ -1533,6 +1685,79 @@ class SearchScreen(ModalScreen):
         self.dismiss((row["session_id"], row["uuid"], terms))
 
 
+class FindBar(Horizontal):
+    """Persistent Ctrl+F-style find bar shown above the transcript.
+
+    Stays open until the user dismisses it (Esc, ×, or Ctrl+F again), so
+    the active query remains editable and the match counter remains
+    visible across session switches. Unlike ``SearchScreen`` (which
+    issues FTS5 queries across ALL indexed sessions), this bar operates
+    purely on widgets already rendered in the current ``TranscriptView``
+    — it's a within-transcript "find in page", not a cross-session
+    search.
+
+    Hidden by default via ``display = False``; App.action_open_find
+    toggles it visible and focuses the input.
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Input(
+            placeholder="Find in transcript… (Enter=next, ↑/↓ prev/next, Esc=close)",
+            id="find-input",
+        )
+        yield Static("", id="find-status")
+        yield Static("[×]", id="find-close")
+
+    def update_status(self, current: int, total: int, has_query: bool) -> None:
+        """Set the match counter. ``has_query=False`` blanks the status."""
+        status = self.query_one("#find-status", Static)
+        if not has_query:
+            status.update("")
+        elif total == 0:
+            status.update("No matches")
+        elif total == 1:
+            status.update("1 match")
+        else:
+            status.update(f"{current} of {total} matches")
+
+    def on_key(self, event) -> None:
+        """Arrow / Escape bubble up from the Input — keep them here.
+
+        Up/Down navigate matches without leaving the input. Escape
+        closes the bar and clears highlights. Enter is handled by the
+        app's ``on_input_submitted`` because Input fires Submitted on
+        Enter, not a raw key event here.
+        """
+        key = event.key
+        if key == "escape":
+            event.stop()
+            event.prevent_default()
+            self.app._close_find()
+        elif key == "down":
+            event.stop()
+            event.prevent_default()
+            self.app.action_find_next()
+        elif key == "up":
+            event.stop()
+            event.prevent_default()
+            self.app.action_find_prev()
+
+    def on_click(self, event) -> None:
+        """Click on the × static to dismiss.
+
+        Textual's Click event bubbles up the widget tree; checking the
+        event's widget id here lets the whole bar act as a click host
+        without extra message plumbing.
+        """
+        try:
+            target = getattr(event, "widget", None)
+            if target is not None and target.id == "find-close":
+                event.stop()
+                self.app._close_find()
+        except Exception:
+            pass
+
+
 class ClaudeSessions(App):
     """Cross-session context manager for Claude Code"""
 
@@ -1554,10 +1779,52 @@ class ClaudeSessions(App):
         border-title-color: $text;
     }
 
-    #transcript-scroll {
+    #transcript-column {
         height: 100%;
+        layout: vertical;
+    }
+
+    #transcript-scroll {
+        height: 1fr;
         border: solid $secondary;
         border-title-color: $text;
+    }
+
+    FindBar {
+        height: 1;
+        background: $boost;
+        layout: horizontal;
+    }
+
+    #find-input {
+        width: 1fr;
+        height: 1;
+        border: none;
+        padding: 0 1;
+        background: $boost;
+    }
+
+    #find-input:focus {
+        background: $surface;
+    }
+
+    #find-status {
+        width: auto;
+        height: 1;
+        padding: 0 2;
+        color: $text-muted;
+    }
+
+    #find-close {
+        width: 3;
+        height: 1;
+        content-align: center middle;
+        color: $error;
+        background: $error 15%;
+    }
+
+    #find-close:hover {
+        background: $error 30%;
     }
 
     #input-container {
@@ -1685,6 +1952,8 @@ class ClaudeSessions(App):
         Binding("enter", "start_reply_or_send", "Reply/Send", show=True, priority=True),
         Binding("alt+enter", "insert_newline", "Newline", show=False),
         Binding("/", "open_search", "Search"),
+        Binding("ctrl+f", "open_find", "Find"),
+        Binding("N", "find_prev", "Prev match", show=False),
         Binding("escape", "cancel_reply", "Cancel", show=False),
         Binding("right", "focus_transcript", "Transcript", show=False),
         Binding("left", "focus_list", "Sessions", show=False),
@@ -1726,6 +1995,9 @@ class ClaudeSessions(App):
         self._spinner_frame = 0
         self._renaming_session_id = None
         self._show_archived = False
+        # Debounce timer for the in-transcript find bar so fast typing
+        # collapses into a single highlight pass.
+        self._find_timer = None
 
         # Open the SQLite store and run the one-time config.json → SQLite
         # migration (ADR-001). Both calls are idempotent — init_db applies
@@ -1757,7 +2029,11 @@ class ClaudeSessions(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield ListView(id="session-list")
-        yield TranscriptView(id="transcript-scroll")
+        yield Vertical(
+            FindBar(id="find-bar"),
+            TranscriptView(id="transcript-scroll"),
+            id="transcript-column",
+        )
         yield Vertical(TextArea(id="reply-input"), id="input-container")
         yield Footer()
 
@@ -1766,6 +2042,15 @@ class ClaudeSessions(App):
         width = self.config.get("sidebar_width", self.SIDEBAR_DEFAULT)
         width = max(self.SIDEBAR_MIN, min(self.SIDEBAR_MAX, int(width)))
         self._apply_sidebar_width(width)
+
+        # Find bar is hidden until the user invokes Ctrl+F or jumps in
+        # from the cross-session SearchScreen. Setting ``display`` (not
+        # a CSS class) keeps the bar out of the layout flow entirely,
+        # so the transcript fills the column while it's inactive.
+        try:
+            self.query_one("#find-bar", FindBar).display = False
+        except Exception:
+            pass
 
         self.update_titles()
         self.load_sessions()
@@ -2302,9 +2587,14 @@ class ClaudeSessions(App):
             # foreign-session search jump, even when the user re-selects
             # the row that was already highlighted — Highlighted doesn't
             # fire in that case, but Selected does.
+            #
+            # Keep ``_find_query`` alive so the find bar applies to the
+            # reselected transcript too; just reset the match cursor.
             transcript._foreign_session_path = None
             transcript._active_highlight_uuid = None
             transcript._active_highlight_terms = None
+            if transcript._find_query:
+                transcript._find_current = -1
 
             await transcript.load_transcript(event.item.session_data["path"])
 
@@ -2320,9 +2610,17 @@ class ClaudeSessions(App):
             # reloads don't try to re-apply stale highlights. The
             # search-flow sets these fresh after this handler runs, via
             # queue_scroll_to_uuid, so same-sidebar jumps aren't broken.
+            #
+            # ``_find_query`` is DELIBERATELY preserved — the find bar
+            # follows the user across session switches so the same term
+            # keeps highlighting in each transcript they browse. Reset
+            # the match cursor so the re-run lands on the first match
+            # in the new transcript rather than a stale index.
             transcript._foreign_session_path = None
             transcript._active_highlight_uuid = None
             transcript._active_highlight_terms = None
+            if transcript._find_query:
+                transcript._find_current = -1
 
             await transcript.load_transcript(event.item.session_data["path"])
 
@@ -2375,6 +2673,12 @@ class ClaudeSessions(App):
     def action_rename_session(self) -> None:
         if self._input_has_focus():
             return
+        # `n` doubles as next-match while find mode is active so the
+        # Ctrl+F workflow stays keyboard-only without colliding with
+        # the rename shortcut the rest of the time.
+        if self._find_is_active():
+            self.action_find_next()
+            return
         list_view = self.query_one("#session-list", ListView)
         if not list_view.highlighted_child or not isinstance(
             list_view.highlighted_child, SessionItem
@@ -2416,7 +2720,27 @@ class ClaudeSessions(App):
             self.notify(f"Resume: {cmd}", timeout=10)
 
     def _input_has_focus(self) -> bool:
-        return self.query_one("#reply-input", TextArea).has_focus
+        if self.query_one("#reply-input", TextArea).has_focus:
+            return True
+        # The find-bar Input counts as an active text input too — stops
+        # top-level bindings like `q`, `/`, `n` from firing while the
+        # user is typing a query in the bar.
+        try:
+            if self.query_one("#find-input", Input).has_focus:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _find_bar(self) -> "FindBar | None":
+        try:
+            return self.query_one("#find-bar", FindBar)
+        except Exception:
+            return None
+
+    def _find_is_active(self) -> bool:
+        bar = self._find_bar()
+        return bool(bar and bar.display)
 
     def action_maybe_quit(self) -> None:
         if not self._input_has_focus():
@@ -2452,6 +2776,110 @@ class ClaudeSessions(App):
             return
         self.push_screen(SearchScreen(self.conn), self._on_search_dismissed)
 
+    def action_open_find(self) -> None:
+        """Toggle the persistent in-transcript find bar.
+
+        Pressing Ctrl+F from anywhere in the app pops the bar open,
+        focuses the input, and (if it already contains a query) re-runs
+        the find so highlights reflect the current transcript. Pressing
+        Ctrl+F again with the bar already open refocuses the input —
+        never closes the bar (Escape / × do that) so the query isn't
+        accidentally lost.
+        """
+        bar = self._find_bar()
+        if bar is None:
+            return
+        bar.display = True
+        input_widget = bar.query_one("#find-input", Input)
+        input_widget.focus()
+        existing = (input_widget.value or "").strip()
+        if existing:
+            self._run_find(input_widget.value)
+
+    def action_find_next(self) -> None:
+        if not self._find_is_active():
+            return
+        transcript = self.query_one("#transcript-scroll", TranscriptView)
+        current, total = transcript.next_match()
+        self._update_find_status(current, total)
+
+    def action_find_prev(self) -> None:
+        if not self._find_is_active():
+            return
+        transcript = self.query_one("#transcript-scroll", TranscriptView)
+        current, total = transcript.prev_match()
+        self._update_find_status(current, total)
+
+    def _run_find(self, query: str, anchor_uuid: str | None = None) -> None:
+        """Apply ``query`` as the find-bar term and refresh the counter."""
+        transcript = self.query_one("#transcript-scroll", TranscriptView)
+        current, total = transcript.activate_find(query, anchor_uuid=anchor_uuid)
+        self._update_find_status(current, total)
+
+    def _update_find_status(self, current: int, total: int) -> None:
+        bar = self._find_bar()
+        if bar is None:
+            return
+        try:
+            query = bar.query_one("#find-input", Input).value or ""
+        except Exception:
+            query = ""
+        bar.update_status(current, total, bool(query.strip()))
+
+    def _close_find(self) -> None:
+        """Dismiss the find bar and drop all highlights.
+
+        Force-reloads the transcript so the inline-highlight rewrites
+        (which replace Markdown bodies with plain-text Rich renderables)
+        are reverted on all widgets. Focus lands back on the sidebar —
+        the typical resting position after a find session.
+        """
+        bar = self._find_bar()
+        transcript = self.query_one("#transcript-scroll", TranscriptView)
+        transcript.clear_find_state()
+        transcript._active_highlight_uuid = None
+        transcript._active_highlight_terms = None
+        if bar is not None:
+            try:
+                bar.query_one("#find-input", Input).value = ""
+            except Exception:
+                pass
+            bar.update_status(0, 0, False)
+            bar.display = False
+        if transcript.current_path:
+            self.call_later(transcript.load_transcript, transcript.current_path, True)
+        try:
+            self.query_one("#session-list", ListView).focus()
+        except Exception:
+            pass
+
+    def on_input_changed(self, event) -> None:
+        """Debounce keystrokes in the find bar into a single highlight pass."""
+        try:
+            if event.input.id != "find-input":
+                return
+        except AttributeError:
+            return
+        if self._find_timer is not None:
+            try:
+                self._find_timer.stop()
+            except Exception:
+                pass
+        value = event.value
+        self._find_timer = self.set_timer(
+            0.1, lambda v=value: self._run_find(v)
+        )
+
+    def on_input_submitted(self, event) -> None:
+        """Enter in the find input = jump to the next match."""
+        try:
+            if event.input.id != "find-input":
+                return
+        except AttributeError:
+            return
+        event.stop()
+        self.action_find_next()
+
     def _on_search_dismissed(self, result) -> None:
         """Dismiss callback: the user either selected a row or pressed Esc."""
         if result is None:
@@ -2465,6 +2893,34 @@ class ClaudeSessions(App):
                 terms = None
         except (TypeError, ValueError):
             return
+
+        # Pre-activate find mode BEFORE the jump so the post-load hook
+        # in TranscriptView.load_transcript applies highlights across
+        # every matching widget (not just the jump target) as soon as
+        # the transcript finishes loading. The anchor_uuid parameter is
+        # passed through via the pending-scroll path so the match
+        # cursor lands on the result the user actually clicked.
+        query = " ".join(terms) if terms else ""
+        transcript = self.query_one("#transcript-scroll", TranscriptView)
+        bar = self._find_bar()
+        if query and bar is not None:
+            bar.display = True
+            input_widget = bar.query_one("#find-input", Input)
+            # Set the find-mode state directly so the transcript reload
+            # sees it immediately; also mirror it in the visible Input
+            # so the user can edit. Suppress the debounce re-run since
+            # activate_find on load will handle the initial highlight.
+            transcript._find_query = query
+            if self._find_timer is not None:
+                try:
+                    self._find_timer.stop()
+                except Exception:
+                    pass
+            # Setting Input.value triggers Changed → debounced _run_find;
+            # that's fine — it just re-runs the same query after load,
+            # keeping state consistent if the user edits the value next.
+            input_widget.value = query
+
         self._jump_to_search_result(session_id, message_uuid, terms)
 
     def _jump_to_search_result(
@@ -2502,9 +2958,22 @@ class ClaudeSessions(App):
             # foreign-session lock from a previous cross-project jump.
             transcript._foreign_session_path = None
             if list_view.index == target_idx:
+                # Same session already loaded — no reload will fire, so
+                # the post-load find hook won't run. If find mode is
+                # live, apply highlights across every matching widget
+                # right here and anchor the cursor on the jump target.
+                # Otherwise fall back to the legacy single-widget
+                # highlight path (keeps behavior identical when find
+                # mode is off).
                 transcript._pending_scroll_uuid = None
                 transcript._pending_scroll_terms = None
-                if not transcript._scroll_to_uuid(message_uuid, search_terms):
+                if transcript._find_query:
+                    current, total = transcript.activate_find(
+                        transcript._find_query,
+                        anchor_uuid=message_uuid,
+                    )
+                    self._update_find_status(current, total)
+                elif not transcript._scroll_to_uuid(message_uuid, search_terms):
                     self.notify(
                         "Message not found in loaded transcript",
                         severity="warning",
@@ -2557,14 +3026,21 @@ class ClaudeSessions(App):
         )
 
     def check_action(self, action: str, parameters):
-        """Disable the priority Enter binding while a modal is up.
+        """Disable the priority Enter binding while a modal is up OR the
+        find-bar input has focus.
 
-        Returning False here tells Textual the binding doesn't match, so
-        the key event passes through to the modal screen's own bindings
-        and widgets instead of being swallowed by this app-level handler.
+        Returning False tells Textual the binding doesn't match, so the
+        key event passes through to whatever owns focus (the modal, or
+        the find input's own Submitted handler).
         """
-        if action == "start_reply_or_send" and len(self.screen_stack) > 1:
-            return False
+        if action == "start_reply_or_send":
+            if len(self.screen_stack) > 1:
+                return False
+            try:
+                if self.query_one("#find-input", Input).has_focus:
+                    return False
+            except Exception:
+                pass
         return True
 
     def action_start_reply_or_send(self) -> None:
@@ -2588,6 +3064,12 @@ class ClaudeSessions(App):
             text_area.insert("\n")
 
     def action_cancel_reply(self) -> None:
+        # Escape closes the find bar first if it's up (Ctrl+F semantics):
+        # users expect it to peel off the overlay rather than clear the
+        # reply buffer underneath.
+        if self._find_is_active():
+            self._close_find()
+            return
         text_area = self.query_one("#reply-input", TextArea)
         text_area.clear()
         self._renaming_session_id = None
