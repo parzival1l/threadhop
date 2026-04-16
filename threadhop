@@ -506,10 +506,9 @@ class TranscriptView(VerticalScroll):
 
     async def load_transcript(self, session_path: Path, force: bool = False):
         """Load and display full conversation from transcript"""
-        if self._selection_mode:
-            self._exit_selection_mode()
-
         if not session_path or not session_path.exists():
+            if self._selection_mode:
+                self._exit_selection_mode()
             await self._clear_and_show("No transcript available")
             return
 
@@ -520,10 +519,15 @@ class TranscriptView(VerticalScroll):
                 and session_path == self.current_path
                 and mtime == self._last_mtime
             ):
+                # File unchanged — keep selection mode alive
                 return
             self._last_mtime = mtime
         except:
             pass
+
+        # Transcript is actually reloading — exit selection mode now
+        if self._selection_mode:
+            self._exit_selection_mode()
 
         self.current_path = session_path
 
