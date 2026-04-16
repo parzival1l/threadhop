@@ -285,6 +285,7 @@ class TranscriptView(VerticalScroll):
         self._last_mtime = 0
         self._selection_mode = False
         self._selected_index = -1
+        self._range_anchor = -1  # -1 = no range; >= 0 = anchor index
 
     def _get_message_widgets(self):
         """Return all message widgets in order."""
@@ -311,6 +312,10 @@ class TranscriptView(VerticalScroll):
                 self._select_previous()
                 event.stop()
                 event.prevent_default()
+            elif event.key == "v":
+                self._toggle_range()
+                event.stop()
+                event.prevent_default()
             elif event.key == "escape":
                 self._exit_selection_mode()
                 event.stop()
@@ -321,16 +326,28 @@ class TranscriptView(VerticalScroll):
         if not messages:
             return
         self._selection_mode = True
+        self._range_anchor = -1
         # Start at the last message — recent context is usually what you want
         self._selected_index = len(messages) - 1
         self._update_selection(messages)
-        self.app.notify("Selection mode: j/k to navigate, m or Esc to exit")
+        self.app.notify("Selection mode: j/k move, v range, m/Esc exit")
 
     def _exit_selection_mode(self):
         self._clear_selection()
         self._selection_mode = False
         self._selected_index = -1
+        self._range_anchor = -1
         self.border_title = "Transcript"
+
+    def _toggle_range(self):
+        if self._range_anchor >= 0:
+            # Deactivate range, keep cursor where it is
+            self._range_anchor = -1
+            self.app.notify("Range cancelled")
+        else:
+            self._range_anchor = self._selected_index
+            self.app.notify("Range started — move j/k to extend, v to cancel")
+        self._update_selection()
 
     def _select_next(self):
         messages = self._get_message_widgets()
@@ -346,19 +363,34 @@ class TranscriptView(VerticalScroll):
         self._selected_index = max(self._selected_index - 1, 0)
         self._update_selection(messages)
 
+    def _get_selected_range(self) -> tuple[int, int]:
+        """Return (start, end) indices of the current selection (inclusive)."""
+        if self._range_anchor >= 0:
+            lo = min(self._range_anchor, self._selected_index)
+            hi = max(self._range_anchor, self._selected_index)
+            return (lo, hi)
+        return (self._selected_index, self._selected_index)
+
     def _update_selection(self, messages=None):
         if messages is None:
             messages = self._get_message_widgets()
+        lo, hi = self._get_selected_range()
         for i, widget in enumerate(messages):
-            if i == self._selected_index:
+            if lo <= i <= hi:
                 widget.add_class("message-selected")
-                widget.scroll_visible()
             else:
                 widget.remove_class("message-selected")
-        # Update position counter in border title
+        # Scroll the cursor (not the anchor) into view
+        if 0 <= self._selected_index < len(messages):
+            messages[self._selected_index].scroll_visible()
+        # Update border title with position info
         total = len(messages)
         pos = self._selected_index + 1
-        self.border_title = f"Transcript ── SELECT {pos}/{total} (j/k move, m/Esc exit)"
+        count = hi - lo + 1
+        if count > 1:
+            self.border_title = f"Transcript ── SELECT {pos}/{total} ({count} selected)"
+        else:
+            self.border_title = f"Transcript ── SELECT {pos}/{total} (j/k move, v range)"
 
     def _clear_selection(self):
         for widget in self._get_message_widgets():
@@ -366,10 +398,9 @@ class TranscriptView(VerticalScroll):
 
     async def load_transcript(self, session_path: Path, force: bool = False):
         """Load and display full conversation from transcript"""
-        if self._selection_mode:
-            self._exit_selection_mode()
-
         if not session_path or not session_path.exists():
+            if self._selection_mode:
+                self._exit_selection_mode()
             await self._clear_and_show("No transcript available")
             return
 
@@ -380,10 +411,15 @@ class TranscriptView(VerticalScroll):
                 and session_path == self.current_path
                 and mtime == self._last_mtime
             ):
+                # File unchanged — keep selection mode alive
                 return
             self._last_mtime = mtime
         except:
             pass
+
+        # Transcript is actually reloading — exit selection mode now
+        if self._selection_mode:
+            self._exit_selection_mode()
 
         self.current_path = session_path
 

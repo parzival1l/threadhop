@@ -57,6 +57,7 @@ threadhop --days 7                     # last 7 days only
 |-----|--------|
 | `m` | Enter / exit selection mode (starts at last message) |
 | `j` / `k` or `Down` / `Up` | Move selection between messages |
+| `v` | Start / cancel range selection (anchor + extend) |
 | `Escape` | Exit selection mode |
 
 ### Display
