@@ -279,3 +279,356 @@ def set_setting(conn: sqlite3.Connection, key: str, value: Any) -> None:
 def delete_setting(conn: sqlite3.Connection, key: str) -> None:
     """Remove a setting. No-op if the key doesn't exist."""
     conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+
+
+# --- Session-row helpers --------------------------------------------------
+# Thin wrappers over the `sessions` table for the fields that get touched
+# by both the filesystem scan and the user's UI actions. Splitting these
+# keeps the callers honest about which fields they own:
+#   - filesystem scan owns: session_path, project, cwd, modified_at, created_at
+#   - user actions own:     custom_name, sort_order, last_viewed, status
+# upsert_session deliberately does NOT touch the user-owned fields so the
+# background refresh loop can refresh rows without clobbering renames.
+
+def upsert_session(
+    conn: sqlite3.Connection,
+    session_id: str,
+    session_path: str,
+    *,
+    project: str | None = None,
+    cwd: str | None = None,
+    created_at: float | None = None,
+    modified_at: float | None = None,
+) -> None:
+    """Ensure a row exists for `session_id` with fresh filesystem metadata.
+
+    On conflict, refreshes the filesystem-owned columns (path/project/cwd/
+    modified_at) but leaves custom_name, sort_order, last_viewed, and
+    status alone — those are owned by user actions and must survive a
+    routine rescan.
+    """
+    conn.execute(
+        """
+        INSERT INTO sessions (
+            session_id, session_path, project, cwd, created_at, modified_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(session_id) DO UPDATE SET
+            session_path = excluded.session_path,
+            project      = COALESCE(excluded.project, sessions.project),
+            cwd          = COALESCE(excluded.cwd, sessions.cwd),
+            modified_at  = COALESCE(excluded.modified_at, sessions.modified_at)
+        """,
+        (session_id, session_path, project, cwd, created_at, modified_at),
+    )
+
+
+def set_custom_name(
+    conn: sqlite3.Connection,
+    session_id: str,
+    name: str | None,
+) -> None:
+    """Set the user-chosen display name for a session. Empty string clears it."""
+    conn.execute(
+        "UPDATE sessions SET custom_name = ? WHERE session_id = ?",
+        (name or None, session_id),
+    )
+
+
+def set_last_viewed(
+    conn: sqlite3.Connection,
+    session_id: str,
+    timestamp: float,
+) -> None:
+    """Record the last time the user opened this session (for unread marking)."""
+    conn.execute(
+        "UPDATE sessions SET last_viewed = ? WHERE session_id = ?",
+        (timestamp, session_id),
+    )
+
+
+def set_session_order(conn: sqlite3.Connection, ordered_ids: list[str]) -> None:
+    """Rewrite sort_order so ordered_ids[0] is first, [1] second, ….
+
+    Sessions not in the list get sort_order = NULL (they'll be sorted to
+    the end by the UI's ordering pass). Runs inside a single transaction
+    so the list is never observed in a half-updated state.
+    """
+    with transaction(conn):
+        conn.execute("UPDATE sessions SET sort_order = NULL")
+        if ordered_ids:
+            conn.executemany(
+                "UPDATE sessions SET sort_order = ? WHERE session_id = ?",
+                [(i, sid) for i, sid in enumerate(ordered_ids)],
+            )
+
+
+def get_custom_names(conn: sqlite3.Connection) -> dict[str, str]:
+    """Return {session_id: custom_name} for every session with a custom name set."""
+    rows = conn.execute(
+        "SELECT session_id, custom_name FROM sessions "
+        "WHERE custom_name IS NOT NULL"
+    ).fetchall()
+    return {r["session_id"]: r["custom_name"] for r in rows}
+
+
+def get_last_viewed(conn: sqlite3.Connection) -> dict[str, float]:
+    """Return {session_id: last_viewed} for every session that's been opened."""
+    rows = conn.execute(
+        "SELECT session_id, last_viewed FROM sessions "
+        "WHERE last_viewed IS NOT NULL"
+    ).fetchall()
+    return {r["session_id"]: float(r["last_viewed"]) for r in rows}
+
+
+def get_session_order(conn: sqlite3.Connection) -> list[str]:
+    """Return session_ids sorted by sort_order (NULLs excluded)."""
+    rows = conn.execute(
+        "SELECT session_id FROM sessions "
+        "WHERE sort_order IS NOT NULL ORDER BY sort_order"
+    ).fetchall()
+    return [r["session_id"] for r in rows]
+
+
+# --- One-time config.json → SQLite migration (ADR-001) --------------------
+# Runs on first startup. Moves session-level keys out of config.json into
+# the `sessions` table. Keeps `theme` (and any future app-level keys like
+# `sidebar_width`) in config.json.
+
+# Settings-table flag marking the migration complete. Stored as True after
+# a successful run; checked at the top of `migrate_config_json_to_sqlite`
+# so subsequent calls are a cheap no-op (= idempotent).
+MIGRATION_FLAG = "config_migrated_v1"
+
+# Legacy session-level keys that must NOT remain in config.json after
+# migration. Anything else (theme, sidebar_width, unknown keys) is preserved.
+_MIGRATED_CONFIG_KEYS = ("session_names", "session_order", "last_viewed")
+
+
+def _rewrite_config_stripped(config_path: Path, raw: dict) -> None:
+    """Rewrite config.json with the legacy session-level keys removed.
+
+    Unknown keys are preserved — users and future features may add their
+    own app-level settings, and we don't want to silently drop them.
+    """
+    remaining = {k: v for k, v in raw.items() if k not in _MIGRATED_CONFIG_KEYS}
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(remaining, indent=2))
+
+
+def migrate_config_json_to_sqlite(
+    conn: sqlite3.Connection,
+    config_path: Path,
+    claude_projects_dir: Path,
+    *,
+    rewrite_config: bool = True,
+) -> dict:
+    """One-time migration per ADR-001: move session-level state from
+    config.json into the `sessions` table.
+
+    Moves:   session_names, session_order, last_viewed.
+    Keeps:   theme and any other app-level keys (sidebar_width, …).
+
+    **Idempotent** via the `config_migrated_v1` settings flag — subsequent
+    calls return `{"action": "skipped"}` without touching either store.
+
+    **Failure safety:**
+    * The DB writes (row inserts + flag-set) all happen inside a single
+      transaction. If any INSERT fails, the transaction rolls back and the
+      flag is not set, so the next run can retry.
+    * The config.json rewrite happens AFTER the DB transaction commits.
+      If the rewrite fails, the DB is already authoritative and the flag
+      is set; legacy keys may linger in config.json but will be ignored
+      by the TUI (which reads session-level state from SQLite now).
+    * In either failure mode, the original config.json content is
+      preserved — we only overwrite it at the very end of a successful
+      migration.
+
+    **Missing sessions:** any session_id referenced in config.json whose
+    JSONL file no longer exists on disk is skipped. We can't satisfy the
+    `session_path NOT NULL` constraint without a real path, and a
+    custom_name for a deleted session is invisible to the user anyway.
+
+    Args:
+        conn: Open DB connection with the schema applied.
+        config_path: Path to `config.json` (may or may not exist).
+        claude_projects_dir: `~/.claude/projects`; scanned to resolve
+            session_ids to their JSONL paths.
+        rewrite_config: When False, skip the config.json rewrite step.
+            Tests use this to inspect the pre-rewrite state; production
+            callers leave it True.
+
+    Returns:
+        A summary dict:
+            {"action": "migrated",  "migrated": [...], "skipped": [...]}
+            {"action": "skipped",   "reason": "..."}
+            {"action": "partial",   "reason": "...", "migrated": [...], "skipped": [...]}
+            {"action": "failed",    "reason": "..."}
+    """
+    # --- 1. Idempotency guard ---------------------------------------------
+    if get_setting(conn, MIGRATION_FLAG):
+        # If a prior run set the flag but failed to rewrite config.json
+        # (the "partial" outcome), try again here so the file eventually
+        # converges. This is purely a cleanup path; the DB is already
+        # authoritative.
+        if rewrite_config and config_path.exists():
+            try:
+                raw = json.loads(config_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                raw = None
+            if isinstance(raw, dict) and any(
+                k in raw for k in _MIGRATED_CONFIG_KEYS
+            ):
+                try:
+                    _rewrite_config_stripped(config_path, raw)
+                except OSError:
+                    pass
+        return {"action": "skipped", "reason": "already migrated"}
+
+    # --- 2. Nothing to migrate? ------------------------------------------
+    # A missing config.json is a normal first-run state. Set the flag so
+    # we don't re-read the filesystem on every future launch.
+    if not config_path.exists():
+        set_setting(conn, MIGRATION_FLAG, True)
+        return {"action": "skipped", "reason": "no config.json"}
+
+    # --- 3. Read and validate the existing config ------------------------
+    try:
+        raw = json.loads(config_path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        # Don't set the flag — a bad file today might be a good file
+        # tomorrow (the user may be fixing it manually).
+        return {"action": "failed", "reason": f"could not read config.json: {e}"}
+    if not isinstance(raw, dict):
+        return {"action": "failed", "reason": "config.json is not a JSON object"}
+
+    # Defensive coercion: a malformed legacy config shouldn't crash
+    # migration. Missing or wrong-typed keys become empty containers.
+    session_names = raw.get("session_names") or {}
+    session_order = raw.get("session_order") or []
+    last_viewed = raw.get("last_viewed") or {}
+    if not isinstance(session_names, dict):
+        session_names = {}
+    if not isinstance(session_order, list):
+        session_order = []
+    if not isinstance(last_viewed, dict):
+        last_viewed = {}
+
+    all_ids = set(session_names) | set(session_order) | set(last_viewed)
+
+    # Nothing to move into sessions rows, but we still want to drop the
+    # (possibly empty) legacy keys from config.json and mark the flag.
+    if not all_ids:
+        set_setting(conn, MIGRATION_FLAG, True)
+        if rewrite_config:
+            try:
+                _rewrite_config_stripped(config_path, raw)
+            except OSError as e:
+                return {
+                    "action": "partial",
+                    "reason": f"DB migrated but could not rewrite config.json: {e}",
+                    "migrated": [],
+                    "skipped": [],
+                }
+        return {"action": "migrated", "migrated": [], "skipped": []}
+
+    # --- 4. Resolve session_id → filesystem metadata ---------------------
+    # One scan of ~/.claude/projects builds the lookup; sessions whose
+    # JSONL is gone stay out of id_meta and get reported as `skipped`.
+    id_meta: dict[str, tuple[str, str, float, float]] = {}
+    try:
+        for proj_dir in claude_projects_dir.iterdir():
+            if not proj_dir.is_dir():
+                continue
+            for jsonl in proj_dir.glob("*.jsonl"):
+                sid = jsonl.stem
+                if sid in all_ids and sid not in id_meta:
+                    try:
+                        st = jsonl.stat()
+                    except OSError:
+                        continue
+                    id_meta[sid] = (
+                        str(jsonl),
+                        proj_dir.name,
+                        st.st_ctime,
+                        st.st_mtime,
+                    )
+    except OSError:
+        # Projects dir missing entirely — every session will be skipped.
+        pass
+
+    # Lower index = higher in the sidebar. Missing IDs get sort_order=NULL.
+    order_index = {sid: i for i, sid in enumerate(session_order)}
+
+    migrated: list[str] = []
+    skipped: list[str] = []
+
+    # --- 5. DB writes + flag in a single transaction ---------------------
+    try:
+        with transaction(conn):
+            for sid in sorted(all_ids):
+                meta = id_meta.get(sid)
+                if meta is None:
+                    skipped.append(sid)
+                    continue
+                path, project, ctime, mtime = meta
+
+                name = session_names.get(sid) or None
+                sort_order = order_index.get(sid)
+                last_viewed_ts = last_viewed.get(sid)
+                # Defensive: last_viewed should be numeric; drop garbage.
+                if not isinstance(last_viewed_ts, (int, float)):
+                    last_viewed_ts = None
+
+                # ON CONFLICT handling covers the (rare) case where a row
+                # was pre-populated by a concurrent writer or an earlier
+                # failed attempt — we overwrite the user-owned fields to
+                # match config.json, since config.json is the source of
+                # truth for this one-time import.
+                conn.execute(
+                    """
+                    INSERT INTO sessions (
+                        session_id, session_path, project,
+                        custom_name, sort_order, last_viewed,
+                        created_at, modified_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        session_path = excluded.session_path,
+                        project      = COALESCE(excluded.project, sessions.project),
+                        custom_name  = excluded.custom_name,
+                        sort_order   = excluded.sort_order,
+                        last_viewed  = excluded.last_viewed,
+                        created_at   = COALESCE(sessions.created_at, excluded.created_at),
+                        modified_at  = COALESCE(excluded.modified_at, sessions.modified_at)
+                    """,
+                    (
+                        sid, path, project,
+                        name, sort_order, last_viewed_ts,
+                        ctime, mtime,
+                    ),
+                )
+                migrated.append(sid)
+
+            # Flag is part of the transaction so partial rollback can't
+            # leave us "migrated according to the flag, but missing rows".
+            set_setting(conn, MIGRATION_FLAG, True)
+    except Exception as e:
+        # Transaction rolled back. config.json is still the pristine
+        # original — we haven't touched it yet.
+        return {"action": "failed", "reason": str(e)}
+
+    # --- 6. Rewrite config.json (after DB commit) ------------------------
+    if rewrite_config:
+        try:
+            _rewrite_config_stripped(config_path, raw)
+        except OSError as e:
+            # The DB is already authoritative; leave a breadcrumb so the
+            # caller can log it. Next startup will retry the rewrite via
+            # the cleanup path at the top of this function.
+            return {
+                "action": "partial",
+                "reason": f"DB migrated but could not rewrite config.json: {e}",
+                "migrated": migrated,
+                "skipped": skipped,
+            }
+
+    return {"action": "migrated", "migrated": migrated, "skipped": skipped}
