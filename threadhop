@@ -750,9 +750,13 @@ class TranscriptView(VerticalScroll):
     def _scroll_to_uuid(self, uuid: str) -> bool:
         """Scroll the widget with matching _uuid into view and flash-highlight.
 
-        Returns True if a match was found and scrolled to. The flash
-        highlight uses the existing `.message-selected` class so no new
-        CSS is needed.
+        Returns True if a match was found and scrolled to. We can't
+        scroll to the exact matched token within the message because
+        Rich-rendered Static widgets don't expose per-line positions to
+        Textual — so we scroll the widget's top near the viewport top
+        (with a small offset so the message header isn't flush against
+        the border) and let the flash highlight + the widget itself
+        guide the reader's eye.
         """
         for widget in self._get_message_widgets():
             if getattr(widget, "_uuid", None) == uuid:
@@ -1144,15 +1148,21 @@ class SearchScreen(ModalScreen):
     ]
 
     CSS = """
+    /* Explicitly reset layout here — the app's top-level
+       `Screen { layout: grid; grid-columns: 36 1fr; ... }` rule cascades
+       to ModalScreen subclasses too, which would otherwise squeeze the
+       modal into the 36-col first grid cell. */
     SearchScreen {
+        layout: vertical;
         align: center top;
+        background: $background 70%;
     }
 
     #search-container {
         width: 90%;
-        max-width: 120;
-        height: 80%;
-        margin-top: 2;
+        max-width: 140;
+        height: 85%;
+        margin-top: 1;
         background: $surface;
         border: thick $accent;
         layout: vertical;
@@ -2250,9 +2260,15 @@ class ClaudeSessions(App):
     def _jump_to_search_result(self, session_id: str, message_uuid: str) -> None:
         """Switch to ``session_id`` and scroll its transcript to ``message_uuid``.
 
-        If the target session isn't currently in the sidebar (e.g. older
-        than ``--days`` or archived with view off), surface a toast
-        rather than silently no-op'ing.
+        Three cases:
+          1. Session is already the selected one → scroll directly.
+          2. Session is in the sidebar → change ``list_view.index`` and
+             queue the scroll; the normal highlight handler loads the
+             transcript then applies the pending scroll.
+          3. Session isn't in the sidebar (older than ``--days``, or
+             archive hidden) → look up its path from the DB and load
+             the transcript directly so search is useful across ALL
+             indexed history, not just what's visible in the sidebar.
         """
         list_view = self.query_one("#session-list", ListView)
         transcript = self.query_one("#transcript-scroll", TranscriptView)
@@ -2266,27 +2282,57 @@ class ClaudeSessions(App):
                 target_idx = i
                 break
 
-        if target_idx is None:
+        if target_idx is not None:
+            # Case 1 & 2: session is in the sidebar.
+            if list_view.index == target_idx:
+                transcript._pending_scroll_uuid = None
+                if not transcript._scroll_to_uuid(message_uuid):
+                    self.notify(
+                        "Message not found in loaded transcript",
+                        severity="warning",
+                    )
+            else:
+                transcript.queue_scroll_to_uuid(message_uuid)
+                list_view.index = target_idx
+            list_view.focus()
+            return
+
+        # Case 3: session is outside the current sidebar view. Fall back
+        # to a direct transcript load using the DB-recorded session_path.
+        row = db.get_session(self.conn, session_id)
+        if not row or not row.get("session_path"):
             self.notify(
-                "Source session not in current view "
-                "(try increasing --days or toggling archive view)",
+                "Session metadata not found in DB",
+                severity="error",
+            )
+            return
+        session_path = Path(row["session_path"])
+        if not session_path.exists():
+            self.notify(
+                "Session file no longer exists on disk",
                 severity="warning",
-                timeout=6,
             )
             return
 
-        # Already on the target session: transcript is loaded, just scroll.
-        # Otherwise queue the scroll so it runs at the end of the load
-        # that the highlight change will trigger.
-        if list_view.index == target_idx:
-            transcript._pending_scroll_uuid = None
-            if not transcript._scroll_to_uuid(message_uuid):
-                self.notify("Message not found in loaded transcript", severity="warning")
-        else:
-            transcript.queue_scroll_to_uuid(message_uuid)
-            list_view.index = target_idx
+        self._selected_session_id = session_id
+        transcript.queue_scroll_to_uuid(message_uuid)
+        # load_transcript is async; schedule and let the pending scroll
+        # fire at the end of the load.
+        self.call_later(transcript.load_transcript, session_path)
 
-        list_view.focus()
+        # Put the foreign session's identity in the transcript border
+        # title so the user knows the panel is showing a session that
+        # isn't in their sidebar. Gets reset to "Transcript" by the
+        # normal selection-exit flow when they click back into a
+        # sidebar session.
+        name = row.get("custom_name") or row.get("project") or session_id[:8]
+        project = row.get("project") or ""
+        label = f"Transcript ── [{project}] {name}" if project else f"Transcript ── {name}"
+        transcript.border_title = label + "  (from search — not in sidebar)"
+        self.notify(
+            f"Jumped to out-of-view session: {name}",
+            timeout=4,
+        )
 
     def check_action(self, action: str, parameters):
         """Disable the priority Enter binding while a modal is up.
