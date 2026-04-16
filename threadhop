@@ -924,6 +924,7 @@ class ClaudeSessions(App):
                             "project": project_name,
                             "cwd": session_cwd,
                             "session_id": jsonl.stem,
+                            "created": stat.st_ctime,
                             "modified": stat.st_mtime,
                             "title": session_title,
                             "first_user_msg": first_user_msg,
@@ -956,6 +957,7 @@ class ClaudeSessions(App):
                         session_path=str(s["path"]),
                         project=s.get("project"),
                         cwd=s.get("cwd"),
+                        created_at=s.get("created"),
                         modified_at=s.get("modified"),
                     )
         except Exception:
