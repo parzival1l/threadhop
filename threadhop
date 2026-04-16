@@ -320,6 +320,10 @@ class TranscriptView(VerticalScroll):
                 self._select_previous()
                 event.stop()
                 event.prevent_default()
+            elif event.key == "y":
+                self._copy_selection()
+                event.stop()
+                event.prevent_default()
             elif event.key == "escape":
                 if self._range_mode:
                     self._exit_range_mode()
@@ -336,7 +340,7 @@ class TranscriptView(VerticalScroll):
         # Start at the last message — recent context is usually what you want
         self._selected_index = len(messages) - 1
         self._update_selection(messages)
-        self.app.notify("Selection mode: j/k move, v range, m/Esc exit")
+        self.app.notify("Selection mode: j/k move, v range, y copy, m/Esc exit")
 
     def _exit_selection_mode(self):
         self._range_mode = False
@@ -429,6 +433,77 @@ class TranscriptView(VerticalScroll):
             widget.remove_class("message-selected")
             widget.remove_class("message-range-selected")
 
+    def _copy_selection(self):
+        """Copy selected messages to clipboard with source labels (ADR-008)."""
+        selected = self.get_selected_messages()
+        if not selected:
+            return
+
+        # Resolve session metadata from the app
+        app = self.app
+        session_id = app._selected_session_id
+        session_data = next(
+            (s for s in app.sessions if s.get("session_id") == session_id),
+            None,
+        )
+
+        if session_data:
+            custom_name = app.config.get("session_names", {}).get(session_id)
+            session_name = (
+                custom_name
+                or session_data.get("title")
+                or session_data.get("project", "unknown")
+            )
+            cwd = session_data.get("project", "")
+        else:
+            session_name = "unknown"
+            cwd = ""
+
+        # Use the first selected message's timestamp for the label
+        first_ts = next(
+            (getattr(w, "_timestamp", None) for w in selected
+             if getattr(w, "_timestamp", None)),
+            None,
+        )
+        ts_str = ""
+        if first_ts:
+            try:
+                dt = datetime.fromisoformat(first_ts.replace("Z", "+00:00"))
+                ts_str = dt.strftime("%Y-%m-%d %H:%M")
+            except (ValueError, AttributeError):
+                pass
+
+        # Build source label — contract parsed by /threadhop:context
+        label_parts = [f'[From "{session_name}"']
+        if cwd:
+            label_parts.append(f" — {cwd}")
+        if ts_str:
+            label_parts.append(f" — {ts_str}")
+        label_parts.append("]")
+        label = "".join(label_parts)
+
+        # Build message content
+        lines = [label]
+        for w in selected:
+            raw = getattr(w, "_raw_text", "")
+            if isinstance(w, UserMessage):
+                lines.append(f"User: {raw}")
+            elif isinstance(w, AssistantMessage):
+                lines.append(f"Claude: {raw}")
+            elif isinstance(w, ToolMessage):
+                lines.append(raw)
+
+        text = "\n".join(lines)
+
+        # Copy to clipboard via pbcopy (macOS)
+        try:
+            subprocess.run(["pbcopy"], input=text.encode(), check=True)
+            count = len(selected)
+            noun = "message" if count == 1 else "messages"
+            app.notify(f"Copied {count} {noun} to clipboard")
+        except Exception:
+            app.notify("Failed to copy to clipboard", severity="error")
+
     async def load_transcript(self, session_path: Path, force: bool = False):
         """Load and display full conversation from transcript"""
         if self._selection_mode:
@@ -469,21 +544,30 @@ class TranscriptView(VerticalScroll):
             if not tool_batch:
                 return
             lines = Text()
-            for j, (tr, tc) in enumerate(tool_batch):
+            first_ts = None
+            raw_parts = []
+            for j, (tr, tc, ts) in enumerate(tool_batch):
+                if first_ts is None:
+                    first_ts = ts
                 if tr == "tool":
                     lines.append("⚙ ", style="dim yellow")
                     lines.append(str(tc) if tc else "", style="dim")
+                    raw_parts.append(f"⚙ {tc}")
                 else:
                     lines.append("  ↳ ", style="dim green")
                     lines.append(str(tc) if tc else "", style="dim green")
+                    raw_parts.append(f"  ↳ {tc}")
                 if j < len(tool_batch) - 1:
                     lines.append("\n")
-            widgets.append(ToolMessage(lines))
+            w = ToolMessage(lines)
+            w._raw_text = "\n".join(raw_parts)
+            w._timestamp = first_ts
+            widgets.append(w)
             tool_batch.clear()
 
-        for role, content in messages:
+        for role, content, timestamp in messages:
             if role in ("tool", "tool_result"):
-                tool_batch.append((role, content))
+                tool_batch.append((role, content, timestamp))
                 continue
 
             flush_tools()
@@ -492,7 +576,10 @@ class TranscriptView(VerticalScroll):
                 user_text = Text()
                 user_text.append("You\n", style="bold cyan")
                 user_text.append(str(content) if content else "")
-                widgets.append(UserMessage(user_text))
+                w = UserMessage(user_text)
+                w._raw_text = str(content) if content else ""
+                w._timestamp = timestamp
+                widgets.append(w)
             else:
                 header = Text()
                 header.append("Claude\n", style="bold green")
@@ -502,7 +589,10 @@ class TranscriptView(VerticalScroll):
                         renderables.append(Markdown(str(content)))
                     except:
                         renderables.append(Text(str(content)))
-                widgets.append(AssistantMessage(Group(*renderables)))
+                w = AssistantMessage(Group(*renderables))
+                w._raw_text = str(content) if content else ""
+                w._timestamp = timestamp
+                widgets.append(w)
 
         flush_tools()
 
@@ -520,8 +610,11 @@ class TranscriptView(VerticalScroll):
         await self._remove_all_messages()
         await self.mount(AssistantMessage(text))
 
-    def _parse_messages(self, session_path: Path) -> list[tuple[str, str]]:
-        """Parse JSONL file and extract displayable messages"""
+    def _parse_messages(self, session_path: Path) -> list[tuple[str, str, str | None]]:
+        """Parse JSONL file and extract displayable messages.
+
+        Returns list of (role, content, timestamp) tuples.
+        """
         messages = []
         try:
             with open(session_path) as f:
@@ -529,6 +622,7 @@ class TranscriptView(VerticalScroll):
                     try:
                         msg = json.loads(line)
                         msg_type = msg.get("type")
+                        timestamp = msg.get("timestamp")
 
                         # Only process user and assistant messages
                         if msg_type not in ("user", "assistant"):
@@ -539,7 +633,7 @@ class TranscriptView(VerticalScroll):
                             if tool_result and isinstance(tool_result, dict):
                                 result_info = self._format_tool_result(tool_result)
                                 if result_info:
-                                    messages.append(("tool_result", result_info))
+                                    messages.append(("tool_result", result_info, timestamp))
                             elif "toolUseResult" not in msg:
                                 content = msg.get("message", {}).get("content", "")
                                 if isinstance(content, list):
@@ -553,7 +647,7 @@ class TranscriptView(VerticalScroll):
                                     # Strip system-reminder tags
                                     content = SYSTEM_REMINDER_RE.sub("", content).strip()
                                     if content:
-                                        messages.append(("user", content))
+                                        messages.append(("user", content, timestamp))
 
                         elif msg_type == "assistant":
                             content = msg.get("message", {}).get("content", [])
@@ -572,10 +666,10 @@ class TranscriptView(VerticalScroll):
                                         tool_desc = self._format_tool_use(
                                             tool_name, tool_input
                                         )
-                                        messages.append(("tool", tool_desc))
+                                        messages.append(("tool", tool_desc, timestamp))
                                 if text_parts:
                                     messages.append(
-                                        ("assistant", " ".join(text_parts))
+                                        ("assistant", " ".join(text_parts), timestamp)
                                     )
                     except (json.JSONDecodeError, KeyError):
                         pass
