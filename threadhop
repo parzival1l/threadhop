@@ -8,6 +8,7 @@
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -324,6 +325,10 @@ class TranscriptView(VerticalScroll):
                 self._copy_selection()
                 event.stop()
                 event.prevent_default()
+            elif event.key == "e":
+                self._export_selection()
+                event.stop()
+                event.prevent_default()
             elif event.key == "escape":
                 if self._range_mode:
                     self._exit_range_mode()
@@ -340,7 +345,7 @@ class TranscriptView(VerticalScroll):
         # Start at the last message — recent context is usually what you want
         self._selected_index = len(messages) - 1
         self._update_selection(messages)
-        self.app.notify("Selection mode: j/k move, v range, y copy, m/Esc exit")
+        self.app.notify("Selection mode: j/k move, v range, y copy, e export, m/Esc exit")
 
     def _exit_selection_mode(self):
         self._range_mode = False
@@ -426,7 +431,7 @@ class TranscriptView(VerticalScroll):
                 f"({pos}/{total}) (j/k extend, v/Esc cancel)"
             )
         else:
-            self.border_title = f"Transcript ── SELECT {pos}/{total} (j/k move, v range, m/Esc exit)"
+            self.border_title = f"Transcript ── SELECT {pos}/{total} (j/k move, v range, y/e copy/export, m/Esc exit)"
 
     def _clear_selection(self):
         for widget in self._get_message_widgets():
@@ -503,6 +508,105 @@ class TranscriptView(VerticalScroll):
             app.notify(f"Copied {count} {noun} to clipboard")
         except Exception:
             app.notify("Failed to copy to clipboard", severity="error")
+
+    def _export_selection(self):
+        """Export selected messages to a temp markdown file (ADR-008).
+
+        Writes to /tmp/threadhop/<session_id>-<timestamp>.md.
+        The /tmp directory is auto-cleaned by macOS on reboot — these are
+        ephemeral reference files, not permanent exports. Users reference
+        them from other sessions via: Read /tmp/threadhop/<file>.md
+        """
+        selected = self.get_selected_messages()
+        if not selected:
+            return
+
+        app = self.app
+        session_id = app._selected_session_id or "unknown"
+        session_data = next(
+            (s for s in app.sessions if s.get("session_id") == session_id),
+            None,
+        )
+
+        if session_data:
+            custom_name = app.config.get("session_names", {}).get(session_id)
+            session_name = (
+                custom_name
+                or session_data.get("title")
+                or session_data.get("project", "unknown")
+            )
+            project = session_data.get("project", "")
+            cwd = session_data.get("cwd", "")
+        else:
+            session_name = "unknown"
+            project = ""
+            cwd = ""
+
+        # Build markdown content
+        ts_now = datetime.now().strftime("%Y%m%d-%H%M%S")
+        lines = [
+            f"# Exported from: {session_name}",
+            "",
+            "| Field | Value |",
+            "| --- | --- |",
+            f"| Session ID | `{session_id}` |",
+        ]
+        if project:
+            lines.append(f"| Project | {project} |")
+        if cwd:
+            lines.append(f"| CWD | `{cwd}` |")
+        lines.append(f"| Exported | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} |")
+        lines.append(f"| Messages | {len(selected)} |")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+        for w in selected:
+            raw = getattr(w, "_raw_text", "")
+            ts = getattr(w, "_timestamp", None)
+            ts_str = ""
+            if ts:
+                try:
+                    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    ts_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+                except (ValueError, AttributeError):
+                    pass
+
+            if isinstance(w, UserMessage):
+                role_label = "User"
+            elif isinstance(w, AssistantMessage):
+                role_label = "Claude"
+            else:
+                role_label = "Tool"
+
+            if ts_str:
+                lines.append(f"### {role_label} — {ts_str}")
+            else:
+                lines.append(f"### {role_label}")
+            lines.append("")
+            lines.append(raw)
+            lines.append("")
+
+        content = "\n".join(lines)
+
+        # /tmp/threadhop/ is auto-cleaned by macOS on reboot — no manual
+        # cleanup needed. This is intentional: exports are ephemeral
+        # reference files for cross-session context sharing.
+        export_dir = Path("/tmp/threadhop")
+        try:
+            os.makedirs(export_dir, exist_ok=True)
+            export_path = export_dir / f"{session_id}-{ts_now}.md"
+            export_path.write_text(content)
+
+            count = len(selected)
+            noun = "message" if count == 1 else "messages"
+            # Show full path so user can copy it for use in other sessions
+            app.notify(
+                f"Exported {count} {noun} → {export_path}",
+                timeout=10,
+            )
+        except Exception as e:
+            app.notify(f"Export failed: {e}", severity="error")
 
     async def load_transcript(self, session_path: Path, force: bool = False):
         """Load and display full conversation from transcript"""
