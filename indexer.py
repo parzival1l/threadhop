@@ -352,6 +352,231 @@ def index_all(
     return results
 
 
+# --- Incremental indexing (task #9) ----------------------------------------
+
+
+def index_session_incremental(
+    conn: sqlite3.Connection,
+    session_id: str,
+    session_path: str | Path,
+) -> None:
+    """Incrementally index new JSONL content for a session.
+
+    Called from the TUI's 5-second refresh cycle.  Reads only bytes
+    appended since the last index, parses new lines, applies the same
+    chunk-merging logic as ``parse_messages``, and upserts into the
+    ``messages`` + ``messages_fts`` tables.
+
+    Edge cases:
+
+    * **File truncation / rotation**: ``file_size < last_offset``
+      triggers deletion of all indexed messages for the session and a
+      full re-index from byte 0.
+    * **Partial line at EOF**: the read stops at the last complete
+      newline; the incomplete trailing bytes are picked up on the next
+      refresh.
+    * **Chunk boundary**: if new bytes begin with a continuation of a
+      previous assistant message chunk (same ``message.id``), the
+      existing row is updated by appending the new text.
+    """
+    from datetime import datetime as _dt
+
+    file_path = Path(session_path)
+    if not file_path.exists():
+        return
+
+    try:
+        file_size = file_path.stat().st_size
+    except OSError:
+        return
+
+    state = db.get_index_state(conn, session_id)
+    last_offset = state["last_byte_offset"] if state else 0
+
+    # --- Truncation / rotation detection ---
+    if file_size < last_offset:
+        with db.transaction(conn):
+            db.delete_session_messages(conn, session_id)
+            db.delete_index_state(conn, session_id)
+        last_offset = 0
+
+    if file_size == last_offset:
+        return  # Nothing new
+
+    # --- Read new bytes ---
+    try:
+        with open(file_path, "rb") as f:
+            f.seek(last_offset)
+            new_bytes = f.read()
+    except OSError:
+        return
+
+    # --- Partial line at EOF ---
+    last_newline = new_bytes.rfind(b"\n")
+    if last_newline == -1:
+        return  # No complete line yet
+    processable = new_bytes[: last_newline + 1]
+    new_offset = last_offset + last_newline + 1
+
+    # --- Parse raw lines ---
+    raw_lines = processable.decode("utf-8", errors="replace").split("\n")
+    # split() on "line1\nline2\n" → ["line1", "line2", ""] — drop trailing empty
+    if raw_lines and raw_lines[-1] == "":
+        raw_lines.pop()
+
+    if not raw_lines:
+        db.upsert_index_state(
+            conn, session_id, str(file_path), new_offset,
+            _dt.now().timestamp(),
+        )
+        return
+
+    # --- Group messages with chunk merging (ADR-003) ---
+    # Reuses the same extraction helpers as parse_messages but reads from
+    # a byte range instead of the full file.
+
+    parsed_groups: list[dict] = []
+    current_chunk: dict | None = None
+    current_chunk_parts: list[str] = []
+
+    def _flush_chunk() -> None:
+        nonlocal current_chunk, current_chunk_parts
+        if current_chunk is not None:
+            current_chunk["text"] = "\n\n".join(
+                p for p in current_chunk_parts if p
+            ).strip()
+            if current_chunk["text"]:
+                parsed_groups.append(current_chunk)
+            current_chunk = None
+            current_chunk_parts = []
+
+    for raw_line in raw_lines:
+        if not raw_line.strip():
+            continue
+        try:
+            msg = json.loads(raw_line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+        mtype = msg.get("type")
+        if mtype not in ("user", "assistant"):
+            continue
+
+        if mtype == "user":
+            _flush_chunk()
+
+            text = _extract_user_text(msg)
+            if not text:
+                continue
+
+            uid = msg.get("uuid")
+            sid = msg.get("sessionId") or session_id
+            if not uid:
+                continue
+
+            parsed_groups.append({
+                "uuid": uid,
+                "session_id": sid,
+                "role": "user",
+                "text": text,
+                "timestamp": msg.get("timestamp"),
+                "cwd": msg.get("cwd"),
+                "parent_uuid": msg.get("parentUuid"),
+                "is_sidechain": 1 if msg.get("isSidechain") else 0,
+                "message_id": msg.get("message", {}).get("id"),
+            })
+            continue
+
+        # --- assistant line ---
+        mid = msg.get("message", {}).get("id")
+        parts = _extract_assistant_blocks(msg)
+
+        # Continuing the same logical message → accumulate.
+        if (
+            mid is not None
+            and current_chunk is not None
+            and current_chunk.get("message_id") == mid
+        ):
+            current_chunk_parts.extend(parts)
+            continue
+
+        # Different message.id → flush previous and start fresh.
+        _flush_chunk()
+
+        uid = msg.get("uuid")
+        sid = msg.get("sessionId") or session_id
+        if not uid:
+            continue
+
+        current_chunk = {
+            "uuid": uid,
+            "session_id": sid,
+            "role": "assistant",
+            "text": "",  # populated by _flush_chunk
+            "timestamp": msg.get("timestamp"),
+            "cwd": msg.get("cwd"),
+            "parent_uuid": msg.get("parentUuid"),
+            "is_sidechain": 1 if msg.get("isSidechain") else 0,
+            "message_id": mid,
+        }
+        current_chunk_parts = list(parts)
+
+    # Flush the last chunk.
+    _flush_chunk()
+
+    if not parsed_groups:
+        db.upsert_index_state(
+            conn, session_id, str(file_path), new_offset,
+            _dt.now().timestamp(),
+        )
+        return
+
+    # --- Write to DB ---
+    with db.transaction(conn):
+        _ensure_session_stub(conn, session_id, file_path)
+
+        for group in parsed_groups:
+            if not group["text"]:
+                continue
+
+            # Cross-batch chunk merging: if this assistant message.id was
+            # partially indexed in a previous refresh, append new text to
+            # the existing row instead of inserting a duplicate.
+            if group["role"] == "assistant" and group.get("message_id"):
+                existing = db.query_one(
+                    conn,
+                    "SELECT uuid, text FROM messages "
+                    "WHERE message_id = ? AND session_id = ?",
+                    (group["message_id"], group["session_id"]),
+                )
+                if existing:
+                    merged = existing["text"] + "\n\n" + group["text"]
+                    conn.execute(
+                        "UPDATE messages SET text = ? WHERE uuid = ?",
+                        (merged, existing["uuid"]),
+                    )
+                    continue
+
+            conn.execute(
+                "INSERT OR IGNORE INTO messages "
+                "(uuid, session_id, role, text, timestamp, cwd, "
+                "parent_uuid, is_sidechain, message_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    group["uuid"], group["session_id"],
+                    group["role"], group["text"],
+                    group["timestamp"], group["cwd"],
+                    group["parent_uuid"], group["is_sidechain"],
+                    group.get("message_id"),
+                ),
+            )
+
+        db.upsert_index_state(
+            conn, session_id, str(file_path), new_offset,
+            _dt.now().timestamp(),
+        )
+
+
 if __name__ == "__main__":  # pragma: no cover
     # Manual sweep entry point: `python indexer.py`
     conn = db.init_db()

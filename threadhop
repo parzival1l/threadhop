@@ -28,6 +28,7 @@ from textual.worker import Worker
 # Imported as a relative module because db.py sits next to this script.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import db  # noqa: E402
+import indexer  # noqa: E402
 
 
 def get_available_themes():
@@ -962,6 +963,18 @@ class ClaudeSessions(App):
                     )
         except:
             pass
+
+        # --- Incremental indexing (task #9) ---
+        # Piggyback on the 5s refresh cycle: for each discovered session,
+        # index only the bytes appended since the last run.  Errors in one
+        # session's indexing must not affect others or the refresh cycle.
+        for s in sessions:
+            try:
+                indexer.index_session_incremental(
+                    self.conn, s["session_id"], s["path"],
+                )
+            except Exception:
+                pass
 
         return {"sessions": sessions}
 
