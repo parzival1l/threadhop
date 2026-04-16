@@ -600,9 +600,18 @@ class TranscriptView(VerticalScroll):
 
             count = len(selected)
             noun = "message" if count == 1 else "messages"
-            # Show full path so user can copy it for use in other sessions
+
+            # Copy the export path to clipboard so the user can paste it
+            # directly into another session (e.g. "Read /tmp/threadhop/...")
+            try:
+                subprocess.run(
+                    ["pbcopy"], input=str(export_path).encode(), check=True,
+                )
+            except Exception:
+                pass
+
             app.notify(
-                f"Exported {count} {noun} → {export_path}",
+                f"Exported {count} {noun} → {export_path} (path copied)",
                 timeout=10,
             )
         except Exception as e:
