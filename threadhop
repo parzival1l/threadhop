@@ -636,7 +636,14 @@ class ClaudeSessions(App):
         Binding("end", "scroll_transcript_end", "Bottom", show=False, priority=True),
         Binding("s", "cycle_status_forward", "Status", show=False),
         Binding("S", "cycle_status_backward", "Status Back", show=False),
+        Binding("left_square_bracket", "shrink_sidebar", "Narrow", show=False),
+        Binding("right_square_bracket", "grow_sidebar", "Widen", show=False),
     ]
+
+    SIDEBAR_MIN = 20
+    SIDEBAR_MAX = 60
+    SIDEBAR_STEP = 4
+    SIDEBAR_DEFAULT = 36
 
     def __init__(self, project_filter: str | None = None, days: int = 10):
         super().__init__()
@@ -683,6 +690,11 @@ class ClaudeSessions(App):
         yield Footer()
 
     def on_mount(self) -> None:
+        # Apply persisted sidebar width (defaults to CSS value of 36).
+        width = self.config.get("sidebar_width", self.SIDEBAR_DEFAULT)
+        width = max(self.SIDEBAR_MIN, min(self.SIDEBAR_MAX, int(width)))
+        self._apply_sidebar_width(width)
+
         self.update_titles()
         self.load_sessions()
         self.query_one("#session-list", ListView).focus()
@@ -1637,6 +1649,28 @@ class ClaudeSessions(App):
         else:
             self.notify("Hiding archived sessions")
         self._update_session_list(force_rebuild=True)
+
+    def _apply_sidebar_width(self, width: int) -> None:
+        """Set grid columns to the given sidebar width."""
+        self.screen.styles.grid_columns = f"{width} 1fr"
+
+    def action_shrink_sidebar(self) -> None:
+        if self._input_has_focus():
+            return
+        current = self.config.get("sidebar_width", self.SIDEBAR_DEFAULT)
+        new_width = max(self.SIDEBAR_MIN, int(current) - self.SIDEBAR_STEP)
+        self._apply_sidebar_width(new_width)
+        self.config["sidebar_width"] = new_width
+        save_app_config(self.config)
+
+    def action_grow_sidebar(self) -> None:
+        if self._input_has_focus():
+            return
+        current = self.config.get("sidebar_width", self.SIDEBAR_DEFAULT)
+        new_width = min(self.SIDEBAR_MAX, int(current) + self.SIDEBAR_STEP)
+        self._apply_sidebar_width(new_width)
+        self.config["sidebar_width"] = new_width
+        save_app_config(self.config)
 
     def action_scroll_transcript_up(self) -> None:
         self.query_one("#transcript-scroll", TranscriptView).scroll_page_up(
