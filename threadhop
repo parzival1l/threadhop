@@ -2951,40 +2951,120 @@ def detect_project_from_cwd() -> str | None:
     return None
 
 
-def main():
+def _cli_stub(command):
+    """Print a stub notice and exit 0. Real implementation lands in later tasks."""
+    print(f"threadhop {command}: not yet implemented (stub)", file=sys.stderr)
+    return 0
+
+
+def _run_tui(args):
+    project = args.project
+    if not project and not args.all:
+        detected = detect_project_from_cwd()
+        if detected:
+            project = detected
+    app = ClaudeSessions(project_filter=project, days=args.days)
+    app.run()
+    return 0
+
+
+def build_parser():
+    # No-subcommand path keeps the original TUI flags (--project/--days/--all).
+    # Subcommands route to CLI mode and share --project/--session via a parent
+    # parser (ADR-011).
     parser = argparse.ArgumentParser(
-        description="TUI transcript viewer for Claude Code sessions"
+        prog="threadhop",
+        description=(
+            "ThreadHop — Claude Code session browser.\n"
+            "  No subcommand  → launch the TUI.\n"
+            "  Subcommand     → CLI mode (tag, todos, decisions, observations)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--project",
         type=str,
         default=None,
-        help="Filter sessions by project (substring match on directory name)",
+        help="TUI: filter sessions by project (substring match on directory name)",
     )
     parser.add_argument(
         "--days",
         type=int,
         default=10,
-        help="Show sessions from the last N days (default: 10)",
+        help="TUI: show sessions from the last N days (default: 10)",
     )
     parser.add_argument(
         "--all",
         action="store_true",
         default=False,
-        help="Show all projects (ignore CWD auto-detection)",
+        help="TUI: show all projects (ignore CWD auto-detection)",
     )
+
+    # Shared flags for CLI subcommands. Parent parser with add_help=False so
+    # each subcommand inherits --project/--session without duplicating help.
+    shared = argparse.ArgumentParser(add_help=False)
+    shared.add_argument(
+        "--project",
+        type=str,
+        default=None,
+        help="Filter by project (substring match on directory name)",
+    )
+    shared.add_argument(
+        "--session",
+        type=str,
+        default=None,
+        help="Target a specific session id (defaults to current terminal's session)",
+    )
+
+    subparsers = parser.add_subparsers(
+        dest="command",
+        metavar="<command>",
+        title="subcommands",
+    )
+
+    tag_p = subparsers.add_parser(
+        "tag",
+        parents=[shared],
+        help="Tag a session with a status",
+        description="Tag a session with a status (backlog, in_progress, in_review, done, archived).",
+    )
+    tag_p.add_argument(
+        "status",
+        help="Status value to set (e.g. backlog, in_progress, in_review, done, archived)",
+    )
+
+    subparsers.add_parser(
+        "todos",
+        parents=[shared],
+        help="List open TODOs from project memory",
+        description="List open TODOs. Use --project to filter.",
+    )
+
+    subparsers.add_parser(
+        "decisions",
+        parents=[shared],
+        help="List decisions from project memory",
+        description="List decisions. Use --project to filter.",
+    )
+
+    subparsers.add_parser(
+        "observations",
+        parents=[shared],
+        help="List all memory entries (todos, decisions, observations)",
+        description="List everything in the memory ledger. Use --project/--session to filter.",
+    )
+
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
 
-    project = args.project
-    if not project and not args.all:
-        # Auto-detect from CWD
-        detected = detect_project_from_cwd()
-        if detected:
-            project = detected
-
-    app = ClaudeSessions(project_filter=project, days=args.days)
-    app.run()
+    if args.command is None:
+        return _run_tui(args)
+    return _cli_stub(args.command)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)
