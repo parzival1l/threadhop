@@ -389,6 +389,26 @@ def get_session_order(conn: sqlite3.Connection) -> list[str]:
     return [r["session_id"] for r in rows]
 
 
+def set_session_status(
+    conn: sqlite3.Connection,
+    session_id: str,
+    status: str,
+) -> None:
+    """Set the status for a session (active|in_progress|in_review|done|archived)."""
+    conn.execute(
+        "UPDATE sessions SET status = ? WHERE session_id = ?",
+        (status, session_id),
+    )
+
+
+def get_session_statuses(conn: sqlite3.Connection) -> dict[str, str]:
+    """Return {session_id: status} for all sessions."""
+    rows = conn.execute(
+        "SELECT session_id, status FROM sessions"
+    ).fetchall()
+    return {r["session_id"]: r["status"] for r in rows}
+
+
 # --- One-time config.json → SQLite migration (ADR-001) --------------------
 # Runs on first startup. Moves session-level keys out of config.json into
 # the `sessions` table. Keeps `theme` (and any future app-level keys like
