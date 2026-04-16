@@ -415,6 +415,62 @@ def _rewrite_config_stripped(config_path: Path, raw: dict) -> None:
     config_path.write_text(json.dumps(remaining, indent=2))
 
 
+# --- Session status helpers ------------------------------------------------
+
+# Ordered list of valid status values. The TUI renders sidebar groups in
+# this order. ADR-004.
+SESSION_STATUS_ORDER: list[str] = [
+    "active",
+    "in_progress",
+    "in_review",
+    "done",
+    "archived",
+]
+
+
+def get_session(
+    conn: sqlite3.Connection,
+    session_id: str,
+) -> dict | None:
+    """Return the full session row as a dict, or None if not found."""
+    return query_one(
+        conn, "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+    )
+
+
+def get_session_statuses(conn: sqlite3.Connection) -> dict[str, str]:
+    """Return a {session_id: status} map for every known session.
+
+    Used by the TUI each refresh to stamp `status` onto in-memory session
+    dicts without issuing one SELECT per row.
+    """
+    rows = conn.execute("SELECT session_id, status FROM sessions").fetchall()
+    return {r["session_id"]: r["status"] for r in rows}
+
+
+def set_session_status(
+    conn: sqlite3.Connection,
+    session_id: str,
+    status: str,
+) -> None:
+    """Write a new status value for a session.
+
+    Validates against SESSION_STATUS_ORDER so typos fail loudly before the
+    CHECK constraint (task #24) is added in a later migration.
+    """
+    if status not in SESSION_STATUS_ORDER:
+        raise ValueError(
+            f"invalid session status {status!r}; "
+            f"expected one of {SESSION_STATUS_ORDER}"
+        )
+    conn.execute(
+        "UPDATE sessions SET status = ? WHERE session_id = ?",
+        (status, session_id),
+    )
+
+
+# --- One-time config.json → SQLite migration (ADR-001) --------------------
+
 def migrate_config_json_to_sqlite(
     conn: sqlite3.Connection,
     config_path: Path,

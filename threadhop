@@ -123,6 +123,18 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 # --- Internal constants ---
 SPINNER_FRAMES = ["◐", "◓", "◑", "◒"]
 
+# Display order + labels for status-grouped sidebar (ADR-004). Keep in sync
+# with db.SESSION_STATUS_ORDER.
+STATUS_ORDER: list[str] = db.SESSION_STATUS_ORDER
+STATUS_LABELS: dict[str, str] = {
+    "active":      "Active",
+    "in_progress": "In Progress",
+    "in_review":   "In Review",
+    "done":        "Done",
+    "archived":    "Archived",
+}
+STATUS_RANK: dict[str, int] = {s: i for i, s in enumerate(STATUS_ORDER)}
+
 # Regex to strip <system-reminder>...</system-reminder> blocks from text
 SYSTEM_REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
 
@@ -211,6 +223,23 @@ class SessionItem(ListItem):
         except:
             pass
 
+
+
+class SessionStatusHeader(ListItem):
+    """Non-selectable divider between status groups in the sidebar (ADR-004).
+
+    Rendered as a dim rule with the status label. `disabled=True` tells
+    ListView to skip over it when the cursor moves with j/k — so users see
+    the grouping but never land on a header.
+    """
+
+    def __init__(self, status: str):
+        self.status = status
+        super().__init__(disabled=True)
+
+    def compose(self) -> ComposeResult:
+        label = STATUS_LABELS.get(self.status, self.status)
+        yield Static(f"── {label} ", classes="status-header")
 
 
 class UserMessage(Static):
@@ -518,6 +547,23 @@ class ClaudeSessions(App):
 
     .session-label {
         padding: 0 1;
+    }
+
+    .status-header {
+        padding: 0 1;
+        color: $text-muted;
+        text-style: italic;
+    }
+
+    /* Keep header backgrounds flat so a disabled header can't be mistaken
+       for a focusable row, even if Textual briefly parks the cursor on it
+       before the disabled-skip logic fires. */
+    SessionStatusHeader, SessionStatusHeader:disabled {
+        background: transparent;
+    }
+
+    ListView:focus > SessionStatusHeader.--highlight {
+        background: transparent;
     }
 
     .session-label.unread {
@@ -878,6 +924,7 @@ class ClaudeSessions(App):
                             "project": project_name,
                             "cwd": session_cwd,
                             "session_id": jsonl.stem,
+                            "created": stat.st_ctime,
                             "modified": stat.st_mtime,
                             "title": session_title,
                             "first_user_msg": first_user_msg,
@@ -910,6 +957,7 @@ class ClaudeSessions(App):
                         session_path=str(s["path"]),
                         project=s.get("project"),
                         cwd=s.get("cwd"),
+                        created_at=s.get("created"),
                         modified_at=s.get("modified"),
                     )
         except Exception:
@@ -917,6 +965,17 @@ class ClaudeSessions(App):
             # next refresh tick. Reads still work because the TUI uses
             # in-memory self.sessions for display.
             pass
+
+        # Stamp each session dict with its persisted status so the UI can
+        # group by it. Read in bulk after the upsert so new sessions get
+        # the DEFAULT 'active' from the column definition.
+        try:
+            statuses = db.get_session_statuses(self.conn)
+            for s in self.sessions:
+                s["status"] = statuses.get(s["session_id"], "active")
+        except Exception:
+            for s in self.sessions:
+                s.setdefault("status", "active")
 
         self._apply_stable_ordering()
         self._update_session_list(force_rebuild)
@@ -948,20 +1007,69 @@ class ClaudeSessions(App):
                 pass
 
         order_index = {sid: i for i, sid in enumerate(final_order)}
-        self.sessions.sort(key=lambda x: order_index.get(x["session_id"], 999999))
+        # Primary key: status rank (ADR-004 grouping). Secondary key: the
+        # user's manual sort order. An unknown status sorts after all known
+        # ones so a typo or future value never vanishes from the list.
+        self.sessions.sort(
+            key=lambda x: (
+                STATUS_RANK.get(x.get("status", "active"), len(STATUS_ORDER)),
+                order_index.get(x["session_id"], 999999),
+            )
+        )
 
     def _update_session_list(self, force_rebuild: bool = False) -> None:
         display_sessions = self.sessions[:MAX_SESSIONS]
 
-        list_view = self.query_one("#session-list", ListView)
-        current_ids = [
-            item.session_data.get("session_id")
-            for item in list_view.children
-            if isinstance(item, SessionItem)
-        ]
-        new_ids = [s.get("session_id") for s in display_sessions]
+        # Bucket sessions by status. Preserve the in-memory order inside
+        # each bucket — the sort in _apply_stable_ordering already put them
+        # in the right order.
+        groups: dict[str, list[dict]] = {}
+        for s in display_sessions:
+            groups.setdefault(s.get("status", "active"), []).append(s)
 
-        if force_rebuild or current_ids != new_ids:
+        # Build a flat (kind, value) plan for the ListView children. Headers
+        # interleave with sessions; only non-empty groups get a header, so
+        # the sidebar never shows an empty "Done" divider.
+        plan: list[tuple[str, object]] = []
+        for status in STATUS_ORDER:
+            bucket = groups.get(status)
+            if not bucket:
+                continue
+            plan.append(("header", status))
+            for s in bucket:
+                plan.append(("session", s))
+        # Catch-all for statuses outside STATUS_ORDER (shouldn't happen, but
+        # safe): render them under their raw label at the bottom.
+        for status, bucket in groups.items():
+            if status in STATUS_RANK or not bucket:
+                continue
+            plan.append(("header", status))
+            for s in bucket:
+                plan.append(("session", s))
+
+        list_view = self.query_one("#session-list", ListView)
+
+        # Build fingerprints that capture both structure (headers) and
+        # order (session ids). Any change — status flip, new session,
+        # reorder, header added/removed — triggers a full rebuild.
+        def _fingerprint_children() -> list[tuple[str, str]]:
+            out: list[tuple[str, str]] = []
+            for item in list_view.children:
+                if isinstance(item, SessionStatusHeader):
+                    out.append(("h", item.status))
+                elif isinstance(item, SessionItem):
+                    out.append(("s", item.session_data.get("session_id", "")))
+            return out
+
+        new_fp: list[tuple[str, str]] = [
+            ("h", val) if kind == "header" else ("s", val.get("session_id", ""))  # type: ignore[union-attr]
+            for kind, val in plan
+        ]
+        current_fp = _fingerprint_children()
+
+        if force_rebuild or current_fp != new_fp:
+            # Preserve selection across rebuild. Prefer the explicit
+            # tracker; fall back to whatever is currently highlighted.
             current_session_id = self._selected_session_id
             if (
                 not current_session_id
@@ -973,23 +1081,37 @@ class ClaudeSessions(App):
                 )
 
             list_view.clear()
-            new_index = 0
-            for i, session in enumerate(display_sessions):
-                session_id = session.get("session_id", "")
+            target_index: int | None = None
+            first_session_index: int | None = None
+            for i, (kind, val) in enumerate(plan):
+                if kind == "header":
+                    list_view.append(SessionStatusHeader(val))  # type: ignore[arg-type]
+                    continue
+                session = val  # type: ignore[assignment]
+                session_id = session.get("session_id", "")  # type: ignore[union-attr]
                 custom_name = self.config.get("session_names", {}).get(session_id)
                 last_viewed = self.config.get("last_viewed", {}).get(session_id, 0)
-                is_unread = session["modified"] > last_viewed
+                is_unread = session["modified"] > last_viewed  # type: ignore[index]
                 list_view.append(
-                    SessionItem(session, custom_name, is_unread, self._spinner_frame)
+                    SessionItem(session, custom_name, is_unread, self._spinner_frame)  # type: ignore[arg-type]
                 )
+                if first_session_index is None:
+                    first_session_index = i
                 if session_id == current_session_id:
-                    new_index = i
+                    target_index = i
 
-            if display_sessions:
-                target_index = min(new_index, len(display_sessions) - 1)
+            # If the previously-selected session is gone, land on the first
+            # real session (skip headers — they're disabled so a header
+            # index would just get bounced past anyway, but being explicit
+            # avoids a visible flicker).
+            if target_index is None:
+                target_index = first_session_index
+
+            if target_index is not None:
+                final_index = target_index
 
                 def restore_highlight():
-                    list_view.index = target_index
+                    list_view.index = final_index
 
                 self.call_after_refresh(restore_highlight)
         else:
@@ -1066,8 +1188,14 @@ class ClaudeSessions(App):
 
             if event.item.is_unread:
                 event.item.is_unread = False
-                label = event.item.query_one(".session-label", Static)
-                label.remove_class("unread")
+                # query_one can race with mount: a freshly-appended
+                # SessionItem may not have composed its Static child yet
+                # when the highlight watcher fires.
+                try:
+                    label = event.item.query_one(".session-label", Static)
+                    label.remove_class("unread")
+                except Exception:
+                    pass
 
     def action_refresh(self) -> None:
         self.load_sessions()
