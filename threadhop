@@ -299,6 +299,22 @@ class TranscriptView(VerticalScroll):
         # handler so the match position is visible inside long messages.
         self._pending_scroll_terms: list[str] | None = None
 
+        # Active highlight state — survives transcript reloads so the
+        # 5-second refresh cycle doesn't wipe out search highlights when
+        # the session file's mtime changes (e.g. claude is actively
+        # writing to it). Set in _scroll_to_uuid, cleared by a sidebar
+        # selection (App.on_list_view_highlighted).
+        self._active_highlight_uuid: str | None = None
+        self._active_highlight_terms: list[str] | None = None
+
+        # Foreign-session lock: non-None while showing a transcript
+        # whose source session isn't in the sidebar (cross-project or
+        # out-of-view search jump). Tells App.refresh_transcript to
+        # leave this transcript alone on auto-refresh ticks — otherwise
+        # the refresh would reload whatever the sidebar highlights and
+        # yank the user back to the original view.
+        self._foreign_session_path: Path | None = None
+
     def _get_message_widgets(self):
         """Return all message widgets in order."""
         return [
@@ -732,15 +748,28 @@ class TranscriptView(VerticalScroll):
         # Await mount to ensure all widgets are in the DOM before scrolling
         await self.mount_all(widgets)
 
-        # If the search panel queued a jump-to-source, honor it here —
-        # after the widgets are mounted. Otherwise scroll to the newest
-        # message as usual.
+        # Decide the post-mount scroll behavior, in priority order:
+        #
+        # 1. Search just handed us a jump-to-source → honor it.
+        # 2. A previous jump is still "active" (highlight state survived
+        #    into this reload, e.g. the 5-second refresh hit while the
+        #    user is still reading a match) → re-apply the highlight
+        #    so it isn't lost on every tick.
+        # 3. Normal reload → scroll to the bottom (live tail).
         if self._pending_scroll_uuid is not None:
             target = self._pending_scroll_uuid
             terms = self._pending_scroll_terms
             self._pending_scroll_uuid = None
             self._pending_scroll_terms = None
             self._scroll_to_uuid(target, terms)
+        elif (
+            self._active_highlight_uuid is not None
+            and self._active_highlight_terms
+        ):
+            self._scroll_to_uuid(
+                self._active_highlight_uuid,
+                self._active_highlight_terms,
+            )
         else:
             self.scroll_end(animate=False)
 
@@ -802,6 +831,14 @@ class TranscriptView(VerticalScroll):
                         pass
 
                 self.set_timer(1.5, clear_flash)
+
+                # Remember so we can re-apply after a refresh-driven
+                # reload (file mtime changed) without losing the match
+                # anchor. Cleared by sidebar navigation.
+                self._active_highlight_uuid = uuid
+                self._active_highlight_terms = (
+                    list(search_terms) if search_terms else None
+                )
                 return True
         return False
 
@@ -2233,11 +2270,20 @@ class ClaudeSessions(App):
                                 pass
 
     def refresh_transcript(self) -> None:
+        transcript = self.query_one("#transcript-scroll", TranscriptView)
+
+        # Foreign-session lock: the user jumped from search to a session
+        # that isn't in the sidebar. The sidebar highlight still points
+        # at the ORIGINAL session, so reloading from it here would yank
+        # the transcript panel back to that original — wiping out what
+        # the user is actually reading. Skip the refresh in that case.
+        if transcript._foreign_session_path is not None:
+            return
+
         list_view = self.query_one("#session-list", ListView)
         if list_view.highlighted_child and isinstance(
             list_view.highlighted_child, SessionItem
         ):
-            transcript = self.query_one("#transcript-scroll", TranscriptView)
             # Schedule the async load
             self.call_later(
                 transcript.load_transcript,
@@ -2251,6 +2297,15 @@ class ClaudeSessions(App):
     async def on_list_view_selected(self, event: ListView.Selected) -> None:
         if isinstance(event.item, SessionItem):
             transcript = self.query_one("#transcript-scroll", TranscriptView)
+
+            # Explicit sidebar selection (click / Enter) always ends a
+            # foreign-session search jump, even when the user re-selects
+            # the row that was already highlighted — Highlighted doesn't
+            # fire in that case, but Selected does.
+            transcript._foreign_session_path = None
+            transcript._active_highlight_uuid = None
+            transcript._active_highlight_terms = None
+
             await transcript.load_transcript(event.item.session_data["path"])
 
     async def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
@@ -2258,6 +2313,17 @@ class ClaudeSessions(App):
             session_id = event.item.session_data.get("session_id")
             self._selected_session_id = session_id
             transcript = self.query_one("#transcript-scroll", TranscriptView)
+
+            # Manual sidebar navigation ends any in-progress search-jump
+            # context. Clear the foreign-session lock AND the active
+            # highlight state so the 5s auto-refresh can resume and new
+            # reloads don't try to re-apply stale highlights. The
+            # search-flow sets these fresh after this handler runs, via
+            # queue_scroll_to_uuid, so same-sidebar jumps aren't broken.
+            transcript._foreign_session_path = None
+            transcript._active_highlight_uuid = None
+            transcript._active_highlight_terms = None
+
             await transcript.load_transcript(event.item.session_data["path"])
 
             if "last_viewed" not in self.config:
@@ -2432,7 +2498,9 @@ class ClaudeSessions(App):
                 break
 
         if target_idx is not None:
-            # Case 1 & 2: session is in the sidebar.
+            # Case 1 & 2: session is in the sidebar. Clear any stale
+            # foreign-session lock from a previous cross-project jump.
+            transcript._foreign_session_path = None
             if list_view.index == target_idx:
                 transcript._pending_scroll_uuid = None
                 transcript._pending_scroll_terms = None
@@ -2465,6 +2533,10 @@ class ClaudeSessions(App):
             return
 
         self._selected_session_id = session_id
+        # Lock the foreign session in so the 5s refresh tick doesn't
+        # reload the sidebar's selection over the top of this panel.
+        # Cleared by the user selecting anything in the sidebar.
+        transcript._foreign_session_path = session_path
         transcript.queue_scroll_to_uuid(message_uuid, search_terms)
         # load_transcript is async; schedule and let the pending scroll
         # fire at the end of the load.
