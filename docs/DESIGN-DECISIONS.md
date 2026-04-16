@@ -232,7 +232,153 @@ Two transport mechanisms, both instantaneous (no LLM).
 
 ---
 
-### ADR-010: Sidebar resize via keybindings
+### ADR-010: Observer-first architecture
+
+**Context:** Initial design was TUI-first — observations only happened when the
+TUI was running. But the real value is in the observations themselves, not the
+TUI. Users want to query observations from the CLI without launching the TUI.
+
+**Decision:** The observer is the core. The TUI and CLI are both consumers.
+
+```
+Chats happen → observer processes them → observations.jsonl accumulates
+                                              ↓
+                             ThreadHop TUI reads them (browsing)
+                             threadhop todos (CLI query)
+                             grep/jq reads them (raw)
+```
+
+**Observer uses Haiku** for extraction:
+- ~200ms response time, ~$0.25/MTok input — fast and cheap
+- Processes conversation chunks and outputs typed JSONL observations
+- Types: `todo | decision | done | adr | question | blocker`
+- Prompt: extract only explicitly discussed items, do not infer
+
+**Observations stored as JSONL** at `~/.config/threadhop/observations.jsonl`:
+```jsonl
+{"type":"decision","text":"REST over gRPC","context":"Client SDK constraints","project":"agent-atlas","session":"abc123","ts":"2026-04-14T10:30:00Z"}
+{"type":"todo","text":"Implement /workflows endpoint","project":"agent-atlas","session":"abc123","ts":"2026-04-14T11:15:00Z"}
+```
+
+JSONL format means observations are queryable without any app — `grep`, `jq`,
+or the ThreadHop CLI all work.
+
+**Observer triggers on CLI query or TUI launch** — not a daemon, not a hook.
+When you run `threadhop todos`, it:
+1. Checks for unprocessed messages (byte offset tracking)
+2. Runs Haiku on new batches
+3. Appends observations
+4. Filters and displays
+
+**Rationale:**
+- The value is in the data, not the UI
+- JSONL is universally queryable — no vendor lock-in to our app
+- Haiku is fast/cheap enough to run on-demand without perceptible delay
+- No daemon or background process to manage
+
+---
+
+### ADR-011: Dual-mode CLI (TUI + subcommands)
+
+**Context:** ThreadHop was initially TUI-only. With the observer-first
+architecture, users need CLI access to observations, tagging, and handoffs
+without launching the TUI.
+
+**Decision:** Single executable, two modes:
+
+```bash
+# No subcommand = TUI mode
+threadhop
+threadhop --project atlas --days 7
+
+# With subcommand = CLI mode
+threadhop todos                        # list all open TODOs
+threadhop todos --project atlas        # filtered by project
+threadhop decisions                    # all decisions
+threadhop observations                 # everything
+threadhop tag backlog                  # tag current session
+threadhop tag in_review --session abc  # tag specific session
+threadhop handoff abc123               # generate handoff brief
+```
+
+**Session detection for `threadhop tag`:** When called without `--session`,
+detects the current session by scanning `ps` for claude processes in the
+current terminal. Same detection logic the TUI already uses.
+
+**Rationale:**
+- One executable, no separate CLI tool to install
+- Subcommand pattern is familiar (git, docker, etc.)
+- CLI queries trigger the observer, so observations are always fresh
+- Tags can be set from any terminal tab without switching to the TUI
+
+---
+
+### ADR-012: Three skills — tag, context, handoff
+
+**Context:** Need to interact with ThreadHop from within a Claude Code session
+without switching to the TUI or a terminal. Earlier design had two skills.
+Expanded to three with clearer separation.
+
+**Decision:** Three Claude Code skills with distinct roles:
+
+| Skill | What it does | Uses LLM? |
+|---|---|---|
+| `/threadhop:tag <status>` | Tags current session | No — calls `threadhop tag` CLI |
+| `/threadhop:context` | Formats clipboard content as sourced context | No — reads `pbpaste`, formats |
+| `/threadhop:handoff <id>` | Compresses a full session into a brief | Yes — sub-agent with Haiku |
+
+**`/threadhop:tag <status>`** — instant, no LLM:
+1. Detects current session ID from process context
+2. Calls `threadhop tag <status>`
+3. Confirms: "Tagged this session as backlog"
+
+**`/threadhop:context`** — instant, no LLM:
+1. Reads clipboard (`pbpaste`) containing messages copied from TUI
+2. Detects ThreadHop source labels in the content
+3. Presents as a clearly bounded context block in the conversation
+4. The model can now work with the injected context
+
+**`/threadhop:handoff <id> [--full]`** — LLM call:
+1. Reads the JSONL transcript for the given session
+2. Default: sub-agent generates a structured brief (~30-50 lines)
+3. `--full`: sub-agent produces comprehensive handoff with rationale and excerpts
+4. Injects the brief into the current conversation
+
+**Rationale:**
+- Tag: must work mid-conversation without context switching
+- Context: bridges TUI (visual selection) to Claude Code (injection)
+- Handoff: the only one that needs an LLM, clearly separated
+- Three skills is still minimal — each does one thing
+
+**Rejected:** Merging context and handoff into one skill (different mechanisms,
+different cost profiles).
+
+---
+
+### ADR-013: Session tagging from three entry points
+
+**Context:** Session tags (backlog, in_progress, in_review, done, archived)
+need to be settable from multiple places depending on the user's context.
+
+**Decision:** Three entry points, one database:
+
+| Entry point | How | When you'd use it |
+|---|---|---|
+| ThreadHop TUI | Press `s` to cycle status | Triaging multiple sessions |
+| Claude Code skill | `/threadhop:tag backlog` | Mid-conversation, without leaving |
+| Terminal CLI | `threadhop tag backlog` | Quick tag from another tab |
+
+All three write to the same SQLite `sessions` table. The TUI reflects
+changes from CLI/skill on the next 5s refresh.
+
+**Rationale:**
+- Different moments call for different interfaces
+- Shared database means no sync issues
+- The skill is the lightest possible — shells out to the CLI
+
+---
+
+### ADR-014: Sidebar resize via keybindings
 
 **Context:** Session list is hardcoded at 36 characters (`grid-columns: 36 1fr`).
 No way to resize from the UI.
@@ -274,41 +420,48 @@ _Enables instant search and cross-session context sharing. All TUI features._
    - Filter syntax: `project:atlas`, `user:`, `assistant:`
 10. Future: trigram-based fuzzy search for typo tolerance
 
-### Phase 3: Skill Plugin (lean — only LLM-powered operations)
-_Only skills that genuinely need an LLM or benefit from mid-conversation invocation._
+### Phase 3: CLI Subcommands + Observer
+_Observer-first architecture. CLI access to observations without the TUI._
+
+1. Add argparse subcommand routing: no subcommand = TUI, with subcommand = CLI
+2. Implement `threadhop tag <status> [--session <id>]`
+   - Auto-detect session from current terminal when `--session` omitted
+3. Implement Haiku observer:
+   - Process unindexed conversation chunks through Haiku
+   - Extract typed observations (todo, decision, done, adr, question, blocker)
+   - Append to `~/.config/threadhop/observations.jsonl`
+   - Track byte offsets for incremental processing
+4. Implement CLI queries:
+   - `threadhop todos [--project <name>]`
+   - `threadhop decisions [--project <name>]`
+   - `threadhop observations [--project <name>]`
+   - All trigger observer for unprocessed messages before displaying results
+
+### Phase 4: Skill Plugin
+_Three skills for in-session use._
 
 1. Research Claude Code skill plugin packaging/distribution
-2. `/threadhop:handoff <session_id>` — read JSONL, delegate to sub-agent
-   for compression, inject brief into current session
-3. `/threadhop:memory <project>` — read project memory, inject as context
-   (no LLM needed, just formatted file read)
+2. `/threadhop:tag <status>` — detect session ID, call `threadhop tag` CLI
+3. `/threadhop:context` — read clipboard, format with source labels, inject
+4. `/threadhop:handoff <id> [--full]` — sub-agent compresses transcript
 
-**Explicitly NOT skills (these are TUI features):**
-- Search (instantaneous, per-keystroke)
-- Message selection + copy (visual, clipboard)
-- Message export (visual, temp file)
-- Bookmarks (one-key action)
-- Session tagging (one-key action)
-
-### Phase 4: Project Memory + Bookmarks
+### Phase 5: Project Memory + Bookmarks
 _Cross-session knowledge persistence._
 
-1. Add memory table + bookmarks table to schema
+1. Add bookmarks table to schema
 2. Bookmark action from message selection mode (`space` to toggle)
 3. Bookmark browser panel in TUI
-4. Memory ledger: manual entry from TUI (type + text)
-5. `/threadhop:memory <project>` skill to inject project memory
-6. Explicit annotation detection: recognize "ADR:", "DECISION:", "TODO:" markers
-   in conversations and offer to append to ledger
+4. Explicit annotation detection: recognize "ADR:", "DECISION:", "TODO:" markers
+   in conversations and auto-append to observations
+5. Memory rendering: generate project memory markdown from observations for injection
 
-### Phase 5: Auto-Observer + Reflector
-_Automatic knowledge extraction._
+### Phase 6: Reflector
+_Condensation of accumulated observations._
 
-1. Background observer: detect new messages in active sessions during refresh
-2. Auto-extract observations (pattern matching first, `claude -p` later)
-3. Append to memory ledger with `source: "auto"`
-4. Reflector: periodic condensation of old observations
-5. Archive completed TODOs, merge related decisions
+1. When observations.jsonl exceeds threshold, run Haiku reflector
+2. Merge related decisions, archive completed TODOs
+3. Produce condensed observation summaries
+4. Keep source links to original observations
 
 ---
 
@@ -396,22 +549,21 @@ CREATE TABLE memory (
 
 ## Skill Plugin Architecture
 
-### Principle: Only skills that need LLM or can't be done visually
+### Principle: Three skills, clear boundaries
 
-The TUI handles everything that should be instantaneous or visual (search,
-selection, copy, export, tag, bookmark). Skills handle only what benefits
-from being invoked mid-conversation without context-switching to the TUI.
+Skills are for operations invoked mid-conversation from Claude Code. The TUI
+handles everything visual and instantaneous. The CLI handles queries and tagging
+from the terminal.
 
 ### Plugin: `threadhop`
 
 ```
 threadhop/
   skills/
+    tag.md              # /threadhop:tag <status>
+    context.md          # /threadhop:context
     handoff.md          # /threadhop:handoff <session_id>
-    memory.md           # /threadhop:memory <project>
 ```
-
-**Only two skills.** Everything else is a TUI feature.
 
 ### What lives where
 
@@ -421,11 +573,47 @@ threadhop/
 | Message select + copy | TUI | Visual selection, clipboard transport |
 | Message export to .md | TUI | Visual selection, writes to /tmp |
 | Bookmark | TUI | Visual selection, one-key action |
-| Tag session | TUI | One-key action on session list |
+| Tag session | TUI + Skill + CLI | All three entry points, one DB |
+| Observation queries | CLI | `threadhop todos`, `threadhop decisions` |
+| Context injection | Skill | Formats clipboard content with source labels |
 | Handoff | Skill | Needs LLM sub-agent for compression |
-| Memory inject | Skill | Reads project memory file, no LLM needed |
 
-### Handoff flow (the only LLM skill)
+### Skill 1: `/threadhop:tag <status>` (instant, no LLM)
+
+```
+User (in Claude Code): /threadhop:tag backlog
+
+1. Skill detects current session ID from process context
+2. Calls: threadhop tag backlog --session <session_id>
+3. ThreadHop CLI writes tag to SQLite
+4. Confirms: "Tagged this session as backlog"
+```
+
+### Skill 2: `/threadhop:context` (instant, no LLM)
+
+Bridges the TUI (visual selection) to Claude Code (context injection).
+User copies messages from the TUI, then invokes this skill to present
+them cleanly in the current conversation.
+
+```
+User (in Claude Code): /threadhop:context
+
+1. Skill reads clipboard (pbpaste)
+2. Detects ThreadHop source labels in the content
+3. Presents as a clearly bounded context block:
+
+   ┌─ From "API contracts" — ~/agent-atlas — 2026-04-12 ─┐
+   │ User: What about rate limiting?                       │
+   │ Claude: Two options: leaky bucket vs token bucket...  │
+   └───────────────────────────────────────────────────────┘
+
+4. The model now has this context and can work with it
+```
+
+### Skill 3: `/threadhop:handoff <id> [--full]` (LLM call)
+
+The only skill that uses an LLM. Compresses an entire session transcript
+into a brief for starting a fresh session.
 
 ```
 User (in Claude Code): /threadhop:handoff abc123
@@ -433,48 +621,41 @@ User (in Claude Code): /threadhop:handoff abc123
 1. Skill locates ~/.claude/projects/**/abc123.jsonl
 2. Parses JSONL → clean (role, text) pairs
 3. Strips system-reminders, abbreviates tool calls
-4. Spawns sub-agent with:
-   - Parsed transcript (full conversation)
+4. Spawns sub-agent (Haiku for speed, configurable) with:
+   - Parsed transcript
    - Prompt: "Generate a handoff brief. Focus on: decisions made (with
      rationale), current implementation state, open questions, and what
-     the next session needs to know. Format as structured markdown."
-5. Sub-agent returns handoff brief (~30-50 lines)
-6. Skill injects brief into current conversation:
-   "[Handoff from session 'API contracts' (abc123, 2026-04-12)]
-    ## Decisions made..."
+     the next session needs to know."
+5. Sub-agent returns brief (~30-50 lines)
+6. Brief injected into current conversation
+
+With --full flag:
+   Sub-agent produces comprehensive handoff with rationale,
+   code references, and conversation excerpts.
 ```
 
 The raw transcript lives only in the sub-agent's context.
 The main session sees only the compressed brief.
 
-### Memory inject flow (file read, no LLM)
+### Context injection flow (TUI → clipboard → skill)
+
+The full workflow for carrying context between sessions:
 
 ```
-User (in Claude Code): /threadhop:memory agent-atlas
-
-1. Skill reads project memory from SQLite (or rendered .md cache)
-2. Formats as structured context with section headers
-3. Injects directly — no sub-agent, no compression
+1. Open ThreadHop TUI
+2. Navigate to source session, view transcript
+3. Enter message select mode (m)
+4. Select messages visually (j/k to move, v for range)
+5. Press y → copied to clipboard with source labels
+6. Switch to Claude Code session
+7. Type /threadhop:context → clipboard content formatted and injected
 ```
 
-### Context injection flow (TUI → clipboard/file → other session)
-
-This is NOT a skill. It's a TUI workflow:
-
+For larger exports:
 ```
-1. User opens ThreadHop TUI
-2. Navigates to source session, views transcript
-3. Enters message select mode (m)
-4. Selects messages visually (j/k to move, v for range)
-5. Either:
-   a. Press y → copied to clipboard with source labels
-      → paste into any Claude Code / T3 session
-   b. Press e → exported to /tmp/threadhop/<id>-<ts>.md
-      → reference from any session: "Read /tmp/threadhop/..."
-6. The TUI shows confirmation: "3 messages copied" or "Exported to /tmp/..."
+5. Press e → exported to /tmp/threadhop/<id>-<ts>.md
+6. In Claude Code: "Read /tmp/threadhop/..."
 ```
-
-No message numbers. No opaque ranges. Visual selection, instant transport.
 
 ---
 
@@ -501,15 +682,28 @@ No message numbers. No opaque ranges. Visual selection, instant transport.
 - [ ] Jump-to-source from search results (`Enter`)
 - [ ] Search filter syntax: `project:`, `user:`, `assistant:`
 
-### Later (Phase 3-5)
+### Phase 3: CLI + Observer
+- [ ] Add argparse subcommand routing (no subcommand = TUI)
+- [ ] Implement `threadhop tag <status> [--session <id>]`
+- [ ] Session auto-detection from current terminal (ps/lsof)
+- [ ] Haiku observer: process conversation chunks, extract typed observations
+- [ ] Observations JSONL output at `~/.config/threadhop/observations.jsonl`
+- [ ] Incremental processing (byte offset tracking per session)
+- [ ] `threadhop todos [--project]` CLI query
+- [ ] `threadhop decisions [--project]` CLI query
+- [ ] `threadhop observations [--project]` CLI query
+
+### Phase 4: Skills
 - [ ] Research Claude Code skill plugin packaging
-- [ ] Implement handoff skill with sub-agent delegation
-- [ ] Implement memory injection skill (file read, no LLM)
-- [ ] Build bookmark system (TUI feature, not skill)
-- [ ] Build project memory ledger
-- [ ] Add explicit annotation detection
-- [ ] Build auto-observer
-- [ ] Build reflector
+- [ ] `/threadhop:tag <status>` skill (calls CLI)
+- [ ] `/threadhop:context` skill (clipboard formatting + injection)
+- [ ] `/threadhop:handoff <id> [--full]` skill (sub-agent compression)
+
+### Phase 5-6: Memory + Reflector
+- [ ] Build bookmark system (TUI feature)
+- [ ] Explicit annotation detection (ADR:, DECISION:, TODO: markers)
+- [ ] Project memory markdown rendering from observations
+- [ ] Reflector: condense old observations via Haiku
 - [ ] Trigram-based fuzzy search for typo tolerance
 
 ---
@@ -531,11 +725,9 @@ metadata). Per-feature requires explicit tagging of sessions to features.
 is essentially a tag that groups sessions and memory entries across projects.
 
 ### Q3: Observer trigger — when does auto-observation run?
-Options:
-- On the TUI's 5s refresh cycle (piggyback, always-on)
-- On session close/inactivity detection (event-driven)
-- On-demand only (manual trigger)
-**Leaning:** On-demand for v1 (via skill or TUI action). Piggyback for v2.
+**Resolved:** On CLI query or TUI launch. When you run `threadhop todos`,
+it processes any unindexed messages first, then filters. No daemon, no hook,
+no background process. The TUI does the same on launch. See ADR-010.
 
 ### Q4: Skill plugin packaging
 How are Claude Code skill plugins distributed? As a directory of .md files in
@@ -549,9 +741,9 @@ contents, command output) and would dominate search with noise.
 find themselves wanting to search "what was the output of that command."
 
 ### Q6: Handoff sub-agent model
-The handoff skill delegates transcript compression to a sub-agent. Which model?
-Haiku for speed/cost? Sonnet for quality? Configurable?
-**Leaning:** Default to the same model as the parent session. Allow override.
+**Resolved:** Haiku for the observer (fast, cheap, structured extraction).
+Handoff skill defaults to Haiku for speed (~200ms, ~$0.25/MTok). `--full` flag
+can use a stronger model. Configurable via CLI flag or config. See ADR-010.
 
 ---
 
