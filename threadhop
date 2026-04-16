@@ -285,7 +285,8 @@ class TranscriptView(VerticalScroll):
         self._last_mtime = 0
         self._selection_mode = False
         self._selected_index = -1
-        self._range_anchor = -1  # -1 = no range; >= 0 = anchor index
+        self._range_mode = False
+        self._range_anchor = -1
 
     def _get_message_widgets(self):
         """Return all message widgets in order."""
@@ -295,7 +296,7 @@ class TranscriptView(VerticalScroll):
         ]
 
     def on_key(self, event) -> None:
-        """Handle keys for message selection mode."""
+        """Handle keys for message selection and range selection modes."""
         if event.key == "m":
             if self._selection_mode:
                 self._exit_selection_mode()
@@ -304,7 +305,14 @@ class TranscriptView(VerticalScroll):
             event.stop()
             event.prevent_default()
         elif self._selection_mode:
-            if event.key in ("j", "down"):
+            if event.key == "v":
+                if self._range_mode:
+                    self._exit_range_mode()
+                else:
+                    self._enter_range_mode()
+                event.stop()
+                event.prevent_default()
+            elif event.key in ("j", "down"):
                 self._select_next()
                 event.stop()
                 event.prevent_default()
@@ -312,16 +320,15 @@ class TranscriptView(VerticalScroll):
                 self._select_previous()
                 event.stop()
                 event.prevent_default()
-            elif event.key == "v":
-                self._toggle_range()
-                event.stop()
-                event.prevent_default()
             elif event.key == "y":
                 self._copy_selection()
                 event.stop()
                 event.prevent_default()
             elif event.key == "escape":
-                self._exit_selection_mode()
+                if self._range_mode:
+                    self._exit_range_mode()
+                else:
+                    self._exit_selection_mode()
                 event.stop()
                 event.prevent_default()
 
@@ -330,28 +337,47 @@ class TranscriptView(VerticalScroll):
         if not messages:
             return
         self._selection_mode = True
-        self._range_anchor = -1
         # Start at the last message — recent context is usually what you want
         self._selected_index = len(messages) - 1
         self._update_selection(messages)
         self.app.notify("Selection mode: j/k move, v range, y copy, m/Esc exit")
 
     def _exit_selection_mode(self):
+        self._range_mode = False
+        self._range_anchor = -1
         self._clear_selection()
         self._selection_mode = False
         self._selected_index = -1
-        self._range_anchor = -1
         self.border_title = "Transcript"
 
-    def _toggle_range(self):
-        if self._range_anchor >= 0:
-            # Deactivate range, keep cursor where it is
-            self._range_anchor = -1
-            self.app.notify("Range cancelled")
-        else:
-            self._range_anchor = self._selected_index
-            self.app.notify("Range started — move j/k to extend, v to cancel")
+    def _enter_range_mode(self):
+        self._range_mode = True
+        self._range_anchor = self._selected_index
         self._update_selection()
+        self.app.notify("Range select: j/k extend, v/Esc cancel")
+
+    def _exit_range_mode(self):
+        self._range_mode = False
+        self._range_anchor = -1
+        self._update_selection()
+
+    def get_selected_messages(self):
+        """Return the list of message widgets in the current selection.
+
+        Single selection mode returns a one-element list; range mode
+        returns all messages between the anchor and cursor (inclusive).
+        Useful for downstream copy (task #12) and export (task #13).
+        """
+        messages = self._get_message_widgets()
+        if not messages or not self._selection_mode:
+            return []
+        if self._range_mode and self._range_anchor >= 0:
+            lo = min(self._range_anchor, self._selected_index)
+            hi = max(self._range_anchor, self._selected_index)
+            return messages[lo:hi + 1]
+        if 0 <= self._selected_index < len(messages):
+            return [messages[self._selected_index]]
+        return []
 
     def _select_next(self):
         messages = self._get_message_widgets()
@@ -367,47 +393,49 @@ class TranscriptView(VerticalScroll):
         self._selected_index = max(self._selected_index - 1, 0)
         self._update_selection(messages)
 
-    def _get_selected_range(self) -> tuple[int, int]:
-        """Return (start, end) indices of the current selection (inclusive)."""
-        if self._range_anchor >= 0:
-            lo = min(self._range_anchor, self._selected_index)
-            hi = max(self._range_anchor, self._selected_index)
-            return (lo, hi)
-        return (self._selected_index, self._selected_index)
-
     def _update_selection(self, messages=None):
         if messages is None:
             messages = self._get_message_widgets()
-        lo, hi = self._get_selected_range()
+
+        if self._range_mode and self._range_anchor >= 0:
+            lo = min(self._range_anchor, self._selected_index)
+            hi = max(self._range_anchor, self._selected_index)
+        else:
+            lo = hi = -1  # no range
+
         for i, widget in enumerate(messages):
-            if lo <= i <= hi:
+            # Cursor position highlight (single selected message)
+            if i == self._selected_index:
                 widget.add_class("message-selected")
+                widget.scroll_visible()
             else:
                 widget.remove_class("message-selected")
-        # Scroll the cursor (not the anchor) into view
-        if 0 <= self._selected_index < len(messages):
-            messages[self._selected_index].scroll_visible()
-        # Update border title with position info
+            # Range highlight (all messages between anchor and cursor)
+            if lo <= i <= hi:
+                widget.add_class("message-range-selected")
+            else:
+                widget.remove_class("message-range-selected")
+
+        # Update position counter in border title
         total = len(messages)
         pos = self._selected_index + 1
-        count = hi - lo + 1
-        if count > 1:
-            self.border_title = f"Transcript ── SELECT {pos}/{total} ({count} selected)"
+        if self._range_mode and self._range_anchor >= 0:
+            count = hi - lo + 1
+            self.border_title = (
+                f"Transcript ── RANGE {count} selected "
+                f"({pos}/{total}) (j/k extend, v/Esc cancel)"
+            )
         else:
-            self.border_title = f"Transcript ── SELECT {pos}/{total} (j/k move, v range)"
+            self.border_title = f"Transcript ── SELECT {pos}/{total} (j/k move, v range, m/Esc exit)"
 
     def _clear_selection(self):
         for widget in self._get_message_widgets():
             widget.remove_class("message-selected")
+            widget.remove_class("message-range-selected")
 
     def _copy_selection(self):
         """Copy selected messages to clipboard with source labels (ADR-008)."""
-        messages = self._get_message_widgets()
-        lo, hi = self._get_selected_range()
-        if lo < 0 or hi < 0:
-            return
-
-        selected = messages[lo:hi + 1]
+        selected = self.get_selected_messages()
         if not selected:
             return
 
@@ -478,9 +506,10 @@ class TranscriptView(VerticalScroll):
 
     async def load_transcript(self, session_path: Path, force: bool = False):
         """Load and display full conversation from transcript"""
+        if self._selection_mode:
+            self._exit_selection_mode()
+
         if not session_path or not session_path.exists():
-            if self._selection_mode:
-                self._exit_selection_mode()
             await self._clear_and_show("No transcript available")
             return
 
@@ -491,15 +520,10 @@ class TranscriptView(VerticalScroll):
                 and session_path == self.current_path
                 and mtime == self._last_mtime
             ):
-                # File unchanged — keep selection mode alive
                 return
             self._last_mtime = mtime
         except:
             pass
-
-        # Transcript is actually reloading — exit selection mode now
-        if self._selection_mode:
-            self._exit_selection_mode()
 
         self.current_path = session_path
 
@@ -833,6 +857,24 @@ class ClaudeSessions(App):
     UserMessage.message-selected,
     AssistantMessage.message-selected,
     ToolMessage.message-selected {
+        background: $warning 20%;
+        border-left: thick $warning;
+        tint: $warning 8%;
+    }
+
+    /* Range selection highlight — softer tint for non-cursor messages */
+    UserMessage.message-range-selected,
+    AssistantMessage.message-range-selected,
+    ToolMessage.message-range-selected {
+        background: $accent 15%;
+        border-left: thick $accent;
+        tint: $accent 5%;
+    }
+
+    /* Cursor within a range — keep the stronger warning highlight */
+    UserMessage.message-selected.message-range-selected,
+    AssistantMessage.message-selected.message-range-selected,
+    ToolMessage.message-selected.message-range-selected {
         background: $warning 20%;
         border-left: thick $warning;
         tint: $warning 8%;
