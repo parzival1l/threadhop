@@ -54,6 +54,9 @@ _Enables instant search and cross-session context sharing. All TUI features._
 - [ ] **14. Real-time search panel (/) with FTS5 prefix matching** *(blocked by: #8, #9)*
   Press `/` to open search input. FTS5 prefix matching per keystroke (e.g., `rate* lim*`). Results show message snippet, session name, project, timestamp. Navigate with `j`/`k`, `Enter` to jump to source. Filter syntax: `project:`, `user:`, `assistant:`. _(ADR-002, ADR-007)_
 
+- [ ] **24. Data model hardening: CHECK constraints + Pydantic schemas** *(blocked by: #1; prereq for: #8)*
+  Add a migration introducing `CHECK (status IN ('active','in_progress','in_review','done','archived'))` on the `sessions` table so the enum is enforced at the DB layer, not just the app. Design Pydantic models as the validation boundary for JSONL transcript parsing — user/assistant messages, `tool_use` blocks, `tool_result` blocks — so the indexer in #8 folds over typed instances instead of raw dicts and malformed lines fail loudly. Use `Literal` types for enums (session status, message role, memory `type`). Define `Session`, `Message`, `Bookmark`, `MemoryEntry` shapes alongside their table migrations so the Python types and SQL schemas evolve together. Add `pydantic` to the script's PEP 723 dependency block. _(ADR-001, ADR-003, ADR-004)_
+
 ---
 
 ## Phase 3: Skill Plugin
@@ -104,8 +107,8 @@ _Automatic knowledge extraction._
 #1 SQLite DB ──┬──> #2 Migration ──> #7 Tests
                ├──> #3 Status ──┬──> #4 Keybinds (s/S)
                │                └──> #5 Archive (a/A)
-               └──> #8 Indexer ──> #9 Incremental ──> #14 Search ──> #23 Fuzzy
-                                                  └──> #14 Search
+               └──> #24 Data models ──> #8 Indexer ──> #9 Incremental ──> #14 Search ──> #23 Fuzzy
+                                                                      └──> #14 Search
 #6 Sidebar resize (independent)
 
 #10 Selection ──┬──> #11 Range select
