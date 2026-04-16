@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 from datetime import datetime, timedelta
@@ -22,7 +23,8 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
-from textual.widgets import Footer, Header, ListItem, ListView, Static, TextArea
+from textual.screen import ModalScreen
+from textual.widgets import Footer, Header, Input, ListItem, ListView, Static, TextArea
 from textual.worker import Worker
 
 # Local package: SQLite DB module (init, migrations, session helpers).
@@ -288,6 +290,10 @@ class TranscriptView(VerticalScroll):
         self._selected_index = -1
         self._range_mode = False
         self._range_anchor = -1
+        # Queued by the search-result dismiss handler: applied at the end
+        # of the next load_transcript() call so the target widget exists
+        # by the time we try to scroll to it.
+        self._pending_scroll_uuid: str | None = None
 
     def _get_message_widgets(self):
         """Return all message widgets in order."""
@@ -662,10 +668,13 @@ class TranscriptView(VerticalScroll):
                 return
             lines = Text()
             first_ts = None
+            first_uuid = None
             raw_parts = []
-            for j, (tr, tc, ts) in enumerate(tool_batch):
+            for j, (tr, tc, ts, tu) in enumerate(tool_batch):
                 if first_ts is None:
                     first_ts = ts
+                if first_uuid is None:
+                    first_uuid = tu
                 if tr == "tool":
                     lines.append("⚙ ", style="dim yellow")
                     lines.append(str(tc) if tc else "", style="dim")
@@ -679,12 +688,13 @@ class TranscriptView(VerticalScroll):
             w = ToolMessage(lines)
             w._raw_text = "\n".join(raw_parts)
             w._timestamp = first_ts
+            w._uuid = first_uuid
             widgets.append(w)
             tool_batch.clear()
 
-        for role, content, timestamp in messages:
+        for role, content, timestamp, uuid in messages:
             if role in ("tool", "tool_result"):
-                tool_batch.append((role, content, timestamp))
+                tool_batch.append((role, content, timestamp, uuid))
                 continue
 
             flush_tools()
@@ -696,6 +706,7 @@ class TranscriptView(VerticalScroll):
                 w = UserMessage(user_text)
                 w._raw_text = str(content) if content else ""
                 w._timestamp = timestamp
+                w._uuid = uuid
                 widgets.append(w)
             else:
                 header = Text()
@@ -709,13 +720,54 @@ class TranscriptView(VerticalScroll):
                 w = AssistantMessage(Group(*renderables))
                 w._raw_text = str(content) if content else ""
                 w._timestamp = timestamp
+                w._uuid = uuid
                 widgets.append(w)
 
         flush_tools()
 
         # Await mount to ensure all widgets are in the DOM before scrolling
         await self.mount_all(widgets)
-        self.scroll_end(animate=False)
+
+        # If the search panel queued a jump-to-source, honor it here —
+        # after the widgets are mounted. Otherwise scroll to the newest
+        # message as usual.
+        if self._pending_scroll_uuid is not None:
+            target = self._pending_scroll_uuid
+            self._pending_scroll_uuid = None
+            self._scroll_to_uuid(target)
+        else:
+            self.scroll_end(animate=False)
+
+    def queue_scroll_to_uuid(self, uuid: str) -> None:
+        """Remember a uuid to scroll into view on the next load_transcript().
+
+        Called by the search dismiss handler before (or in place of)
+        switching sessions. If the transcript is already loaded,
+        _scroll_to_uuid can be called directly instead.
+        """
+        self._pending_scroll_uuid = uuid
+
+    def _scroll_to_uuid(self, uuid: str) -> bool:
+        """Scroll the widget with matching _uuid into view and flash-highlight.
+
+        Returns True if a match was found and scrolled to. The flash
+        highlight uses the existing `.message-selected` class so no new
+        CSS is needed.
+        """
+        for widget in self._get_message_widgets():
+            if getattr(widget, "_uuid", None) == uuid:
+                widget.scroll_visible(animate=False, top=True)
+                widget.add_class("message-selected")
+
+                def clear_flash(w=widget):
+                    try:
+                        w.remove_class("message-selected")
+                    except Exception:
+                        pass
+
+                self.set_timer(1.5, clear_flash)
+                return True
+        return False
 
     async def _remove_all_messages(self):
         """Remove all message widgets, awaiting completion"""
@@ -727,10 +779,14 @@ class TranscriptView(VerticalScroll):
         await self._remove_all_messages()
         await self.mount(AssistantMessage(text))
 
-    def _parse_messages(self, session_path: Path) -> list[tuple[str, str, str | None]]:
+    def _parse_messages(
+        self, session_path: Path
+    ) -> list[tuple[str, str, str | None, str | None]]:
         """Parse JSONL file and extract displayable messages.
 
-        Returns list of (role, content, timestamp) tuples.
+        Returns list of (role, content, timestamp, uuid) tuples. The uuid
+        is the JSONL line's own uuid — used by the search jump-to-source
+        flow to scroll the correct widget into view.
         """
         messages = []
         try:
@@ -740,6 +796,7 @@ class TranscriptView(VerticalScroll):
                         msg = json.loads(line)
                         msg_type = msg.get("type")
                         timestamp = msg.get("timestamp")
+                        uuid = msg.get("uuid")
 
                         # Only process user and assistant messages
                         if msg_type not in ("user", "assistant"):
@@ -750,7 +807,7 @@ class TranscriptView(VerticalScroll):
                             if tool_result and isinstance(tool_result, dict):
                                 result_info = self._format_tool_result(tool_result)
                                 if result_info:
-                                    messages.append(("tool_result", result_info, timestamp))
+                                    messages.append(("tool_result", result_info, timestamp, uuid))
                             elif "toolUseResult" not in msg:
                                 content = msg.get("message", {}).get("content", "")
                                 if isinstance(content, list):
@@ -764,7 +821,7 @@ class TranscriptView(VerticalScroll):
                                     # Strip system-reminder tags
                                     content = SYSTEM_REMINDER_RE.sub("", content).strip()
                                     if content:
-                                        messages.append(("user", content, timestamp))
+                                        messages.append(("user", content, timestamp, uuid))
 
                         elif msg_type == "assistant":
                             content = msg.get("message", {}).get("content", [])
@@ -783,10 +840,10 @@ class TranscriptView(VerticalScroll):
                                         tool_desc = self._format_tool_use(
                                             tool_name, tool_input
                                         )
-                                        messages.append(("tool", tool_desc, timestamp))
+                                        messages.append(("tool", tool_desc, timestamp, uuid))
                                 if text_parts:
                                     messages.append(
-                                        ("assistant", " ".join(text_parts), timestamp)
+                                        ("assistant", " ".join(text_parts), timestamp, uuid)
                                     )
                     except (json.JSONDecodeError, KeyError):
                         pass
@@ -858,6 +915,436 @@ class TranscriptView(VerticalScroll):
             return status
 
         return None
+
+
+# --- Real-time search panel (task #14, ADR-002 / ADR-007) -----------------
+#
+# FTS5 prefix matching against the `messages` table populated by the
+# indexer. Each keystroke in the search input debounces (~80 ms) and
+# re-runs the query. Results render as a ListView of SearchResultItem
+# rows; dismissing the modal with a selection jumps the main TUI to the
+# source message.
+#
+# Filter syntax parsed from the raw query string:
+#   project:<name>  — substring match against sessions.project
+#   user:           — only role = 'user'
+#   assistant:      — only role = 'assistant'
+# Remaining whitespace-separated tokens become FTS5 prefix terms.
+
+# Sentinel characters bracketing matched spans in the SQL `snippet()`
+# output. Using control chars avoids collisions with user text. Parsed
+# back out by `_render_snippet` into Rich Text with a highlight style.
+_FTS_MATCH_START = "\x01"
+_FTS_MATCH_END = "\x02"
+
+
+def _build_fts_query(raw: str) -> tuple[str, str | None, str | None]:
+    """Parse raw input into (fts_match_expr, role_filter, project_filter).
+
+    The FTS5 expression uses AND semantics across prefix terms
+    (e.g. ``rate* lim*``). Non-filter tokens are sanitized to word chars
+    only so stray punctuation can't produce an invalid MATCH expression.
+    An empty expression means no searchable terms were supplied —
+    callers may still return filter-only results (see `search_messages`).
+    """
+    tokens = raw.strip().split()
+    role: str | None = None
+    project: str | None = None
+    terms: list[str] = []
+    for tok in tokens:
+        low = tok.lower()
+        if low == "user:":
+            role = "user"
+        elif low == "assistant:":
+            role = "assistant"
+        elif low.startswith("project:"):
+            val = tok[len("project:"):]
+            if val:
+                project = val
+        else:
+            # Keep only word chars (letters/digits/underscore). FTS5's
+            # unicode61 tokenizer is fine with these, and stripping
+            # punctuation prevents syntax errors at MATCH time.
+            clean = re.sub(r"[^\w]", "", tok)
+            if clean:
+                terms.append(clean + "*")
+    return " ".join(terms), role, project
+
+
+def search_messages(
+    conn: sqlite3.Connection,
+    raw_query: str,
+    limit: int = 50,
+) -> list[dict]:
+    """Run the FTS5 search for the search panel.
+
+    Returns rows with keys: uuid, session_id, role, timestamp, snippet,
+    custom_name, project, session_path. ``snippet`` contains
+    _FTS_MATCH_START / _FTS_MATCH_END sentinels around each match span.
+
+    A malformed FTS5 expression (shouldn't happen after sanitization, but
+    defensive) returns an empty list rather than propagating the
+    exception up into the TUI event loop.
+    """
+    fts_expr, role, project = _build_fts_query(raw_query)
+
+    # No search terms: allow a filter-only query so typing just
+    # `project:foo` lists recent messages in that project.
+    if not fts_expr:
+        if not role and not project:
+            return []
+        sql = (
+            "SELECT m.uuid AS uuid, m.session_id AS session_id, "
+            "m.role AS role, m.timestamp AS timestamp, "
+            "substr(m.text, 1, 160) AS snippet, "
+            "s.custom_name AS custom_name, s.project AS project, "
+            "s.session_path AS session_path "
+            "FROM messages m "
+            "LEFT JOIN sessions s ON s.session_id = m.session_id "
+            "WHERE 1=1"
+        )
+        params: dict = {}
+        if role:
+            sql += " AND m.role = :role"
+            params["role"] = role
+        if project:
+            sql += " AND s.project LIKE :project"
+            params["project"] = f"%{project}%"
+        sql += " ORDER BY m.timestamp DESC LIMIT :lim"
+        params["lim"] = limit
+        try:
+            return db.query_all(conn, sql, params)
+        except sqlite3.OperationalError:
+            return []
+
+    sql = (
+        "SELECT m.uuid AS uuid, m.session_id AS session_id, "
+        "m.role AS role, m.timestamp AS timestamp, "
+        "snippet(messages_fts, 0, :mstart, :mend, '…', 16) AS snippet, "
+        "s.custom_name AS custom_name, s.project AS project, "
+        "s.session_path AS session_path "
+        "FROM messages_fts "
+        "JOIN messages m ON m.rowid = messages_fts.rowid "
+        "LEFT JOIN sessions s ON s.session_id = m.session_id "
+        "WHERE messages_fts MATCH :q"
+    )
+    params = {
+        "q": fts_expr,
+        "mstart": _FTS_MATCH_START,
+        "mend": _FTS_MATCH_END,
+    }
+    if role:
+        sql += " AND m.role = :role"
+        params["role"] = role
+    if project:
+        sql += " AND s.project LIKE :project"
+        params["project"] = f"%{project}%"
+    sql += " ORDER BY rank LIMIT :lim"
+    params["lim"] = limit
+
+    try:
+        return db.query_all(conn, sql, params)
+    except sqlite3.OperationalError:
+        # Malformed expressions still slip through on edge cases
+        # (e.g. a bare `*`). Surface as "no results" rather than crash.
+        return []
+
+
+def _render_snippet(snippet: str) -> Text:
+    """Convert an FTS5 snippet with sentinel-wrapped matches to Rich Text."""
+    out = Text()
+    remaining = snippet or ""
+    while True:
+        i = remaining.find(_FTS_MATCH_START)
+        if i < 0:
+            out.append(remaining)
+            break
+        out.append(remaining[:i])
+        remaining = remaining[i + len(_FTS_MATCH_START):]
+        j = remaining.find(_FTS_MATCH_END)
+        if j < 0:
+            # Unterminated — highlight the rest and stop.
+            out.append(remaining, style="bold black on yellow")
+            break
+        out.append(remaining[:j], style="bold black on yellow")
+        remaining = remaining[j + len(_FTS_MATCH_END):]
+    return out
+
+
+class SearchResultItem(ListItem):
+    """One row in the search-results list.
+
+    Holds the raw result dict so the dismiss handler can pull the
+    session_id + uuid for jump-to-source without another DB lookup.
+    """
+
+    def __init__(self, row: dict):
+        self.result = row
+        super().__init__()
+
+    def compose(self) -> ComposeResult:
+        role = self.result.get("role", "")
+        role_icon = "▶" if role == "user" else "●"
+        role_style = "bold cyan" if role == "user" else "bold green"
+
+        # Snippet line: colored role marker + highlighted text span.
+        snippet_line = Text()
+        snippet_line.append(f"{role_icon} ", style=role_style)
+        snippet_line.append_text(
+            _render_snippet(self.result.get("snippet") or "")
+        )
+
+        # Metadata line: session name · project · formatted timestamp.
+        session_name = (
+            self.result.get("custom_name")
+            or self.result.get("project")
+            or (self.result.get("session_id", "") or "")[:8]
+        )
+        project = self.result.get("project") or ""
+        ts_raw = self.result.get("timestamp") or ""
+        ts_str = ts_raw[:16]
+        try:
+            dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            ts_str = dt.strftime("%Y-%m-%d %H:%M")
+        except (ValueError, AttributeError):
+            pass
+
+        meta = Text()
+        meta.append("  ", style="dim")
+        meta.append(str(session_name), style="bold")
+        if project and project != session_name:
+            meta.append("  ·  ", style="dim")
+            meta.append(str(project), style="cyan")
+        meta.append("  ·  ", style="dim")
+        meta.append(ts_str, style="dim")
+
+        yield Static(Group(snippet_line, meta), classes="search-result")
+
+
+class SearchScreen(ModalScreen):
+    """Modal full-text search over indexed messages (task #14).
+
+    Focus stays on the Input; arrow keys (and Ctrl+N/Ctrl+P) navigate
+    the results list without losing typing focus — matches common
+    fuzzy-finder UX (fzf, Helm). Enter returns ``(session_id, uuid)``
+    to the dismiss callback; Escape dismisses with ``None``.
+    """
+
+    # Debounce delay between keystroke and the FTS query. 80 ms keeps
+    # typing responsive while avoiding a query per character on fast
+    # typists — plenty of headroom over FTS5's sub-ms query time.
+    DEBOUNCE_SECONDS = 0.08
+
+    # The app binds `enter` with priority=True to start_reply_or_send, and
+    # app priority bindings fire even while a modal is up. Re-bind enter
+    # here with priority so the modal wins and Input.Submitted actually
+    # reaches our handler.
+    BINDINGS = [
+        Binding("enter", "open_result", "Open", priority=True, show=False),
+    ]
+
+    CSS = """
+    SearchScreen {
+        align: center top;
+    }
+
+    #search-container {
+        width: 90%;
+        max-width: 120;
+        height: 80%;
+        margin-top: 2;
+        background: $surface;
+        border: thick $accent;
+        layout: vertical;
+    }
+
+    #search-input {
+        margin: 0;
+        border: none;
+        background: $boost;
+    }
+
+    #search-input:focus {
+        background: $boost;
+    }
+
+    #search-results {
+        height: 1fr;
+        background: $surface;
+    }
+
+    #search-status {
+        height: 1;
+        padding: 0 1;
+        color: $text-muted;
+        background: $boost;
+    }
+
+    #search-help {
+        height: 1;
+        padding: 0 1;
+        color: $text-muted;
+        background: $boost;
+        text-style: italic;
+    }
+
+    .search-result {
+        padding: 0 1;
+    }
+
+    SearchResultItem {
+        padding: 0;
+    }
+    """
+
+    def __init__(self, conn: sqlite3.Connection):
+        super().__init__()
+        self.conn = conn
+        # Single outstanding debounce timer. Each new keystroke stops
+        # the previous timer before scheduling the next one, so only
+        # the final keystroke in a typing burst triggers a query.
+        self._search_timer = None
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="search-container") as container:
+            container.border_title = "Search"
+            yield Input(
+                placeholder=(
+                    "Search (prefix match) — "
+                    "filters: project:<name> user: assistant:"
+                ),
+                id="search-input",
+            )
+            yield Static("Type to search…", id="search-status")
+            yield ListView(id="search-results")
+            yield Static(
+                "↑/↓ or ctrl+n/ctrl+p navigate • Enter jump • Esc close",
+                id="search-help",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#search-input", Input).focus()
+
+    def on_input_changed(self, event) -> None:
+        """Debounced re-run on every keystroke."""
+        try:
+            if event.input.id != "search-input":
+                return
+        except AttributeError:
+            return
+        if self._search_timer is not None:
+            try:
+                self._search_timer.stop()
+            except Exception:
+                pass
+        value = event.value
+        self._search_timer = self.set_timer(
+            self.DEBOUNCE_SECONDS, lambda v=value: self._execute_search(v)
+        )
+
+    def _execute_search(self, raw_query: str) -> None:
+        results_list = self.query_one("#search-results", ListView)
+        status = self.query_one("#search-status", Static)
+
+        raw = raw_query.strip()
+        if not raw:
+            results_list.clear()
+            status.update("Type to search…")
+            return
+
+        try:
+            rows = search_messages(self.conn, raw, limit=50)
+        except Exception as e:  # noqa: BLE001
+            results_list.clear()
+            status.update(f"Search error: {e}")
+            return
+
+        results_list.clear()
+        for row in rows:
+            results_list.append(SearchResultItem(row))
+
+        count = len(rows)
+        if count == 0:
+            status.update("No results")
+        else:
+            noun = "result" if count == 1 else "results"
+            status.update(
+                f"{count} {noun}" + (" (showing first 50)" if count >= 50 else "")
+            )
+
+    def on_key(self, event) -> None:
+        """Intercept nav / Escape keys while the Input holds focus.
+
+        Arrow keys and Ctrl+N/P aren't bound by Input so they bubble up
+        to here. Escape isn't bound by Input either. Enter IS bound by
+        Input (fires Submitted), so it's handled via on_input_submitted
+        below rather than here.
+        """
+        key = event.key
+        if key == "escape":
+            event.stop()
+            event.prevent_default()
+            self.dismiss(None)
+        elif key in ("down", "ctrl+n"):
+            event.stop()
+            event.prevent_default()
+            self._move_selection(1)
+        elif key in ("up", "ctrl+p"):
+            event.stop()
+            event.prevent_default()
+            self._move_selection(-1)
+
+    def action_open_result(self) -> None:
+        """Enter → open the highlighted result.
+
+        Fires via the screen-level priority Enter binding. As a safety
+        net, ``on_input_submitted`` below catches the Input.Submitted
+        message too — either path lands at _open_selected.
+        """
+        self._open_selected()
+
+    def on_input_submitted(self, event) -> None:
+        """Safety net: if Input's own enter binding fires first, its
+        Submitted message bubbles up to here. Treat it the same as the
+        screen-level binding — dismiss with the highlighted row.
+        """
+        try:
+            if event.input.id != "search-input":
+                return
+        except AttributeError:
+            return
+        event.stop()
+        self._open_selected()
+
+    def _move_selection(self, delta: int) -> None:
+        lv = self.query_one("#search-results", ListView)
+        count = len(lv.children)
+        if count == 0:
+            return
+        if lv.index is None:
+            lv.index = 0 if delta > 0 else count - 1
+            return
+        new_idx = max(0, min(count - 1, lv.index + delta))
+        lv.index = new_idx
+
+    def _open_selected(self) -> None:
+        """Dismiss with (session_id, uuid) from the highlighted result.
+
+        Reads ``children[index]`` directly rather than ``highlighted_child``
+        because ``highlighted_child`` may not be synchronously up to date
+        after a programmatic ``index`` change — the reactive update lands
+        on the next message cycle, not before we're called.
+        """
+        lv = self.query_one("#search-results", ListView)
+        if not lv.children:
+            return
+        idx = lv.index if lv.index is not None else 0
+        if idx < 0 or idx >= len(lv.children):
+            idx = 0
+        item = lv.children[idx]
+        if isinstance(item, SearchResultItem):
+            row = item.result
+            self.dismiss((row["session_id"], row["uuid"]))
 
 
 class ClaudeSessions(App):
@@ -1011,7 +1498,7 @@ class ClaudeSessions(App):
         Binding("g", "copy_session_id", "Copy ID"),
         Binding("enter", "start_reply_or_send", "Reply/Send", show=True, priority=True),
         Binding("alt+enter", "insert_newline", "Newline", show=False),
-        Binding("/", "start_reply", "Reply", show=False),
+        Binding("/", "open_search", "Search"),
         Binding("escape", "cancel_reply", "Cancel", show=False),
         Binding("right", "focus_transcript", "Transcript", show=False),
         Binding("left", "focus_list", "Sessions", show=False),
@@ -1737,6 +2224,80 @@ class ClaudeSessions(App):
                     list_view.highlighted_child.session_data.get("session_id")
                 )
             text_area.focus()
+
+    def action_open_search(self) -> None:
+        """Open the real-time FTS5 search panel (task #14).
+
+        Skips when the reply input has focus so `/` types normally while
+        the user is composing a message. Dismissing with a selection
+        routes through `_jump_to_search_result` to switch sessions and
+        scroll to the source message.
+        """
+        if self._input_has_focus():
+            return
+        self.push_screen(SearchScreen(self.conn), self._on_search_dismissed)
+
+    def _on_search_dismissed(self, result) -> None:
+        """Dismiss callback: the user either selected a row or pressed Esc."""
+        if result is None:
+            return
+        try:
+            session_id, message_uuid = result
+        except (TypeError, ValueError):
+            return
+        self._jump_to_search_result(session_id, message_uuid)
+
+    def _jump_to_search_result(self, session_id: str, message_uuid: str) -> None:
+        """Switch to ``session_id`` and scroll its transcript to ``message_uuid``.
+
+        If the target session isn't currently in the sidebar (e.g. older
+        than ``--days`` or archived with view off), surface a toast
+        rather than silently no-op'ing.
+        """
+        list_view = self.query_one("#session-list", ListView)
+        transcript = self.query_one("#transcript-scroll", TranscriptView)
+
+        target_idx: int | None = None
+        for i, item in enumerate(list_view.children):
+            if (
+                isinstance(item, SessionItem)
+                and item.session_data.get("session_id") == session_id
+            ):
+                target_idx = i
+                break
+
+        if target_idx is None:
+            self.notify(
+                "Source session not in current view "
+                "(try increasing --days or toggling archive view)",
+                severity="warning",
+                timeout=6,
+            )
+            return
+
+        # Already on the target session: transcript is loaded, just scroll.
+        # Otherwise queue the scroll so it runs at the end of the load
+        # that the highlight change will trigger.
+        if list_view.index == target_idx:
+            transcript._pending_scroll_uuid = None
+            if not transcript._scroll_to_uuid(message_uuid):
+                self.notify("Message not found in loaded transcript", severity="warning")
+        else:
+            transcript.queue_scroll_to_uuid(message_uuid)
+            list_view.index = target_idx
+
+        list_view.focus()
+
+    def check_action(self, action: str, parameters):
+        """Disable the priority Enter binding while a modal is up.
+
+        Returning False here tells Textual the binding doesn't match, so
+        the key event passes through to the modal screen's own bindings
+        and widgets instead of being swallowed by this app-level handler.
+        """
+        if action == "start_reply_or_send" and len(self.screen_stack) > 1:
+            return False
+        return True
 
     def action_start_reply_or_send(self) -> None:
         """If in list/transcript, go to reply. If in reply, send message."""
