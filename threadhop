@@ -13,6 +13,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -24,7 +25,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Footer, Header, Input, ListItem, ListView, Static, TextArea
+from textual.widgets import Header, Input, ListItem, ListView, Static, TextArea
 from textual.worker import Worker
 
 # Local package: SQLite DB module (init, migrations, session helpers).
@@ -146,6 +147,227 @@ STATUS_CYCLE: list[str] = [s for s in STATUS_ORDER if s != "archived"]
 
 # Regex to strip <system-reminder>...</system-reminder> blocks from text
 SYSTEM_REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
+
+
+# --- Command metadata registry (ADR-017, task #42) ---
+#
+# One source of truth for app-level bindings, widget-local keys, the
+# contextual footer, and the help overlay. Any new command lands here
+# and automatically becomes discoverable everywhere.
+#
+# Scopes group commands by where they're reachable. Widget-local
+# handlers (TranscriptView selection mode, FindBar, SearchScreen) own
+# their behaviour — the registry just records the metadata so the rest
+# of the UI can surface it.
+
+SCOPE_GLOBAL = "global"
+SCOPE_SESSION_LIST = "session_list"
+SCOPE_TRANSCRIPT = "transcript"
+SCOPE_SELECTION = "selection"
+SCOPE_REPLY = "reply"
+SCOPE_FIND = "find"
+SCOPE_SEARCH = "search"
+
+SCOPE_ORDER: list[str] = [
+    SCOPE_GLOBAL,
+    SCOPE_SESSION_LIST,
+    SCOPE_TRANSCRIPT,
+    SCOPE_SELECTION,
+    SCOPE_REPLY,
+    SCOPE_FIND,
+    SCOPE_SEARCH,
+]
+
+SCOPE_LABELS: dict[str, str] = {
+    SCOPE_GLOBAL: "Global",
+    SCOPE_SESSION_LIST: "Session list",
+    SCOPE_TRANSCRIPT: "Transcript",
+    SCOPE_SELECTION: "Selection mode",
+    SCOPE_REPLY: "Reply input",
+    SCOPE_FIND: "Find bar",
+    SCOPE_SEARCH: "Search modal",
+}
+
+# Pretty-print Textual key strings for the help overlay and footer.
+# Lookup is exact-match first, then falls back to capitalizing the raw
+# string so unknown keys still show up reasonably.
+_KEY_DISPLAY: dict[str, str] = {
+    "up": "↑",
+    "down": "↓",
+    "left": "←",
+    "right": "→",
+    "enter": "Enter",
+    "escape": "Esc",
+    "pageup": "PgUp",
+    "pagedown": "PgDn",
+    "home": "Home",
+    "end": "End",
+    "space": "Space",
+    "tab": "Tab",
+    "left_square_bracket": "[",
+    "right_square_bracket": "]",
+    "shift+up": "⇧↑",
+    "shift+down": "⇧↓",
+    "alt+enter": "⌥Enter",
+    "alt+j": "⌥j",
+    "alt+k": "⌥k",
+    "ctrl+f": "^F",
+    "ctrl+n": "^N",
+    "ctrl+p": "^P",
+}
+
+
+def format_key(key: str) -> str:
+    return _KEY_DISPLAY.get(key, key)
+
+
+@dataclass(frozen=True)
+class Command:
+    """One row of the command registry.
+
+    ``keys`` holds Textual-valid key names (``"ctrl+f"``, ``"shift+down"``,
+    ``"left_square_bracket"``) — prettification for display happens in
+    ``format_key``. When ``action`` is set the command is wired as an
+    App-level ``Binding``; otherwise the command is widget-local and the
+    registry entry exists purely for discoverability (footer, help
+    overlay).
+    """
+
+    keys: tuple[str, ...]
+    description: str
+    scope: str
+    action: str | None = None
+    priority: bool = False
+    # Footer commands are the minimal contextual hint row — only the
+    # highest-value bindings for each scope are marked ``footer=True``.
+    footer: bool = False
+
+
+COMMAND_REGISTRY: list[Command] = [
+    # --- Global ---
+    Command(("?",), "Help", SCOPE_GLOBAL, "open_help", footer=True),
+    Command(("q",), "Quit", SCOPE_GLOBAL, "maybe_quit", footer=True),
+    Command(("r",), "Refresh sessions", SCOPE_GLOBAL, "maybe_refresh"),
+    Command(("t",), "Next theme", SCOPE_GLOBAL, "toggle_theme_next"),
+    Command(("T",), "Previous theme", SCOPE_GLOBAL, "toggle_theme_prev"),
+    Command(("/",), "Search all sessions", SCOPE_GLOBAL, "open_search", footer=True),
+    Command(("ctrl+f",), "Find in transcript", SCOPE_GLOBAL, "open_find", footer=True),
+    Command(("left_square_bracket",), "Shrink sidebar", SCOPE_GLOBAL, "shrink_sidebar"),
+    Command(("right_square_bracket",), "Grow sidebar", SCOPE_GLOBAL, "grow_sidebar"),
+
+    # --- Session list ---
+    Command(("j",), "Next session", SCOPE_SESSION_LIST, "cursor_down", footer=True),
+    Command(("k",), "Previous session", SCOPE_SESSION_LIST, "cursor_up", footer=True),
+    Command(("l", "right"), "Focus transcript", SCOPE_SESSION_LIST, "focus_transcript"),
+    Command(
+        ("enter",), "Reply to session", SCOPE_SESSION_LIST,
+        "start_reply_or_send", priority=True, footer=True,
+    ),
+    Command(("n",), "Rename session", SCOPE_SESSION_LIST, "rename_session", footer=True),
+    Command(("g",), "Copy resume command", SCOPE_SESSION_LIST, "copy_session_id"),
+    Command(("s",), "Cycle status forward", SCOPE_SESSION_LIST, "cycle_status_forward"),
+    Command(("S",), "Cycle status backward", SCOPE_SESSION_LIST, "cycle_status_backward"),
+    Command(("a",), "Archive session", SCOPE_SESSION_LIST, "archive_session"),
+    Command(("A",), "Toggle archived view", SCOPE_SESSION_LIST, "toggle_archive_view"),
+    Command(
+        ("J", "shift+down"), "Move session down",
+        SCOPE_SESSION_LIST, "move_session_down",
+    ),
+    Command(
+        ("K", "shift+up"), "Move session up",
+        SCOPE_SESSION_LIST, "move_session_up",
+    ),
+
+    # --- Transcript ---
+    Command(("h", "left"), "Focus session list", SCOPE_TRANSCRIPT, "focus_list"),
+    Command(
+        ("pageup",), "Scroll page up", SCOPE_TRANSCRIPT,
+        "scroll_transcript_up", priority=True,
+    ),
+    Command(
+        ("pagedown",), "Scroll page down", SCOPE_TRANSCRIPT,
+        "scroll_transcript_down", priority=True,
+    ),
+    Command(
+        ("home",), "Scroll to top", SCOPE_TRANSCRIPT,
+        "scroll_transcript_home", priority=True,
+    ),
+    Command(
+        ("end",), "Scroll to bottom", SCOPE_TRANSCRIPT,
+        "scroll_transcript_end", priority=True,
+    ),
+    Command(("m",), "Enter selection mode", SCOPE_TRANSCRIPT, footer=True),
+
+    # --- Selection mode (widget-local; TranscriptView.on_key) ---
+    Command(("j", "down"), "Next message", SCOPE_SELECTION, footer=True),
+    Command(("k", "up"), "Previous message", SCOPE_SELECTION, footer=True),
+    Command(("v",), "Toggle range select", SCOPE_SELECTION, footer=True),
+    Command(("y",), "Copy selection", SCOPE_SELECTION, footer=True),
+    Command(("e",), "Export to /tmp", SCOPE_SELECTION, footer=True),
+    Command(("m", "escape"), "Exit selection", SCOPE_SELECTION, footer=True),
+
+    # --- Reply input ---
+    Command(
+        ("enter",), "Send message", SCOPE_REPLY,
+        "start_reply_or_send", priority=True, footer=True,
+    ),
+    Command(("alt+enter",), "Newline", SCOPE_REPLY, "insert_newline", footer=True),
+    Command(("escape",), "Cancel / return to list", SCOPE_REPLY, "cancel_reply", footer=True),
+    Command(("alt+j",), "Nav sessions while replying", SCOPE_REPLY, "nav_down_from_reply"),
+    Command(("alt+k",), "Nav sessions while replying", SCOPE_REPLY, "nav_up_from_reply"),
+
+    # --- Find bar (widget-local; FindBar.on_key + Input.Submitted) ---
+    Command(("enter",), "Next match", SCOPE_FIND, footer=True),
+    Command(("down",), "Next match", SCOPE_FIND, footer=True),
+    Command(("up",), "Previous match", SCOPE_FIND, footer=True),
+    Command(("N",), "Previous match (app-wide)", SCOPE_FIND, "find_prev"),
+    Command(("escape",), "Close find", SCOPE_FIND, footer=True),
+
+    # --- Search modal (widget-local; SearchScreen.on_key) ---
+    Command(("up", "down", "ctrl+n", "ctrl+p"), "Navigate results", SCOPE_SEARCH, footer=True),
+    Command(("enter",), "Open result", SCOPE_SEARCH, footer=True),
+    Command(("escape",), "Close search", SCOPE_SEARCH, footer=True),
+]
+
+
+def commands_for_scope(scope: str) -> list[Command]:
+    return [c for c in COMMAND_REGISTRY if c.scope == scope]
+
+
+def format_command_keys(cmd: Command) -> str:
+    """Render a command's keys as a slash-separated list for display."""
+    return "/".join(format_key(k) for k in cmd.keys)
+
+
+def app_bindings_from_registry() -> list[Binding]:
+    """Derive App-level ``Binding`` entries from the registry.
+
+    Every Command with an ``action`` is bound at the App level. The
+    scope field is advisory for display — app bindings fire globally,
+    but each action already gates itself on focus / mode state (see
+    e.g. ``_input_has_focus`` in action handlers). Widget-local keys
+    (selection mode, find bar, search modal) are deliberately skipped
+    because their widgets handle the key in ``on_key`` and stop the
+    event before it reaches an app binding.
+    """
+    bindings: list[Binding] = []
+    for cmd in COMMAND_REGISTRY:
+        if cmd.action is None:
+            continue
+        for key in cmd.keys:
+            bindings.append(
+                Binding(
+                    key,
+                    cmd.action,
+                    cmd.description,
+                    show=False,
+                    priority=cmd.priority,
+                )
+            )
+    # Escape on the reply input action is the app-level cancel_reply;
+    # it doubles as "close find bar" when the bar is up (see
+    # action_cancel_reply). Registered via the SCOPE_REPLY entry above.
+    return bindings
 
 
 def format_age(timestamp: float) -> str:
@@ -384,6 +606,11 @@ class TranscriptView(VerticalScroll):
         self._selected_index = len(messages) - 1
         self._update_selection(messages)
         self.app.notify("Selection mode: j/k move, v range, y copy, e export, m/Esc exit")
+        # Nudge the contextual footer — selection mode has its own scope.
+        try:
+            self.app.refresh_footer()
+        except Exception:
+            pass
 
     def _exit_selection_mode(self):
         self._range_mode = False
@@ -392,6 +619,10 @@ class TranscriptView(VerticalScroll):
         self._selection_mode = False
         self._selected_index = -1
         self.border_title = "Transcript"
+        try:
+            self.app.refresh_footer()
+        except Exception:
+            pass
 
     def _enter_range_mode(self):
         self._range_mode = True
@@ -1686,6 +1917,167 @@ class SearchScreen(ModalScreen):
         self.dismiss((row["session_id"], row["uuid"], terms))
 
 
+class HelpScreen(ModalScreen):
+    """Full-app help overlay grouped by scope (ADR-017, task #42).
+
+    Mirrors the search modal layout so the two discoverability surfaces
+    feel consistent. Reads entirely from ``COMMAND_REGISTRY`` — anything
+    new added there appears here automatically.
+    """
+
+    BINDINGS = [
+        Binding("escape", "close", "Close", priority=True),
+        Binding("?", "close", "Close", priority=True),
+        Binding("q", "close", "Close", priority=True),
+    ]
+
+    CSS = """
+    HelpScreen {
+        layout: vertical;
+        align: center top;
+        background: $background 70%;
+    }
+
+    #help-container {
+        width: 90%;
+        max-width: 120;
+        height: 85%;
+        margin-top: 1;
+        background: $surface;
+        border: thick $accent;
+        layout: vertical;
+    }
+
+    #help-title {
+        height: 1;
+        padding: 0 1;
+        background: $boost;
+        color: $text;
+        text-style: bold;
+    }
+
+    #help-body {
+        height: 1fr;
+        padding: 1 2;
+    }
+
+    #help-hint {
+        height: 1;
+        padding: 0 1;
+        color: $text-muted;
+        background: $boost;
+        text-style: italic;
+    }
+
+    .help-scope {
+        margin-top: 1;
+        text-style: bold;
+        color: $accent;
+    }
+
+    .help-scope:first-of-type {
+        margin-top: 0;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="help-container") as container:
+            container.border_title = "Help — keys grouped by context"
+            yield Static("ThreadHop commands", id="help-title")
+            yield VerticalScroll(id="help-body")
+            yield Static(
+                "Esc / ? / q close • keys are grouped by where they're live",
+                id="help-hint",
+            )
+
+    def on_mount(self) -> None:
+        body = self.query_one("#help-body", VerticalScroll)
+        for scope in SCOPE_ORDER:
+            commands = commands_for_scope(scope)
+            if not commands:
+                continue
+            body.mount(Static(SCOPE_LABELS[scope], classes="help-scope"))
+            # Width of the keys column is computed per-scope so shorter
+            # sections don't pay for a long key name in another scope.
+            key_width = max(len(format_command_keys(c)) for c in commands)
+            key_width = max(key_width, 6)
+            for cmd in commands:
+                keys = format_command_keys(cmd).ljust(key_width)
+                body.mount(Static(f"  {keys}   {cmd.description}"))
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
+class ContextualFooter(Static):
+    """Single-line footer that shows scope-relevant hints from the registry.
+
+    The stock ``Footer`` widget lists every visible binding at once, which
+    turns into noise once the app has focus-aware and mode-specific
+    commands. Instead we read ``COMMAND_REGISTRY`` and render only
+    commands whose scope matches the caller-supplied context, preferring
+    those marked ``footer=True``.
+    """
+
+    DEFAULT_CSS = """
+    ContextualFooter {
+        dock: bottom;
+        height: 1;
+        background: $boost;
+        color: $text-muted;
+        padding: 0 1;
+    }
+    ContextualFooter > .footer-sep {
+        color: $text-disabled;
+    }
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__("", *args, **kwargs)
+        self._last_scopes: tuple[str, ...] = ()
+
+    def render_for(self, scopes: list[str]) -> None:
+        """Rebuild the footer content for the given list of active scopes.
+
+        Scopes are evaluated in the order passed — the registry entries
+        for later scopes win when a key appears in multiple (e.g. Enter
+        is Reply/Send globally but Send in the reply scope).
+        """
+        scope_tuple = tuple(scopes)
+        if scope_tuple == self._last_scopes:
+            # Footer already reflects the right context — skip the rebuild.
+            return
+        self._last_scopes = scope_tuple
+
+        # Keep the help shortcut pinned on the far left so it stays
+        # discoverable regardless of current focus.
+        parts: list[str] = []
+        seen_keys: set[tuple[str, ...]] = set()
+
+        def add(cmd: Command) -> None:
+            if cmd.keys in seen_keys:
+                return
+            seen_keys.add(cmd.keys)
+            parts.append(f"[b]{format_command_keys(cmd)}[/b] {cmd.description}")
+
+        # Global "?" first, so it's always in the same spot.
+        for cmd in commands_for_scope(SCOPE_GLOBAL):
+            if cmd.keys == ("?",):
+                add(cmd)
+                break
+
+        for scope in scopes:
+            for cmd in commands_for_scope(scope):
+                if cmd.footer and cmd.keys != ("?",):
+                    add(cmd)
+
+        if not parts:
+            self.update("")
+            return
+        sep = "  [dim]·[/dim]  "
+        self.update(sep.join(parts))
+
+
 class FindBar(Horizontal):
     """Persistent Ctrl+F-style find bar shown above the transcript.
 
@@ -1943,44 +2335,10 @@ class ClaudeSessions(App):
     }
     """
 
-    BINDINGS = [
-        Binding("q", "maybe_quit", "Quit"),
-        Binding("r", "maybe_refresh", "Refresh"),
-        Binding("t", "toggle_theme_next", "Theme"),
-        Binding("T", "toggle_theme_prev", "Theme Prev", show=False),
-        Binding("n", "rename_session", "Rename"),
-        Binding("g", "copy_session_id", "Copy ID"),
-        Binding("enter", "start_reply_or_send", "Reply/Send", show=True, priority=True),
-        Binding("alt+enter", "insert_newline", "Newline", show=False),
-        Binding("/", "open_search", "Search"),
-        Binding("ctrl+f", "open_find", "Find"),
-        Binding("N", "find_prev", "Prev match", show=False),
-        Binding("escape", "cancel_reply", "Cancel", show=False),
-        Binding("right", "focus_transcript", "Transcript", show=False),
-        Binding("left", "focus_list", "Sessions", show=False),
-        Binding("l", "focus_transcript", "Transcript", show=False),
-        Binding("h", "focus_list", "Sessions", show=False),
-        Binding("j", "cursor_down", "Down", show=False),
-        Binding("k", "cursor_up", "Up", show=False),
-        Binding("J", "move_session_down", "Move Down", show=False),
-        Binding("K", "move_session_up", "Move Up", show=False),
-        Binding("shift+down", "move_session_down", "Move Down", show=False),
-        Binding("shift+up", "move_session_up", "Move Up", show=False),
-        Binding("alt+j", "nav_down_from_reply", "Nav Down", show=False),
-        Binding("alt+k", "nav_up_from_reply", "Nav Up", show=False),
-        Binding("a", "archive_session", "Archive", show=False),
-        Binding("A", "toggle_archive_view", "Show Archived", show=False),
-        Binding("pageup", "scroll_transcript_up", "PgUp", show=False, priority=True),
-        Binding(
-            "pagedown", "scroll_transcript_down", "PgDn", show=False, priority=True
-        ),
-        Binding("home", "scroll_transcript_home", "Top", show=False, priority=True),
-        Binding("end", "scroll_transcript_end", "Bottom", show=False, priority=True),
-        Binding("s", "cycle_status_forward", "Status", show=False),
-        Binding("S", "cycle_status_backward", "Status Back", show=False),
-        Binding("left_square_bracket", "shrink_sidebar", "Narrow", show=False),
-        Binding("right_square_bracket", "grow_sidebar", "Widen", show=False),
-    ]
+    # Bindings come from the shared command registry (ADR-017). Add new
+    # App-level commands to COMMAND_REGISTRY above, not here — footer and
+    # help overlay both read from the same list.
+    BINDINGS = app_bindings_from_registry()
 
     SIDEBAR_MIN = 20
     SIDEBAR_MAX = 60
@@ -2036,7 +2394,7 @@ class ClaudeSessions(App):
             id="transcript-column",
         )
         yield Vertical(TextArea(id="reply-input"), id="input-container")
-        yield Footer()
+        yield ContextualFooter(id="contextual-footer")
 
     def on_mount(self) -> None:
         # Apply persisted sidebar width (defaults to CSS value of 36).
@@ -2059,6 +2417,11 @@ class ClaudeSessions(App):
         self.set_interval(REFRESH_INTERVAL, self.auto_refresh_background)
         self._spinner_frame = 0
         self.set_interval(SPINNER_INTERVAL, self.animate_spinners)
+        # Prime the contextual footer now that all widgets are mounted
+        # and the sidebar has focus. on_descendant_focus also covers
+        # this, but calling refresh_footer directly makes startup
+        # deterministic in tests that don't emit focus events.
+        self.refresh_footer()
 
     def update_titles(self) -> None:
         filter_info = ""
@@ -2703,6 +3066,75 @@ class ClaudeSessions(App):
         bar = self._find_bar()
         return bool(bar and bar.display)
 
+    def _current_scopes(self) -> list[str]:
+        """Resolve which registry scopes are live right now.
+
+        Ordered from outer to inner (``global`` first, most-specific
+        last) so the contextual footer and any downstream consumer
+        can give precedence to the innermost scope when a key appears
+        in more than one.
+        """
+        scopes = [SCOPE_GLOBAL]
+        focused = self.focused
+
+        # Selection mode is inside the transcript but displaces its
+        # regular bindings, so it's surfaced as its own scope first.
+        try:
+            transcript = self.query_one("#transcript-scroll", TranscriptView)
+        except Exception:
+            transcript = None
+        in_selection = bool(transcript and transcript._selection_mode)
+
+        # Find bar is modeless — it can be up while focus is elsewhere.
+        # Surface it as its own scope whenever it's visible.
+        if self._find_is_active():
+            scopes.append(SCOPE_FIND)
+
+        if focused is not None:
+            fid = getattr(focused, "id", None)
+            if fid == "reply-input":
+                scopes.append(SCOPE_REPLY)
+            elif fid == "session-list":
+                scopes.append(SCOPE_SESSION_LIST)
+            elif fid == "find-input":
+                # Already covered by SCOPE_FIND above.
+                pass
+            elif transcript is not None and focused is transcript:
+                scopes.append(SCOPE_SELECTION if in_selection else SCOPE_TRANSCRIPT)
+
+        if in_selection and SCOPE_SELECTION not in scopes:
+            scopes.append(SCOPE_SELECTION)
+        return scopes
+
+    def refresh_footer(self) -> None:
+        """Re-render the contextual footer for the current scope stack.
+
+        Called whenever focus moves, selection mode toggles, or the
+        find bar opens/closes — the footer picks up the new scope set
+        and redraws. No-ops if the footer hasn't mounted yet.
+        """
+        try:
+            footer = self.query_one("#contextual-footer", ContextualFooter)
+        except Exception:
+            return
+        footer.render_for(self._current_scopes())
+
+    def on_descendant_focus(self, event) -> None:
+        self.refresh_footer()
+
+    def on_descendant_blur(self, event) -> None:
+        self.refresh_footer()
+
+    def action_open_help(self) -> None:
+        """Show the context-aware help overlay.
+
+        Skips when an input widget has focus so `?` still types
+        normally while composing a reply or a search query.
+        """
+        if self._input_has_focus():
+            return
+        self.push_screen(HelpScreen())
+
     def action_maybe_quit(self) -> None:
         if not self._input_has_focus():
             self.exit()
@@ -2756,6 +3188,7 @@ class ClaudeSessions(App):
         existing = (input_widget.value or "").strip()
         if existing:
             self._run_find(input_widget.value)
+        self.refresh_footer()
 
     def action_find_next(self) -> None:
         if not self._find_is_active():
@@ -2813,6 +3246,7 @@ class ClaudeSessions(App):
             self.query_one("#session-list", ListView).focus()
         except Exception:
             pass
+        self.refresh_footer()
 
     def on_input_changed(self, event) -> None:
         """Debounce keystrokes in the find bar into a single highlight pass."""
