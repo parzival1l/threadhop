@@ -33,6 +33,7 @@ from textual.worker import Worker
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import db  # noqa: E402
 import indexer  # noqa: E402
+import observation_queries  # noqa: E402
 import observer  # noqa: E402
 
 
@@ -4161,6 +4162,36 @@ def cmd_observe(args) -> int:
     return 0
 
 
+def cmd_todos(args) -> int:
+    """List open TODO observations as compact JSONL."""
+    conn = db.init_db()
+    try:
+        results = observation_queries.refresh_unprocessed_observations(
+            conn,
+            project=args.project,
+            session_id=args.session,
+        )
+        for result in results:
+            if result.get("status") == "failed":
+                print(
+                    "threadhop todos: observer failed for session "
+                    f"{result['session_id']}: {result.get('message', 'unknown error')}",
+                    file=sys.stderr,
+                )
+        entries = observation_queries.list_observation_entries(
+            conn,
+            observation_type="todo",
+            project=args.project,
+            session_id=args.session,
+        )
+    finally:
+        conn.close()
+
+    for entry in entries:
+        print(observation_queries.format_entry_json(entry))
+    return 0
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -4188,6 +4219,8 @@ def main():
             conn.close()
         print(f"Tagged session {args.session} as {args.status}")
         return 0
+    if args.command == "todos":
+        return cmd_todos(args)
     if args.command == "observe":
         return cmd_observe(args)
     return _cli_stub(args.command)
