@@ -32,6 +32,7 @@ from textual.worker import Worker
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import db  # noqa: E402
 import indexer  # noqa: E402
+import observer  # noqa: E402
 
 
 def get_available_themes():
@@ -3529,11 +3530,13 @@ def _cli_stub(command):
     return 0
 
 
-def _resolve_tag_session(args) -> int:
+def _resolve_cli_session(args) -> int:
     """Populate args.session via auto-detection when omitted.
 
-    Returns 0 on success (args.session is set), non-zero on failure (already
-    printed an error). macOS-only — detection relies on `ps`/`lsof`.
+    Shared by every CLI subcommand that takes ``--session`` (tag, observe,
+    …). Returns 0 on success (args.session is set), non-zero on failure
+    (already printed an error). macOS-only — detection relies on
+    ``ps``/``lsof``.
     """
     if args.session:
         return 0
@@ -3542,7 +3545,7 @@ def _resolve_tag_session(args) -> int:
         args.session = detected
         return 0
     print(
-        "threadhop tag: could not auto-detect the current session id.\n"
+        f"threadhop {args.command}: could not auto-detect the current session id.\n"
         "  Run this from inside a `claude` terminal, or pass --session <id> explicitly.\n"
         "  (Auto-detection walks the current process tree for a claude CLI ancestor; macOS only — relies on `ps`/`lsof`.)",
         file=sys.stderr,
@@ -3648,7 +3651,80 @@ def build_parser():
         description="List everything in the memory ledger. Use --project/--session to filter.",
     )
 
+    observe_p = subparsers.add_parser(
+        "observe",
+        parents=[shared],
+        help="Run the observer once on a session (on-demand mode)",
+        description=(
+            "Run the Haiku observer on new messages for a session, once. "
+            "Reads from the recorded source_byte_offset, extracts typed "
+            "observations into ~/.config/threadhop/observations/<id>.jsonl, "
+            "and advances the cursor. This is the on-demand mode of the "
+            "observer — the background sidecar / watch mode (task #34) "
+            "lands separately."
+        ),
+    )
+    observe_p.add_argument(
+        "--batch-threshold",
+        type=int,
+        default=observer.BATCH_THRESHOLD,
+        help=(
+            f"Minimum new message turns before extraction runs "
+            f"(default {observer.BATCH_THRESHOLD}). Lower for demos."
+        ),
+    )
+
     return parser
+
+
+def cmd_observe(args) -> int:
+    """Run the observer once for the given session and print a summary.
+
+    Partial implementation of task #34 — on-demand only. No watch mode,
+    no PID tracking, no fsevents — those belong to the background
+    sidecar. This handler is what the demo uses and what the
+    ``/threadhop:observe`` skill will eventually shell out to.
+    """
+    rc = _resolve_cli_session(args)
+    if rc != 0:
+        return rc
+    session_path = find_session_path(args.session)
+    if session_path is None:
+        print(
+            f"threadhop observe: no transcript found for session "
+            f"{args.session} under {CLAUDE_PROJECTS}.",
+            file=sys.stderr,
+        )
+        return 1
+
+    conn = db.init_db()
+    try:
+        # Seed the sessions row so the observer can resolve source_path on
+        # its first run (same pattern the `tag` handler uses).
+        db.upsert_session(
+            conn, args.session, str(session_path),
+            project=session_path.parent.name,
+        )
+        result = observer.observe_session(
+            conn, args.session,
+            batch_threshold=args.batch_threshold,
+        )
+    finally:
+        conn.close()
+
+    print(result.get("message", "(no message)"))
+    if result.get("obs_path"):
+        print(f"  obs file: {result['obs_path']}")
+    if result.get("status") == "extracted":
+        print(
+            f"  cursor:   {result['source_byte_offset']} bytes  "
+            f"({result['entry_count']} observations on file)"
+        )
+    if result.get("status") == "failed":
+        if result.get("stderr"):
+            print(f"  stderr:   {result['stderr']}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def main():
@@ -3658,7 +3734,7 @@ def main():
     if args.command is None:
         return _run_tui(args)
     if args.command == "tag":
-        rc = _resolve_tag_session(args)
+        rc = _resolve_cli_session(args)
         if rc != 0:
             return rc
         # Ensure the session row exists (CLI may run before TUI discovery).
@@ -3678,6 +3754,8 @@ def main():
             conn.close()
         print(f"Tagged session {args.session} as {args.status}")
         return 0
+    if args.command == "observe":
+        return cmd_observe(args)
     return _cli_stub(args.command)
 
 
