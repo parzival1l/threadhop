@@ -3498,6 +3498,13 @@ def detect_current_session_id() -> str | None:
     return None
 
 
+def find_session_path(session_id: str) -> Path | None:
+    """Locate the JSONL transcript for a session ID under ~/.claude/projects/."""
+    for path in CLAUDE_PROJECTS.glob(f"*/{session_id}.jsonl"):
+        return path
+    return None
+
+
 def detect_project_from_cwd() -> str | None:
     """Auto-detect project by matching CWD to Claude's project directory names.
 
@@ -3616,7 +3623,8 @@ def build_parser():
     )
     tag_p.add_argument(
         "status",
-        help="Status value to set (e.g. backlog, in_progress, in_review, done, archived)",
+        choices=db.SESSION_STATUS_ORDER,
+        help="Status value to set",
     )
 
     subparsers.add_parser(
@@ -3653,7 +3661,22 @@ def main():
         rc = _resolve_tag_session(args)
         if rc != 0:
             return rc
-        print(f"threadhop tag: resolved session={args.session} status={args.status} (stub — #16)", file=sys.stderr)
+        # Ensure the session row exists (CLI may run before TUI discovery).
+        session_path = find_session_path(args.session)
+        if session_path is None:
+            print(
+                f"threadhop tag: no transcript found for session {args.session} "
+                f"under {CLAUDE_PROJECTS}.",
+                file=sys.stderr,
+            )
+            return 1
+        conn = db.init_db()
+        try:
+            db.upsert_session(conn, args.session, str(session_path))
+            db.set_session_status(conn, args.session, args.status)
+        finally:
+            conn.close()
+        print(f"Tagged session {args.session} as {args.status}")
         return 0
     return _cli_stub(args.command)
 
