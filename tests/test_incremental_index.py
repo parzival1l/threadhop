@@ -460,9 +460,9 @@ def test_migration_003_from_v2(tmp_path):
     cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
     assert "message_id" not in cols
 
-    # Apply pending migration
+    # Apply pending migrations (003 + any later ones)
     db.apply_migrations(conn)
-    assert db.get_schema_version(conn) == 3
+    assert db.get_schema_version(conn) == db.SCHEMA_VERSION
 
     # Verify index_state table exists
     tables = {

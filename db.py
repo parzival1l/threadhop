@@ -32,7 +32,7 @@ DB_PATH = DB_DIR / "sessions.db"
 # --- Schema version ---
 # Each migration N in MIGRATIONS moves the DB from version N to N+1.
 # The DB's current version lives in PRAGMA user_version.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 # --- Migrations -----------------------------------------------------------
@@ -189,11 +189,50 @@ def _migration_003_index_state(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migration_004_observation_state(conn: sqlite3.Connection) -> None:
+    """Phase 3: observer + reflector state tracking (ADR-019, ADR-022).
+
+    Tracks per-session observation state: where the observer left off in
+    the source JSONL (``source_byte_offset``), how many observation entries
+    have been written (``entry_count``), what the reflector has already
+    compared (``reflector_entry_offset``), and whether the observer is
+    currently running (``observer_pid``).
+
+    This table is the single source of truth for "has this session been
+    observed?" and "where did we leave off?" — queried by the TUI for the
+    observation indicator, by the observer for incremental processing, and
+    by the reflector for its own cadence tracking.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS observation_state (
+            session_id              TEXT PRIMARY KEY,
+            source_path             TEXT NOT NULL,
+            obs_path                TEXT NOT NULL,
+            source_byte_offset      INTEGER NOT NULL DEFAULT 0,
+            entry_count             INTEGER NOT NULL DEFAULT 0,
+            reflector_entry_offset  INTEGER NOT NULL DEFAULT 0,
+            observer_pid            INTEGER,
+            status                  TEXT NOT NULL DEFAULT 'idle',
+                -- idle | running | stopped
+            started_at              REAL,
+            last_observed_at        REAL,
+            FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_obs_state_status "
+        "ON observation_state(status)"
+    )
+
+
 # Ordered list; MIGRATIONS[i] moves schema from version i to i+1.
 MIGRATIONS: list = [
     _migration_001_initial,
     _migration_002_messages,
     _migration_003_index_state,
+    _migration_004_observation_state,
 ]
 
 assert len(MIGRATIONS) == SCHEMA_VERSION, (
@@ -872,3 +911,169 @@ def migrate_config_json_to_sqlite(
             }
 
     return {"action": "migrated", "migrated": migrated, "skipped": skipped}
+
+
+# --- Observation state helpers (ADR-019, ADR-022) --------------------------
+
+# Directory where per-session observation JSONL files live.
+OBS_DIR = DB_DIR / "observations"
+
+
+def get_observation_state(
+    conn: sqlite3.Connection,
+    session_id: str,
+) -> dict | None:
+    """Return the observation state for a session, or None if never observed."""
+    return query_one(
+        conn,
+        "SELECT * FROM observation_state WHERE session_id = ?",
+        (session_id,),
+    )
+
+
+def upsert_observation_state(
+    conn: sqlite3.Connection,
+    session_id: str,
+    source_path: str,
+    obs_path: str,
+    *,
+    source_byte_offset: int = 0,
+    entry_count: int = 0,
+    reflector_entry_offset: int = 0,
+    observer_pid: int | None = None,
+    status: str = "idle",
+    started_at: float | None = None,
+    last_observed_at: float | None = None,
+) -> None:
+    """Insert or update the observation state for a session.
+
+    On conflict, updates all mutable fields. The caller controls which
+    fields to advance — typically ``source_byte_offset`` and ``entry_count``
+    after an observer run, or ``observer_pid`` and ``status`` on start/stop.
+    """
+    conn.execute(
+        """
+        INSERT INTO observation_state (
+            session_id, source_path, obs_path,
+            source_byte_offset, entry_count, reflector_entry_offset,
+            observer_pid, status, started_at, last_observed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(session_id) DO UPDATE SET
+            source_path            = excluded.source_path,
+            obs_path               = excluded.obs_path,
+            source_byte_offset     = excluded.source_byte_offset,
+            entry_count            = excluded.entry_count,
+            reflector_entry_offset = excluded.reflector_entry_offset,
+            observer_pid           = excluded.observer_pid,
+            status                 = excluded.status,
+            started_at             = COALESCE(excluded.started_at, observation_state.started_at),
+            last_observed_at       = COALESCE(excluded.last_observed_at, observation_state.last_observed_at)
+        """,
+        (
+            session_id, source_path, obs_path,
+            source_byte_offset, entry_count, reflector_entry_offset,
+            observer_pid, status, started_at, last_observed_at,
+        ),
+    )
+
+
+def update_observer_offset(
+    conn: sqlite3.Connection,
+    session_id: str,
+    source_byte_offset: int,
+    entry_count: int,
+    last_observed_at: float,
+) -> None:
+    """Advance the observer's position after processing a chunk.
+
+    Called after each observer extraction. Updates the byte offset (where
+    to resume reading source JSONL) and entry count (how many observations
+    have been written so far).
+    """
+    conn.execute(
+        """
+        UPDATE observation_state
+        SET source_byte_offset = ?,
+            entry_count        = ?,
+            last_observed_at   = ?
+        WHERE session_id = ?
+        """,
+        (source_byte_offset, entry_count, last_observed_at, session_id),
+    )
+
+
+def update_reflector_offset(
+    conn: sqlite3.Connection,
+    session_id: str,
+    reflector_entry_offset: int,
+) -> None:
+    """Advance the reflector's position after a comparison pass.
+
+    The reflector processes observation entries (not source bytes), so its
+    offset is an entry index, not a byte offset.
+    """
+    conn.execute(
+        """
+        UPDATE observation_state
+        SET reflector_entry_offset = ?
+        WHERE session_id = ?
+        """,
+        (reflector_entry_offset, session_id),
+    )
+
+
+def set_observer_running(
+    conn: sqlite3.Connection,
+    session_id: str,
+    pid: int,
+    started_at: float,
+) -> None:
+    """Record that the observer is now running for this session."""
+    conn.execute(
+        """
+        UPDATE observation_state
+        SET observer_pid = ?, status = 'running', started_at = ?
+        WHERE session_id = ?
+        """,
+        (pid, started_at, session_id),
+    )
+
+
+def set_observer_stopped(
+    conn: sqlite3.Connection,
+    session_id: str,
+) -> None:
+    """Record that the observer has stopped (graceful or detected stale)."""
+    conn.execute(
+        """
+        UPDATE observation_state
+        SET observer_pid = NULL, status = 'stopped'
+        WHERE session_id = ?
+        """,
+        (session_id,),
+    )
+
+
+def get_observed_sessions(
+    conn: sqlite3.Connection,
+) -> list[dict]:
+    """Return all sessions that have observations (entry_count > 0).
+
+    Used by the TUI to show the observation indicator (ADR-021).
+    """
+    return query_all(
+        conn,
+        "SELECT session_id, entry_count, status, observer_pid "
+        "FROM observation_state WHERE entry_count > 0",
+    )
+
+
+def get_running_observers(
+    conn: sqlite3.Connection,
+) -> list[dict]:
+    """Return all sessions with a running observer (for --stop-all)."""
+    return query_all(
+        conn,
+        "SELECT session_id, observer_pid "
+        "FROM observation_state WHERE status = 'running' AND observer_pid IS NOT NULL",
+    )
