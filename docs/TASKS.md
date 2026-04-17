@@ -112,8 +112,8 @@ _Observer-first architecture. Observer uses `claude -p --model haiku --permissio
 
   _(ADR-010, ADR-018, ADR-019)_
 
-- [ ] **19. Incremental observer processing (byte offset per session)** *(blocked by: #18)*
-  The incremental logic is built into task #18's Step 1-2 (read from `source_byte_offset`, not byte 0). This task covers the **watch mode** layer on top: after the initial extraction, continue monitoring the source JSONL for growth. When the file grows and the batch threshold is met again, re-run Steps 2-7. Uses `observation_state.source_byte_offset` as the cursor. On-demand mode: run once and exit. Background mode: loop with fsevents/polling. _(ADR-010, ADR-019)_
+- [x] **19. Incremental observer processing (byte offset per session)** *(blocked by: #18)*
+  **DONE.** `observer.watch_session()` is the watch-mode layer on top of `observe_session()`. Runs an initial catch-up extraction, then polls `source_path.stat().st_size` and re-invokes the observer whenever the file has grown past the recorded cursor. Polling is the ADR-015 fallback; the per-iteration `sleep_fn` is the swap point where task #34 can plug in fsevents/kqueue without breaking the contract. Failures are tallied and never raised, so transient Haiku errors don't kill the watcher. Tests in `tests/test_observer.py::TestWatchSession`. _(ADR-010, ADR-015, ADR-019)_
 
 - [ ] **34. Build background observer sidecar (`threadhop observe`)** *(blocked by: #18, #19)*
   Background process mode for the observer (ADR-015). `threadhop observe --session <id>` watches the session's JSONL via fsevents (macOS) with polling fallback. Batches new messages (~3-4 trigger extraction). Records PID in `observation_state.observer_pid`. Exits when Claude Code session ends or `--stop` is sent. _(ADR-015)_

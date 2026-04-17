@@ -40,9 +40,10 @@ import json
 import shutil
 import sqlite3
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import db
 import indexer
@@ -64,6 +65,13 @@ PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "observer.md"
 # first call of a session can pay an auth/warmup cost, and extremely large
 # chunks (first-time catch-up on a long transcript) take longer.
 DEFAULT_TIMEOUT_SEC = 180.0
+
+# Default poll cadence for the watch-mode loop. Haiku itself takes seconds
+# to respond, so sub-second polling buys nothing — 1.0s keeps the loop
+# responsive without burning CPU on stat() calls. Background sidecars that
+# care about lower latency can swap in fsevents/kqueue without changing the
+# public API (see ``watch_session``'s docstring).
+WATCH_POLL_INTERVAL_SEC = 1.0
 
 # Known observation types, in display order for the summary line.
 _TYPE_ORDER = ("decision", "todo", "done", "adr", "observation", "conflict")
@@ -483,3 +491,217 @@ def observe_session(
         "obs_path": str(obs_path),
         "message": _summary_message(turns, by_type),
     }
+
+
+# --- Watch mode -----------------------------------------------------------
+
+
+def _resolve_source_path(
+    conn: sqlite3.Connection,
+    session_id: str,
+    explicit: str | Path | None,
+) -> Path | None:
+    """Resolve the source JSONL path for ``session_id``.
+
+    Same precedence as ``observe_session``: explicit override → state row
+    → sessions row. Returns ``None`` if no path is known anywhere.
+    Centralised here so the watch loop can detect a missing source up
+    front rather than discovering it inside the first observer call.
+    """
+    if explicit is not None:
+        return Path(explicit)
+    state = db.get_observation_state(conn, session_id)
+    if state is not None and state["source_path"]:
+        return Path(state["source_path"])
+    sess = db.get_session(conn, session_id)
+    if sess is not None and sess.get("session_path"):
+        return Path(sess["session_path"])
+    return None
+
+
+def _current_offset(
+    conn: sqlite3.Connection,
+    session_id: str,
+    fallback: int = 0,
+) -> int:
+    """Return the observer's recorded byte offset for ``session_id``.
+
+    Falls back to ``fallback`` when no state row exists yet — this happens
+    on the very first iteration before observe_session has had a chance to
+    seed the row.
+    """
+    state = db.get_observation_state(conn, session_id)
+    if state is None:
+        return fallback
+    return int(state["source_byte_offset"])
+
+
+def watch_session(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    source_path: str | Path | None = None,
+    batch_threshold: int = BATCH_THRESHOLD,
+    poll_interval_sec: float = WATCH_POLL_INTERVAL_SEC,
+    claude_bin: str = "claude",
+    timeout: float = DEFAULT_TIMEOUT_SEC,
+    prompt_path: Path | None = None,
+    should_stop: Callable[[], bool] | None = None,
+    max_iterations: int | None = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    on_result: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Loop ``observe_session`` over ``session_id`` until told to stop.
+
+    The on-demand path (``observe_session``) already handles the
+    incremental "read from ``source_byte_offset``" logic; this function
+    is the **watch-mode** layer that lives on top of it. After the
+    initial catch-up extraction, it monitors the source JSONL for growth
+    and re-invokes the observer whenever the file has grown past the
+    current cursor — gated by ``observe_session``'s own batch-threshold
+    check, so cheap "1 new turn" updates don't pay for a Haiku call.
+
+    The implementation polls ``Path.stat().st_size``. Polling is the
+    "fallback" half of the ADR-015 design ("fsevents on macOS, polling
+    fallback") — it's correct everywhere and adds zero deps. A future
+    background sidecar (task #34) can replace the wait step with kqueue
+    / fsevents for sub-second latency without changing this function's
+    contract: the only swap point is the per-iteration sleep, which is
+    already injectable via ``sleep_fn``.
+
+    Args:
+        conn: Open DB connection with the schema applied.
+        session_id: Claude Code session UUID to watch.
+        source_path: Override for the source JSONL path. Resolved from
+            the ``observation_state`` / ``sessions`` rows otherwise.
+        batch_threshold: Forwarded to each ``observe_session`` call.
+        poll_interval_sec: Seconds between size checks. Defaults to
+            ``WATCH_POLL_INTERVAL_SEC`` (1.0s).
+        claude_bin: Forwarded to ``observe_session``.
+        timeout: Forwarded to ``observe_session``.
+        prompt_path: Forwarded to ``observe_session``.
+        should_stop: Optional callable polled before every iteration.
+            Returning ``True`` exits the loop with status ``stopped``.
+            Background sidecars wire this to a SIGTERM-set flag.
+        max_iterations: Optional cap on iteration count after the
+            initial catch-up. Primarily for tests so they don't have to
+            rely on the stop callback to terminate.
+        sleep_fn: Injected sleep function. Tests pass a no-op so the
+            loop runs at full speed.
+        on_result: Optional callback invoked with the full result dict
+            of every ``observe_session`` call (catch-up included). Lets
+            sidecars stream summaries to the user without coupling this
+            function to a specific output format.
+
+    Returns:
+        A summary dict::
+
+            {
+              "status":     "stopped" | "source_gone" | "max_iterations",
+              "iterations": <int>,         # loop ticks past the catch-up
+              "extractions": <int>,        # observe_session "extracted" runs
+              "below_threshold_runs": <int>,
+              "failures":   <int>,         # observe_session "failed" runs
+              "last_result": <dict | None> # last observe_session() return
+            }
+
+        Never raises on expected failures — the loop swallows
+        ``observe_session`` failures (so transient Haiku errors don't
+        kill the watcher) and reports them via ``on_result`` and the
+        ``failures`` counter. The only fatal condition is the source
+        JSONL disappearing, which exits with ``status="source_gone"``.
+    """
+    resolved = _resolve_source_path(conn, session_id, source_path)
+    if resolved is None or not resolved.exists():
+        return {
+            "status": "source_gone",
+            "iterations": 0,
+            "extractions": 0,
+            "below_threshold_runs": 0,
+            "failures": 0,
+            "last_result": None,
+        }
+
+    extractions = 0
+    below_threshold_runs = 0
+    failures = 0
+    last_result: dict[str, Any] | None = None
+
+    def _run_once() -> dict[str, Any]:
+        """Invoke observe_session and tally the outcome."""
+        nonlocal extractions, below_threshold_runs, failures, last_result
+        result = observe_session(
+            conn,
+            session_id,
+            source_path=resolved,
+            batch_threshold=batch_threshold,
+            claude_bin=claude_bin,
+            timeout=timeout,
+            prompt_path=prompt_path,
+        )
+        last_result = result
+        status = result.get("status")
+        if status == "extracted":
+            extractions += 1
+        elif status == "below_threshold":
+            below_threshold_runs += 1
+        elif status == "failed":
+            failures += 1
+        if on_result is not None:
+            on_result(result)
+        return result
+
+    # --- Catch-up: always run once so the cursor is current before we
+    # start watching. observe_session() handles the "no new bytes" case
+    # itself (status="up_to_date"), so this is safe even if the file is
+    # already fully observed.
+    _run_once()
+
+    iterations = 0
+    while True:
+        if should_stop is not None and should_stop():
+            return {
+                "status": "stopped",
+                "iterations": iterations,
+                "extractions": extractions,
+                "below_threshold_runs": below_threshold_runs,
+                "failures": failures,
+                "last_result": last_result,
+            }
+        if max_iterations is not None and iterations >= max_iterations:
+            return {
+                "status": "max_iterations",
+                "iterations": iterations,
+                "extractions": extractions,
+                "below_threshold_runs": below_threshold_runs,
+                "failures": failures,
+                "last_result": last_result,
+            }
+
+        # Source JSONL gone (deleted, moved): exit cleanly. Truncation
+        # (file shrank but still exists) is observe_session's problem —
+        # it rewinds the cursor to 0 and re-reads, so the watcher just
+        # keeps going on the next growth event.
+        try:
+            size = resolved.stat().st_size
+        except FileNotFoundError:
+            return {
+                "status": "source_gone",
+                "iterations": iterations,
+                "extractions": extractions,
+                "below_threshold_runs": below_threshold_runs,
+                "failures": failures,
+                "last_result": last_result,
+            }
+
+        offset = _current_offset(conn, session_id)
+        # Any growth past the cursor is a candidate. observe_session
+        # itself decides whether the new bytes contain enough complete
+        # turns to warrant a Haiku call — when they don't, it returns
+        # below_threshold without advancing the offset, and we'll retry
+        # on the next growth event for free (no subprocess cost).
+        if size > offset:
+            _run_once()
+
+        sleep_fn(poll_interval_sec)
+        iterations += 1
