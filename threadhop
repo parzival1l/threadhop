@@ -4161,6 +4161,185 @@ def cmd_observe(args) -> int:
     return 0
 
 
+def _seed_session_row(
+    conn: sqlite3.Connection,
+    session_id: str,
+) -> dict | None:
+    """Ensure SQLite knows this session's source path before a CLI query."""
+    session = db.get_session(conn, session_id)
+    if session is not None and session.get("session_path"):
+        return session
+
+    session_path = find_session_path(session_id)
+    if session_path is None:
+        return None
+
+    db.upsert_session(
+        conn,
+        session_id,
+        str(session_path),
+        project=session_path.parent.name,
+    )
+    return db.get_session(conn, session_id)
+
+
+def _query_target_sessions(
+    conn: sqlite3.Connection,
+    *,
+    project: str | None = None,
+    session_id: str | None = None,
+) -> list[dict]:
+    """Return sessions whose observation files should be refreshed/read."""
+    if session_id:
+        session = _seed_session_row(conn, session_id)
+        return [session] if session is not None else []
+
+    sql = (
+        "SELECT session_id, session_path, project, modified_at, created_at "
+        "FROM sessions WHERE session_path IS NOT NULL"
+    )
+    params: list[str] = []
+    if project:
+        sql += " AND project IS NOT NULL AND lower(project) LIKE ?"
+        params.append(f"%{project.lower()}%")
+    sql += (
+        " ORDER BY COALESCE(modified_at, created_at, 0) DESC, session_id DESC"
+    )
+    return db.query_all(conn, sql, tuple(params))
+
+
+def _run_observer_for_query(
+    conn: sqlite3.Connection,
+    session_rows: list[dict],
+) -> list[tuple[str, dict]]:
+    """Run one on-demand observer pass for every candidate session."""
+    failures: list[tuple[str, dict]] = []
+    for row in session_rows:
+        result = observer.observe_session(
+            conn,
+            row["session_id"],
+            source_path=row.get("session_path"),
+        )
+        if result.get("status") in {"failed", "no_source"}:
+            failures.append((row["session_id"], result))
+    return failures
+
+
+def _read_query_entries(
+    conn: sqlite3.Connection,
+    *,
+    entry_type: str | None = None,
+    project: str | None = None,
+    session_id: str | None = None,
+) -> list[dict]:
+    """Read compact JSONL observations from per-session files."""
+    session_rows = db.query_all(
+        conn,
+        "SELECT session_id, project FROM sessions",
+    )
+    project_by_session = {
+        row["session_id"]: row.get("project")
+        for row in session_rows
+    }
+    allowed_sessions = None
+    if session_id:
+        allowed_sessions = {session_id}
+    elif project:
+        needle = project.lower()
+        allowed_sessions = {
+            sid for sid, proj in project_by_session.items()
+            if proj and needle in proj.lower()
+        }
+
+    entries: list[dict] = []
+    for obs_path in db.OBS_DIR.glob("*.jsonl"):
+        sid = obs_path.stem
+        if allowed_sessions is not None and sid not in allowed_sessions:
+            continue
+
+        project_name = project_by_session.get(sid)
+        try:
+            with obs_path.open() as fh:
+                for line_number, raw_line in enumerate(fh, start=1):
+                    raw_line = raw_line.strip()
+                    if not raw_line:
+                        continue
+                    try:
+                        entry = json.loads(raw_line)
+                    except json.JSONDecodeError as e:
+                        print(
+                            f"threadhop: skipping malformed JSON in {obs_path}: "
+                            f"line {line_number}: {e}",
+                            file=sys.stderr,
+                        )
+                        continue
+                    if entry_type and entry.get("type") != entry_type:
+                        continue
+                    entries.append({
+                        "session_id": sid,
+                        "project": project_name,
+                        **entry,
+                    })
+        except OSError as e:
+            print(
+                f"threadhop: could not read observations from {obs_path}: {e}",
+                file=sys.stderr,
+            )
+
+    return sorted(
+        entries,
+        key=lambda entry: (
+            entry.get("ts") or "",
+            entry["session_id"],
+            entry.get("text") or "",
+        ),
+        reverse=True,
+    )
+
+
+def cmd_decisions(args) -> int:
+    """List decision observations as compact JSONL, newest first."""
+    conn = db.init_db()
+    try:
+        session_rows = _query_target_sessions(
+            conn,
+            project=args.project,
+            session_id=args.session,
+        )
+        if args.session and not session_rows:
+            print(
+                f"threadhop decisions: no transcript found for session "
+                f"{args.session} under {CLAUDE_PROJECTS}.",
+                file=sys.stderr,
+            )
+            return 1
+
+        failures = _run_observer_for_query(conn, session_rows)
+        entries = _read_query_entries(
+            conn,
+            entry_type="decision",
+            project=args.project,
+            session_id=args.session,
+        )
+    finally:
+        conn.close()
+
+    for entry in entries:
+        print(json.dumps(entry, separators=(",", ":")))
+
+    if failures:
+        for failed_session, result in failures:
+            print(
+                f"threadhop decisions: observer failed for {failed_session}: "
+                f"{result.get('message', 'unknown error')}",
+                file=sys.stderr,
+            )
+            if result.get("stderr"):
+                print(result["stderr"], file=sys.stderr)
+        return 1
+    return 0
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -4188,6 +4367,8 @@ def main():
             conn.close()
         print(f"Tagged session {args.session} as {args.status}")
         return 0
+    if args.command == "decisions":
+        return cmd_decisions(args)
     if args.command == "observe":
         return cmd_observe(args)
     return _cli_stub(args.command)
