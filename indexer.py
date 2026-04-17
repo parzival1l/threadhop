@@ -355,6 +355,132 @@ def index_all(
 # --- Incremental indexing (task #9) ----------------------------------------
 
 
+def parse_byte_range(
+    raw_bytes: bytes,
+    *,
+    fallback_session_id: str | None = None,
+) -> list[dict]:
+    """Parse a JSONL byte range into cleaned message groups.
+
+    Applies ADR-003 chunk-merging (consecutive assistant lines sharing
+    ``message.id`` collapse into one row), strips ``<system-reminder>``
+    blocks, skips tool-result user lines, and abbreviates ``tool_use``
+    blocks. Empty rows (a line that reduced to nothing after cleaning)
+    are dropped.
+
+    Callers are expected to trim any trailing partial line before
+    calling — see ``index_session_incremental`` for how to do that with
+    a byte offset. Malformed JSON lines are silently skipped.
+
+    Returns one dict per logical message with the same shape
+    ``index_session_incremental`` writes to ``messages``::
+
+        {"uuid", "session_id", "role", "text", "timestamp",
+         "cwd", "parent_uuid", "is_sidechain", "message_id"}
+
+    ``fallback_session_id`` is substituted when a line omits its own
+    ``sessionId`` (rare, but happens on older transcripts).
+
+    Extracted as a public helper so the observer (ADR-018) can reuse
+    the exact rendering the FTS index uses — "observer sees what the
+    user sees."
+    """
+    raw_lines = raw_bytes.decode("utf-8", errors="replace").split("\n")
+    # split() on "line1\nline2\n" → ["line1", "line2", ""] — drop trailing empty.
+    if raw_lines and raw_lines[-1] == "":
+        raw_lines.pop()
+
+    groups: list[dict] = []
+    current_chunk: dict | None = None
+    current_chunk_parts: list[str] = []
+
+    def _flush_chunk() -> None:
+        nonlocal current_chunk, current_chunk_parts
+        if current_chunk is not None:
+            current_chunk["text"] = "\n\n".join(
+                p for p in current_chunk_parts if p
+            ).strip()
+            if current_chunk["text"]:
+                groups.append(current_chunk)
+            current_chunk = None
+            current_chunk_parts = []
+
+    for raw_line in raw_lines:
+        if not raw_line.strip():
+            continue
+        try:
+            msg = json.loads(raw_line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+        mtype = msg.get("type")
+        if mtype not in ("user", "assistant"):
+            continue
+
+        if mtype == "user":
+            _flush_chunk()
+
+            text = _extract_user_text(msg)
+            if not text:
+                continue
+
+            uid = msg.get("uuid")
+            sid = msg.get("sessionId") or fallback_session_id
+            if not uid:
+                continue
+
+            groups.append({
+                "uuid": uid,
+                "session_id": sid,
+                "role": "user",
+                "text": text,
+                "timestamp": msg.get("timestamp"),
+                "cwd": msg.get("cwd"),
+                "parent_uuid": msg.get("parentUuid"),
+                "is_sidechain": 1 if msg.get("isSidechain") else 0,
+                "message_id": msg.get("message", {}).get("id"),
+            })
+            continue
+
+        # --- assistant line ---
+        mid = msg.get("message", {}).get("id")
+        parts = _extract_assistant_blocks(msg)
+
+        # Continuing the same logical message → accumulate.
+        if (
+            mid is not None
+            and current_chunk is not None
+            and current_chunk.get("message_id") == mid
+        ):
+            current_chunk_parts.extend(parts)
+            continue
+
+        # Different message.id → flush previous and start fresh.
+        _flush_chunk()
+
+        uid = msg.get("uuid")
+        sid = msg.get("sessionId") or fallback_session_id
+        if not uid:
+            continue
+
+        current_chunk = {
+            "uuid": uid,
+            "session_id": sid,
+            "role": "assistant",
+            "text": "",  # populated by _flush_chunk
+            "timestamp": msg.get("timestamp"),
+            "cwd": msg.get("cwd"),
+            "parent_uuid": msg.get("parentUuid"),
+            "is_sidechain": 1 if msg.get("isSidechain") else 0,
+            "message_id": mid,
+        }
+        current_chunk_parts = list(parts)
+
+    # Flush the last chunk.
+    _flush_chunk()
+    return groups
+
+
 def index_session_incremental(
     conn: sqlite3.Connection,
     session_id: str,
@@ -363,9 +489,9 @@ def index_session_incremental(
     """Incrementally index new JSONL content for a session.
 
     Called from the TUI's 5-second refresh cycle.  Reads only bytes
-    appended since the last index, parses new lines, applies the same
-    chunk-merging logic as ``parse_messages``, and upserts into the
-    ``messages`` + ``messages_fts`` tables.
+    appended since the last index, parses new lines via
+    ``parse_byte_range``, and upserts into the ``messages`` +
+    ``messages_fts`` tables.
 
     Edge cases:
 
@@ -418,111 +544,9 @@ def index_session_incremental(
     processable = new_bytes[: last_newline + 1]
     new_offset = last_offset + last_newline + 1
 
-    # --- Parse raw lines ---
-    raw_lines = processable.decode("utf-8", errors="replace").split("\n")
-    # split() on "line1\nline2\n" → ["line1", "line2", ""] — drop trailing empty
-    if raw_lines and raw_lines[-1] == "":
-        raw_lines.pop()
-
-    if not raw_lines:
-        db.upsert_index_state(
-            conn, session_id, str(file_path), new_offset,
-            _dt.now().timestamp(),
-        )
-        return
-
-    # --- Group messages with chunk merging (ADR-003) ---
-    # Reuses the same extraction helpers as parse_messages but reads from
-    # a byte range instead of the full file.
-
-    parsed_groups: list[dict] = []
-    current_chunk: dict | None = None
-    current_chunk_parts: list[str] = []
-
-    def _flush_chunk() -> None:
-        nonlocal current_chunk, current_chunk_parts
-        if current_chunk is not None:
-            current_chunk["text"] = "\n\n".join(
-                p for p in current_chunk_parts if p
-            ).strip()
-            if current_chunk["text"]:
-                parsed_groups.append(current_chunk)
-            current_chunk = None
-            current_chunk_parts = []
-
-    for raw_line in raw_lines:
-        if not raw_line.strip():
-            continue
-        try:
-            msg = json.loads(raw_line)
-        except (json.JSONDecodeError, ValueError):
-            continue
-
-        mtype = msg.get("type")
-        if mtype not in ("user", "assistant"):
-            continue
-
-        if mtype == "user":
-            _flush_chunk()
-
-            text = _extract_user_text(msg)
-            if not text:
-                continue
-
-            uid = msg.get("uuid")
-            sid = msg.get("sessionId") or session_id
-            if not uid:
-                continue
-
-            parsed_groups.append({
-                "uuid": uid,
-                "session_id": sid,
-                "role": "user",
-                "text": text,
-                "timestamp": msg.get("timestamp"),
-                "cwd": msg.get("cwd"),
-                "parent_uuid": msg.get("parentUuid"),
-                "is_sidechain": 1 if msg.get("isSidechain") else 0,
-                "message_id": msg.get("message", {}).get("id"),
-            })
-            continue
-
-        # --- assistant line ---
-        mid = msg.get("message", {}).get("id")
-        parts = _extract_assistant_blocks(msg)
-
-        # Continuing the same logical message → accumulate.
-        if (
-            mid is not None
-            and current_chunk is not None
-            and current_chunk.get("message_id") == mid
-        ):
-            current_chunk_parts.extend(parts)
-            continue
-
-        # Different message.id → flush previous and start fresh.
-        _flush_chunk()
-
-        uid = msg.get("uuid")
-        sid = msg.get("sessionId") or session_id
-        if not uid:
-            continue
-
-        current_chunk = {
-            "uuid": uid,
-            "session_id": sid,
-            "role": "assistant",
-            "text": "",  # populated by _flush_chunk
-            "timestamp": msg.get("timestamp"),
-            "cwd": msg.get("cwd"),
-            "parent_uuid": msg.get("parentUuid"),
-            "is_sidechain": 1 if msg.get("isSidechain") else 0,
-            "message_id": mid,
-        }
-        current_chunk_parts = list(parts)
-
-    # Flush the last chunk.
-    _flush_chunk()
+    parsed_groups = parse_byte_range(
+        processable, fallback_session_id=session_id,
+    )
 
     if not parsed_groups:
         db.upsert_index_state(
