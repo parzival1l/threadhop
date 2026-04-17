@@ -22,6 +22,7 @@ original context carrying ~80% of signal. Generated on-demand, not in advance.
 ## 2. Mastra Observational Memory Pattern
 
 Reference: `observational-memory.mdx` (Mastra `@mastra/memory` docs)
+Credit: [Mastra team](https://mastra.ai) — `@mastra/memory@1.1.0`
 
 A three-tier memory system that applies beyond Mastra's framework:
 
@@ -43,6 +44,20 @@ Reflections (condensed patterns, merged items)
 **Applicable insight:** This tiered compression model works for any system where
 context accumulates over time. The Observer/Reflector split means you can start
 with just observation (cheap) and add reflection later (when volume demands it).
+
+**The inherent problem when applying to Claude Code:** Mastra's Observer/Reflector
+are *inline agents* — they share the same process and memory as the primary agent
+and can directly modify its context window (removing old messages, injecting
+compressed observations). Claude Code is a black box: we can read its JSONL
+transcript files but cannot modify the running agent's context. This makes the
+inline approach impossible.
+
+ThreadHop adapts the pattern as an *external sidecar* — the observer watches
+transcript files post-hoc, and the reflector focuses on *conflict detection*
+(finding contradictory decisions across sessions) rather than Mastra's original
+goal of context compression. The value shifts from helping the *agent* stay
+effective to helping the *human* understand what happened. See ADR-015 in
+`DESIGN-DECISIONS.md` for the full architecture.
 
 ## 3. Feature-Scoped Shared Memory
 
