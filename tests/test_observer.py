@@ -514,3 +514,287 @@ class TestObserveSession:
         assert result["status"] == "extracted"
         # All 3 turns should be read (cursor rewound to 0).
         assert result["turns"] == 3
+
+
+# --- Watch-mode tests ------------------------------------------------------
+
+
+class _StopAfter:
+    """should_stop helper: returns False until called ``after`` times.
+
+    Using a class instead of a closure makes the call count inspectable
+    from the tests so we can assert how many polls actually happened.
+    """
+
+    def __init__(self, after: int) -> None:
+        self.after = after
+        self.calls = 0
+
+    def __call__(self) -> bool:
+        self.calls += 1
+        return self.calls > self.after
+
+
+class TestWatchSession:
+    """The watch loop is the layer on top of observe_session that polls
+    for source-file growth and re-invokes the observer. These tests
+    exercise the loop's branches with a no-op sleep and either a stop
+    callback or ``max_iterations`` to terminate deterministically.
+    """
+
+    def test_runs_initial_catch_up_then_stops(
+        self, tmp_path, conn, obs_dir, fake_claude
+    ):
+        # 3 turns waiting at start — meets threshold for the catch-up run.
+        jsonl = _write_session(tmp_path, "sess-1", [
+            _user_line("u1", "hi"),
+            _assistant_line("a1", "m1", "yo"),
+            _user_line("u2", "more"),
+        ])
+        _seed_session_row(conn, "sess-1", jsonl)
+        claude = fake_claude([
+            {"type": "decision", "text": "x", "context": "",
+             "ts": "2026-04-17T10:00:00Z"},
+        ])
+
+        results: list[dict] = []
+        result = observer.watch_session(
+            conn, "sess-1",
+            claude_bin=str(claude),
+            should_stop=_StopAfter(0),  # exit before the first poll iteration
+            sleep_fn=lambda _: None,
+            on_result=results.append,
+        )
+
+        assert result["status"] == "stopped"
+        assert result["extractions"] == 1
+        assert result["iterations"] == 0
+        # The catch-up call propagated through on_result.
+        assert len(results) == 1
+        assert results[0]["status"] == "extracted"
+
+    def test_no_growth_means_observer_not_re_invoked(
+        self, tmp_path, conn, obs_dir, fake_claude
+    ):
+        # Same shape as above. After the catch-up advances the cursor
+        # to EOF, no further growth occurs, so the loop should not call
+        # observe_session again no matter how many times it polls.
+        jsonl = _write_session(tmp_path, "sess-1", [
+            _user_line("u1", "a"),
+            _assistant_line("a1", "m1", "b"),
+            _user_line("u2", "c"),
+        ])
+        _seed_session_row(conn, "sess-1", jsonl)
+        claude = fake_claude([
+            {"type": "decision", "text": "x", "context": "",
+             "ts": "2026-04-17T10:00:00Z"},
+        ])
+
+        result = observer.watch_session(
+            conn, "sess-1",
+            claude_bin=str(claude),
+            max_iterations=5,
+            sleep_fn=lambda _: None,
+        )
+
+        assert result["status"] == "max_iterations"
+        # Only the catch-up extraction happened — no further calls.
+        assert result["extractions"] == 1
+        assert result["iterations"] == 5
+        # Observation file unchanged after catch-up.
+        obs_path = obs_dir / "sess-1.jsonl"
+        assert len(obs_path.read_text().strip().splitlines()) == 1
+
+    def test_growth_after_catch_up_triggers_extraction(
+        self, tmp_path, conn, obs_dir, fake_claude
+    ):
+        # Catch-up consumes 3 turns; then before each poll we append
+        # more turns and confirm the loop re-extracts.
+        jsonl = _write_session(tmp_path, "sess-1", [
+            _user_line("u1", "a"),
+            _assistant_line("a1", "m1", "b"),
+            _user_line("u2", "c"),
+        ])
+        _seed_session_row(conn, "sess-1", jsonl)
+
+        # Single fake claude — appends one canned line per invocation.
+        # Each call to observe_session triggers exactly one append.
+        claude = fake_claude([
+            {"type": "decision", "text": "x", "context": "",
+             "ts": "2026-04-17T10:00:00Z"},
+        ])
+
+        # The "growth driver" runs as our sleep_fn: every time the loop
+        # sleeps, we append 3 more turns to the source. That guarantees
+        # growth is visible on the very next size check.
+        appends_left = [2]
+
+        def grow_then_sleep(_):
+            if appends_left[0] <= 0:
+                return
+            appends_left[0] -= 1
+            with open(jsonl, "a") as f:
+                f.write(_user_line(f"u-extra-{appends_left[0]}", "q") + "\n")
+                f.write(_assistant_line(
+                    f"a-extra-{appends_left[0]}",
+                    f"m-extra-{appends_left[0]}", "a") + "\n")
+                f.write(_user_line(f"u-extra2-{appends_left[0]}", "q2") + "\n")
+
+        result = observer.watch_session(
+            conn, "sess-1",
+            claude_bin=str(claude),
+            max_iterations=3,
+            sleep_fn=grow_then_sleep,
+        )
+
+        assert result["status"] == "max_iterations"
+        # 1 catch-up + 2 growth-triggered runs = 3 total extractions.
+        assert result["extractions"] == 3
+
+    def test_below_threshold_growth_does_not_advance_cursor(
+        self, tmp_path, conn, obs_dir, fake_claude
+    ):
+        """A 1-turn append after catch-up triggers an observe call but
+        observe_session returns 'below_threshold' without advancing the
+        cursor — and counts as below_threshold_runs in the summary.
+        """
+        jsonl = _write_session(tmp_path, "sess-1", [
+            _user_line("u1", "a"),
+            _assistant_line("a1", "m1", "b"),
+            _user_line("u2", "c"),
+        ])
+        _seed_session_row(conn, "sess-1", jsonl)
+        claude = fake_claude([
+            {"type": "decision", "text": "x", "context": "",
+             "ts": "2026-04-17T10:00:00Z"},
+        ])
+
+        # First sleep: append exactly one new turn (below the 3-turn
+        # threshold). All later sleeps are no-ops.
+        appended = [False]
+
+        def sleep_fn(_):
+            if appended[0]:
+                return
+            appended[0] = True
+            with open(jsonl, "a") as f:
+                f.write(_user_line("u-extra", "tiny") + "\n")
+
+        cursor_before_loop = jsonl.stat().st_size
+
+        result = observer.watch_session(
+            conn, "sess-1",
+            claude_bin=str(claude),
+            max_iterations=2,
+            sleep_fn=sleep_fn,
+        )
+
+        assert result["extractions"] == 1  # just the catch-up
+        assert result["below_threshold_runs"] == 1
+        # The state cursor stayed at the catch-up EOF — observe_session
+        # is not allowed to advance past bytes it didn't ship to Haiku.
+        state = db.get_observation_state(conn, "sess-1")
+        assert state is not None
+        assert state["source_byte_offset"] == cursor_before_loop
+
+    def test_source_disappears_returns_source_gone(
+        self, tmp_path, conn, obs_dir, fake_claude
+    ):
+        jsonl = _write_session(tmp_path, "sess-1", [
+            _user_line("u1", "a"),
+            _assistant_line("a1", "m1", "b"),
+            _user_line("u2", "c"),
+        ])
+        _seed_session_row(conn, "sess-1", jsonl)
+        claude = fake_claude([
+            {"type": "decision", "text": "x", "context": "",
+             "ts": "2026-04-17T10:00:00Z"},
+        ])
+
+        deleted = [False]
+
+        def delete_then_sleep(_):
+            if deleted[0]:
+                return
+            deleted[0] = True
+            jsonl.unlink()
+
+        result = observer.watch_session(
+            conn, "sess-1",
+            claude_bin=str(claude),
+            max_iterations=10,
+            sleep_fn=delete_then_sleep,
+        )
+
+        assert result["status"] == "source_gone"
+        # The catch-up still ran before the file went away.
+        assert result["extractions"] == 1
+
+    def test_missing_source_skips_catch_up(
+        self, tmp_path, conn, obs_dir, fake_claude
+    ):
+        # No sessions row, no state row — the watcher must not try to
+        # call observe_session at all (it would fail with no_source).
+        result = observer.watch_session(
+            conn, "ghost-sess",
+            claude_bin=str(fake_claude([])),
+            max_iterations=3,
+            sleep_fn=lambda _: None,
+        )
+        assert result["status"] == "source_gone"
+        assert result["extractions"] == 0
+        assert result["iterations"] == 0
+
+    def test_subprocess_failure_does_not_kill_the_loop(
+        self, tmp_path, conn, obs_dir, fake_claude
+    ):
+        # Catch-up will fail (claude exits non-zero). The loop must
+        # keep going — failures are tallied, not raised.
+        jsonl = _write_session(tmp_path, "sess-1", [
+            _user_line("u1", "a"),
+            _assistant_line("a1", "m1", "b"),
+            _user_line("u2", "c"),
+        ])
+        _seed_session_row(conn, "sess-1", jsonl)
+        claude = fake_claude("#!/usr/bin/env bash\nexit 7\n")
+
+        result = observer.watch_session(
+            conn, "sess-1",
+            claude_bin=str(claude),
+            max_iterations=2,
+            sleep_fn=lambda _: None,
+        )
+
+        assert result["status"] == "max_iterations"
+        assert result["failures"] >= 1
+        assert result["extractions"] == 0
+
+    def test_should_stop_polled_each_iteration(
+        self, tmp_path, conn, obs_dir, fake_claude
+    ):
+        # No real source — we just want to prove should_stop is consulted
+        # before max_iterations and exits cleanly.
+        jsonl = _write_session(tmp_path, "sess-1", [
+            _user_line("u1", "a"),
+            _assistant_line("a1", "m1", "b"),
+            _user_line("u2", "c"),
+        ])
+        _seed_session_row(conn, "sess-1", jsonl)
+        claude = fake_claude([
+            {"type": "decision", "text": "x", "context": "",
+             "ts": "2026-04-17T10:00:00Z"},
+        ])
+        stop = _StopAfter(3)
+
+        result = observer.watch_session(
+            conn, "sess-1",
+            claude_bin=str(claude),
+            should_stop=stop,
+            max_iterations=100,
+            sleep_fn=lambda _: None,
+        )
+
+        assert result["status"] == "stopped"
+        # Polled at the top of every iteration; exits on the 4th call.
+        assert stop.calls == 4
+        assert result["iterations"] == 3
