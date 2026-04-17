@@ -134,40 +134,71 @@ def _seed_session_row(conn, session_id: str, session_path: Path):
 # --- Pure-function tests ---------------------------------------------------
 
 
-class TestCountMessageTurns:
-    def test_users_and_assistants_each_count(self):
+class TestTranscriptRendering:
+    """The observer now feeds Haiku the cleaned transcript produced by
+    indexer.parse_byte_range (tool outputs stripped, tool_use abbreviated,
+    streaming chunks merged). These tests cover the assembly step — both
+    turn counting (which is just ``len(message_turns)`` now) and the
+    transcript-format helper the prompt splices in.
+    """
+
+    def test_users_and_assistants_each_count_as_turns(self):
+        import indexer
         raw = (
             _user_line("u1", "hi") + "\n" +
             _assistant_line("a1", "m1", "hello") + "\n" +
             _user_line("u2", "more") + "\n"
         ).encode()
-        assert observer._count_message_turns(raw) == 3
+        assert len(indexer.parse_byte_range(raw)) == 3
 
     def test_assistant_streaming_chunks_collapse_to_one_turn(self):
-        # Three assistant lines, same message.id → one turn.
+        import indexer
         raw = (
             _user_line("u1", "q") + "\n" +
             _assistant_line("a1", "m1", "part 1") + "\n" +
             _assistant_line("a2", "m1", "part 2") + "\n" +
             _assistant_line("a3", "m1", "part 3") + "\n"
         ).encode()
-        assert observer._count_message_turns(raw) == 2
+        turns = indexer.parse_byte_range(raw)
+        assert len(turns) == 2
+        # The assistant turn is the *merged* text, not three separate ones.
+        assistant_turn = next(t for t in turns if t["role"] == "assistant")
+        assert "part 1" in assistant_turn["text"]
+        assert "part 2" in assistant_turn["text"]
+        assert "part 3" in assistant_turn["text"]
 
     def test_tool_result_user_lines_are_not_turns(self):
+        import indexer
         raw = (
             _user_line("u1", "do a thing") + "\n" +
             _tool_result_user_line("tr1") + "\n" +
             _assistant_line("a1", "m1", "done") + "\n"
         ).encode()
-        assert observer._count_message_turns(raw) == 2
+        turns = indexer.parse_byte_range(raw)
+        assert len(turns) == 2
+        assert [t["role"] for t in turns] == ["user", "assistant"]
 
-    def test_malformed_lines_skipped(self):
-        raw = (
-            _user_line("u1", "hi") + "\n" +
-            "not json at all\n" +
-            _assistant_line("a1", "m1", "hey") + "\n"
-        ).encode()
-        assert observer._count_message_turns(raw) == 2
+    def test_format_transcript_uses_role_and_timestamp_headers(self):
+        turns = [
+            {"role": "user", "timestamp": "2026-04-17T10:00:00Z",
+             "text": "Should we use SQLite?"},
+            {"role": "assistant", "timestamp": "2026-04-17T10:00:01Z",
+             "text": "Yes — single-file deployment wins."},
+        ]
+        out = observer._format_transcript(turns)
+        assert "### user · 2026-04-17T10:00:00Z" in out
+        assert "### assistant · 2026-04-17T10:00:01Z" in out
+        assert "Should we use SQLite?" in out
+        assert "single-file deployment wins" in out
+
+    def test_format_transcript_skips_empty_text(self):
+        turns = [
+            {"role": "user", "timestamp": "t1", "text": "hello"},
+            {"role": "assistant", "timestamp": "t2", "text": ""},
+        ]
+        out = observer._format_transcript(turns)
+        assert "### user" in out
+        assert "### assistant" not in out
 
 
 class TestReadNewBytes:
@@ -393,6 +424,65 @@ class TestObserveSession:
         )
         assert result["status"] == "failed"
         assert "not found" in result["error"]
+
+    def test_prompt_contains_cleaned_transcript_not_raw_jsonl(
+        self, tmp_path, conn, obs_dir
+    ):
+        """The observer must send Haiku the cleaned transcript — not raw
+        JSONL with message.content blocks, tool results, or system-reminders.
+        We capture the prompt arg via a fake claude that dumps it to a file.
+        """
+        jsonl = _write_session(tmp_path, "sess-1", [
+            _user_line("u1", "Should we cache this?"),
+            _assistant_line("a1", "m1", "Yes <system-reminder>internal</system-reminder> definitely"),
+            _user_line("u2", "Great"),
+            # A tool_result user line that must NOT appear in the prompt.
+            _tool_result_user_line("tr1"),
+        ])
+        _seed_session_row(conn, "sess-1", jsonl)
+
+        # Fake claude that writes its prompt arg to a known file.
+        captured = tmp_path / "captured_prompt.txt"
+        script = tmp_path / "fake_claude"
+        script.write_text(
+            "#!/usr/bin/env bash\n"
+            f"printf '%s' \"$2\" > {captured}\n"
+        )
+        script.chmod(
+            script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH
+        )
+
+        result = observer.observe_session(
+            conn, "sess-1", claude_bin=str(script),
+        )
+        assert result["status"] == "extracted"
+
+        prompt_body = captured.read_text()
+
+        # Isolate the transcript section — the prompt template itself
+        # references `<session_chunk>` and `<system-reminder>` in its
+        # instructions, so we can only assert stripping happened inside
+        # the actual delimited chunk. The delimiter sits on its own line,
+        # which lets us skip the backticked mentions in the guidance.
+        start = (
+            prompt_body.index("<session_chunk>\n")
+            + len("<session_chunk>\n")
+        )
+        end = prompt_body.index("\n</session_chunk>")
+        chunk = prompt_body[start:end]
+
+        # Role-labelled transcript headers present.
+        assert "### user" in chunk
+        assert "### assistant" in chunk
+
+        # Raw JSONL artifacts MUST NOT appear in the transcript.
+        assert "\"sessionId\"" not in chunk
+        assert "\"toolUseResult\"" not in chunk
+        assert "<system-reminder>" not in chunk
+
+        # Cleaned text still makes it through.
+        assert "Should we cache this?" in chunk
+        assert "definitely" in chunk
 
     def test_truncation_rewinds_cursor(
         self, tmp_path, conn, obs_dir, fake_claude

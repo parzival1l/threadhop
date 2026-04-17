@@ -8,12 +8,16 @@ indicator, and CLI query commands). It is an **orchestrator**, not just a
   1. Read the per-session ``observation_state`` row to find where the last
      run left off (``source_byte_offset``).
   2. Open the source JSONL, seek to that offset, read to EOF.
-  3. Count *message turns* in the new bytes (user lines + assistant
-     ``message.id`` groups — streaming chunks are one turn, not many).
+  3. Parse the new bytes via ``indexer.parse_byte_range`` — same pipeline
+     that feeds the FTS index and the TUI. Tool outputs are already
+     filtered out, ``<system-reminder>`` blocks stripped, ``tool_use``
+     blocks rendered as one-line abbreviations, streaming chunks merged.
+     The observer sees exactly what the user sees.
   4. If fewer than ``BATCH_THRESHOLD`` new turns accumulated, return early —
      Haiku with two turns of context tends to hallucinate or extract trivia.
-  5. Assemble the prompt: ``prompts/observer.md`` + the chunk + the output
-     file path (``~/.config/threadhop/observations/<session_id>.jsonl``).
+  5. Format the cleaned turns as a readable role-labelled transcript and
+     splice it into ``prompts/observer.md`` along with the output file
+     path (``~/.config/threadhop/observations/<session_id>.jsonl``).
   6. Invoke ``claude -p --model haiku --permission-mode acceptEdits`` — the
      Haiku process appends JSONL observations to the output file itself
      (``acceptEdits`` is the minimum permission required for file append).
@@ -41,6 +45,7 @@ from pathlib import Path
 from typing import Any
 
 import db
+import indexer
 
 
 # --- Configuration --------------------------------------------------------
@@ -67,44 +72,32 @@ _TYPE_ORDER = ("decision", "todo", "done", "adr", "observation", "conflict")
 # --- Helpers --------------------------------------------------------------
 
 
-def _count_message_turns(raw: bytes) -> int:
-    """Count distinct user/assistant turns in a JSONL byte range.
+def _format_transcript(turns: list[dict]) -> str:
+    """Render cleaned message turns as a role-labelled transcript.
 
-    Mirrors ADR-003 chunk-merging: consecutive assistant lines sharing the
-    same ``message.id`` are one logical turn. User lines carrying a
-    ``toolUseResult`` are tool output (not user speech) and don't count.
-    Malformed JSON lines are skipped silently — the observer shouldn't
-    refuse to run just because one line is corrupt.
+    Each turn becomes a markdown-ish block::
+
+        ### user · 2026-04-17T10:00:00Z
+        <cleaned text>
+
+        ### assistant · 2026-04-17T10:00:01Z
+        <cleaned text with [Editing foo.py] style tool-use abbreviations>
+
+    Chosen over JSONL-per-turn because field names repeated per line would
+    waste tokens on no new information, and Haiku reasons more reliably
+    about a transcript-shaped input. Timestamps are kept so the prompt's
+    ``ts`` field requirement (ADR-018) has an authoritative source.
     """
-    turns = 0
-    last_assistant_mid: str | None = None
-
-    for line in raw.decode("utf-8", errors="replace").splitlines():
-        if not line.strip():
+    blocks: list[str] = []
+    for turn in turns:
+        role = turn.get("role", "user")
+        ts = turn.get("timestamp") or ""
+        header = f"### {role} · {ts}" if ts else f"### {role}"
+        text = (turn.get("text") or "").strip()
+        if not text:
             continue
-        try:
-            msg = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
-            continue
-
-        mtype = msg.get("type")
-        if mtype == "user":
-            # Tool results arrive as ``type: "user"`` with ``toolUseResult``
-            # — they're machine output, not a user turn.
-            if msg.get("toolUseResult") is not None:
-                continue
-            turns += 1
-            last_assistant_mid = None
-        elif mtype == "assistant":
-            mid = msg.get("message", {}).get("id")
-            # Group streaming chunks: only the *first* chunk of a new
-            # message.id counts as a turn.
-            if mid is None or mid != last_assistant_mid:
-                turns += 1
-                last_assistant_mid = mid
-        # Other line types (summary, ai-title, system) don't contribute.
-
-    return turns
+        blocks.append(f"{header}\n{text}")
+    return "\n\n".join(blocks)
 
 
 def _read_new_bytes(
@@ -193,22 +186,20 @@ def _summary_message(turns: int, by_type: dict[str, int]) -> str:
     return f"Processed {turns} {turns_label}. {tail}."
 
 
-def _build_prompt(template: str, chunk: bytes, obs_path: Path) -> str:
-    """Splice the conversation chunk and output path into the prompt.
+def _build_prompt(template: str, transcript: str, obs_path: Path) -> str:
+    """Splice the cleaned transcript and output path into the prompt.
 
     Kept as plain string concat rather than a template engine — the
     observer prompt is a markdown file curated as part of the app, and
-    the only substitutions are the chunk body and the file path.
+    the only substitutions are the transcript body and the file path.
     """
-    chunk_text = chunk.decode("utf-8", errors="replace")
     return (
         f"{template.rstrip()}\n\n"
         "---\n\n"
         "## Conversation chunk\n\n"
         "<session_chunk>\n"
-        f"{chunk_text}"
-        + ("" if chunk_text.endswith("\n") else "\n")
-        + "</session_chunk>\n\n"
+        f"{transcript.strip()}\n"
+        "</session_chunk>\n\n"
         "## Output file\n\n"
         f"Append observations to: {obs_path}\n"
     )
@@ -335,7 +326,16 @@ def observe_session(
         offset = 0
 
     new_bytes, new_offset = _read_new_bytes(source_path, offset)
-    turns = _count_message_turns(new_bytes)
+
+    # Parse the new bytes through the same pipeline the FTS index uses
+    # (indexer.parse_byte_range): tool outputs dropped, system-reminders
+    # stripped, tool_use abbreviated, streaming chunks merged. This keeps
+    # Haiku's input token count small and ensures the observer reasons
+    # about the same view of the conversation the user reads in the TUI.
+    message_turns = indexer.parse_byte_range(
+        new_bytes, fallback_session_id=session_id,
+    )
+    turns = len(message_turns)
 
     # Ensure the observations directory exists before we risk any writes.
     db.OBS_DIR.mkdir(parents=True, exist_ok=True)
@@ -377,7 +377,8 @@ def observe_session(
             "error": f"read prompt {prompt_path}: {e}",
             "message": f"Could not read observer prompt: {e}",
         }
-    prompt = _build_prompt(prompt_template, new_bytes, obs_path)
+    transcript = _format_transcript(message_turns)
+    prompt = _build_prompt(prompt_template, transcript, obs_path)
 
     # --- Step 5: invoke claude -p -----------------------------------------
     # ``shutil.which`` gives a precise error before we pay for the fork.
