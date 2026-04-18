@@ -83,6 +83,12 @@ def _seed_db(home: Path, sessions: list[tuple[str, Path, str]]) -> None:
                 str(session_path),
                 project=project,
             )
+            db.upsert_observation_state(
+                conn,
+                session_id,
+                str(session_path),
+                str(home / ".config" / "threadhop" / "observations" / f"{session_id}.jsonl"),
+            )
     finally:
         conn.close()
 
@@ -154,9 +160,12 @@ class TestDecisionsCli:
         assert len(lines) == 2
 
         parsed = [json.loads(line) for line in lines]
-        assert [entry["session_id"] for entry in parsed] == [sid_new, sid_old]
+        assert [entry["session"] for entry in parsed] == [sid_new, sid_old]
         assert [entry["project"] for entry in parsed] == [project_new, project_old]
-        assert [entry["type"] for entry in parsed] == ["decision", "decision"]
+        assert [entry["timestamp"] for entry in parsed] == [
+            "2026-04-17T11:00:00Z",
+            "2026-04-17T10:00:00Z",
+        ]
         assert parsed[0]["text"] == "Use per-session JSONL"
         assert parsed[1]["text"] == "Keep SQLite"
 
@@ -204,8 +213,9 @@ class TestDecisionsCli:
         assert len(lines) == 1
 
         entry = json.loads(lines[0])
-        assert entry["session_id"] == sid_alpha
+        assert entry["session"] == sid_alpha
         assert entry["project"] == project_alpha
+        assert entry["timestamp"] == "2026-04-17T12:00:00Z"
         assert entry["text"] == "Alpha only"
 
         obs_dir = home / ".config" / "threadhop" / "observations"
