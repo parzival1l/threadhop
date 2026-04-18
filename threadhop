@@ -2,6 +2,7 @@
 # /// script
 # dependencies = [
 #   "textual>=0.89.0",
+#   "watchdog>=4.0.0",
 # ]
 # ///
 """ThreadHop — cross-session context manager for Claude Code"""
@@ -10,6 +11,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -2469,60 +2471,7 @@ class ClaudeSessions(App):
         For `claude -r` (no ID) or `claude -c`, we match by CWD to find the
         most recent session in that project.
         """
-        active_ids = set()
-        cwd_pids = {}  # pid -> cwd for processes without explicit session IDs
-
-        try:
-            # Get all claude CLI processes (not Claude.app, not Windsurf extension)
-            result = subprocess.run(
-                ["ps", "-eo", "pid,args"],
-                capture_output=True, text=True, timeout=5,
-            )
-            for line in result.stdout.strip().split("\n"):
-                line = line.strip()
-                if not line:
-                    continue
-                parts = line.split(None, 1)
-                if len(parts) < 2:
-                    continue
-                pid_str, args = parts
-                is_interactive, explicit_id = _parse_claude_process_args(args)
-                if not is_interactive:
-                    continue
-
-                if explicit_id:
-                    active_ids.add(explicit_id)
-                else:
-                    try:
-                        cwd_pids[int(pid_str)] = None
-                    except ValueError:
-                        pass
-
-            # For processes without explicit IDs, get their CWD via lsof
-            if cwd_pids:
-                pid_list = ",".join(str(p) for p in cwd_pids)
-                result = subprocess.run(
-                    ["lsof", "-a", "-d", "cwd", "-p", pid_list, "-Fn"],
-                    capture_output=True, text=True, timeout=5,
-                )
-                current_pid = None
-                for line in result.stdout.strip().split("\n"):
-                    if line.startswith("p"):
-                        current_pid = int(line[1:])
-                    elif line.startswith("n") and current_pid:
-                        cwd_pids[current_pid] = line[1:]
-
-                # Match CWD to most recent session in that project
-                for pid, cwd in cwd_pids.items():
-                    if not cwd:
-                        continue
-                    sid = _resolve_session_id_by_cwd(cwd)
-                    if sid:
-                        active_ids.add(sid)
-        except Exception:
-            pass
-
-        return active_ids
+        return get_active_claude_session_ids()
 
     def _gather_session_data(self) -> dict:
         """Gather session data from JSONL files"""
@@ -3845,6 +3794,61 @@ def _parse_claude_process_args(args: str) -> tuple[bool, str | None]:
     return (is_interactive, explicit_id)
 
 
+def get_active_claude_session_ids() -> set[str]:
+    """Detect running interactive Claude session ids on macOS/Linux."""
+    active_ids = set()
+    cwd_pids = {}  # pid -> cwd for processes without explicit session IDs
+
+    try:
+        result = subprocess.run(
+            ["ps", "-eo", "pid,args"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(None, 1)
+            if len(parts) < 2:
+                continue
+            pid_str, args = parts
+            is_interactive, explicit_id = _parse_claude_process_args(args)
+            if not is_interactive:
+                continue
+
+            if explicit_id:
+                active_ids.add(explicit_id)
+            else:
+                try:
+                    cwd_pids[int(pid_str)] = None
+                except ValueError:
+                    pass
+
+        if cwd_pids:
+            pid_list = ",".join(str(p) for p in cwd_pids)
+            result = subprocess.run(
+                ["lsof", "-a", "-d", "cwd", "-p", pid_list, "-Fn"],
+                capture_output=True, text=True, timeout=5,
+            )
+            current_pid = None
+            for line in result.stdout.strip().split("\n"):
+                if line.startswith("p"):
+                    current_pid = int(line[1:])
+                elif line.startswith("n") and current_pid:
+                    cwd_pids[current_pid] = line[1:]
+
+            for cwd in cwd_pids.values():
+                if not cwd:
+                    continue
+                sid = _resolve_session_id_by_cwd(cwd)
+                if sid:
+                    active_ids.add(sid)
+    except Exception:
+        pass
+
+    return active_ids
+
+
 def _resolve_session_id_by_cwd(cwd: str) -> str | None:
     """Given a claude process CWD, return the most-recently-modified session id
     in the matching `~/.claude/projects/<encoded>` directory."""
@@ -4088,15 +4092,31 @@ def build_parser():
     observe_p = subparsers.add_parser(
         "observe",
         parents=[shared],
-        help="Run the observer once on a session (on-demand mode)",
+        help="Run the background observer sidecar for a session",
         description=(
-            "Run the Haiku observer on new messages for a session, once. "
-            "Reads from the recorded source_byte_offset, extracts typed "
-            "observations into ~/.config/threadhop/observations/<id>.jsonl, "
-            "and advances the cursor. This is the on-demand mode of the "
-            "observer — the background sidecar / watch mode (task #34) "
-            "lands separately."
+            "Run the observer sidecar for a session. The process performs an "
+            "initial catch-up extraction, then watches the transcript for new "
+            "messages, appends observations into "
+            "~/.config/threadhop/observations/<id>.jsonl, and triggers the "
+            "reflector when enough new observations accumulate. Use --once "
+            "for the old on-demand single-pass mode."
         ),
+    )
+    mode_group = observe_p.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--once",
+        action="store_true",
+        help="Run a single observation pass and exit",
+    )
+    mode_group.add_argument(
+        "--stop",
+        action="store_true",
+        help="Stop the observer for this session",
+    )
+    mode_group.add_argument(
+        "--stop-all",
+        action="store_true",
+        help="Stop every running observer",
     )
     observe_p.add_argument(
         "--batch-threshold",
@@ -4107,56 +4127,201 @@ def build_parser():
             f"(default {observer.BATCH_THRESHOLD}). Lower for demos."
         ),
     )
+    observe_p.add_argument(
+        "--poll-interval",
+        type=float,
+        default=observer.WATCH_POLL_INTERVAL_SEC,
+        help=(
+            "Watcher fallback poll interval in seconds "
+            f"(default {observer.WATCH_POLL_INTERVAL_SEC})."
+        ),
+    )
+    observe_p.add_argument(
+        "--watch-backend",
+        choices=[
+            observer.WATCH_BACKEND_AUTO,
+            observer.WATCH_BACKEND_POLL,
+            observer.WATCH_BACKEND_FSEVENTS,
+        ],
+        default=observer.WATCH_BACKEND_AUTO,
+        help="Watch backend for background mode (default: auto).",
+    )
+    observe_p.add_argument(
+        "--claude-bin",
+        type=str,
+        default="claude",
+        help="Path to the claude CLI binary used for observer/reflector runs",
+    )
+    observe_p.add_argument(
+        "--timeout",
+        type=float,
+        default=observer.DEFAULT_TIMEOUT_SEC,
+        help=(
+            "Timeout in seconds for each observer/reflector claude call "
+            f"(default {observer.DEFAULT_TIMEOUT_SEC})."
+        ),
+    )
 
     return parser
 
 
-def cmd_observe(args) -> int:
-    """Run the observer once for the given session and print a summary.
+def _refresh_observer_state(conn, session_id: str) -> dict | None:
+    """Return the observation_state row, correcting stale running PIDs."""
+    state = db.get_observation_state(conn, session_id)
+    if state is None:
+        return None
+    pid = state.get("observer_pid")
+    if state.get("status") == "running" and pid is not None:
+        if not observer._pid_is_alive(int(pid)):
+            db.set_observer_stopped(conn, session_id)
+            state = db.get_observation_state(conn, session_id)
+    return state
 
-    Partial implementation of task #34 — on-demand only. No watch mode,
-    no PID tracking, no fsevents — those belong to the background
-    sidecar. This handler is what the demo uses and what the
-    ``/threadhop:observe`` skill will eventually shell out to.
-    """
-    rc = _resolve_cli_session(args)
-    if rc != 0:
-        return rc
-    session_path = find_session_path(args.session)
-    if session_path is None:
+
+def _print_observer_result(result: dict, *, prefix: str = "observer") -> None:
+    message = result.get("message")
+    if message:
+        print(f"[{prefix}] {message}")
+    if prefix == "observer" and result.get("status") == "extracted":
         print(
-            f"threadhop observe: no transcript found for session "
-            f"{args.session} under {CLAUDE_PROJECTS}.",
-            file=sys.stderr,
+            f"[{prefix}] cursor {result['source_byte_offset']} bytes; "
+            f"{result['entry_count']} observations on file"
         )
-        return 1
+    if result.get("status") == "failed" and result.get("stderr"):
+        print(f"[{prefix}] stderr: {result['stderr']}", file=sys.stderr)
 
+
+def _stop_observer_session(conn, session_id: str) -> int:
+    state = _refresh_observer_state(conn, session_id)
+    if state is None or state.get("observer_pid") is None:
+        print(f"Observer is not running for session {session_id}.")
+        return 0
+
+    pid = int(state["observer_pid"])
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        db.set_observer_stopped(conn, session_id)
+        print(
+            f"Observer PID {pid} for session {session_id} was stale; "
+            "state corrected to stopped."
+        )
+        return 0
+    print(f"Sent SIGTERM to observer for session {session_id} (pid {pid}).")
+    return 0
+
+
+def _stop_all_observers(conn) -> int:
+    rows = db.get_running_observers(conn)
+    if not rows:
+        print("No running observers.")
+        return 0
+
+    stopped = 0
+    stale = 0
+    for row in rows:
+        session_id = row["session_id"]
+        pid = int(row["observer_pid"])
+        try:
+            os.kill(pid, signal.SIGTERM)
+            stopped += 1
+        except ProcessLookupError:
+            db.set_observer_stopped(conn, session_id)
+            stale += 1
+    print(f"Sent SIGTERM to {stopped} observer(s).")
+    if stale:
+        print(f"Corrected {stale} stale observer PID(s).")
+    return 0
+
+
+def cmd_observe(args) -> int:
+    """Run or manage the per-session observer sidecar."""
     conn = db.init_db()
     try:
-        # Seed the sessions row so the observer can resolve source_path on
-        # its first run (same pattern the `tag` handler uses).
+        if args.stop_all:
+            return _stop_all_observers(conn)
+
+        rc = _resolve_cli_session(args)
+        if rc != 0:
+            return rc
+
+        if args.stop:
+            return _stop_observer_session(conn, args.session)
+
+        session_path = find_session_path(args.session)
+        if session_path is None:
+            print(
+                f"threadhop observe: no transcript found for session "
+                f"{args.session} under {CLAUDE_PROJECTS}.",
+                file=sys.stderr,
+            )
+            return 1
+
         db.upsert_session(
             conn, args.session, str(session_path),
             project=session_path.parent.name,
         )
-        result = observer.observe_session(
-            conn, args.session,
+
+        if args.once:
+            result = observer.observe_session(
+                conn, args.session,
+                batch_threshold=args.batch_threshold,
+                claude_bin=args.claude_bin,
+                timeout=args.timeout,
+            )
+            _print_observer_result(result)
+            if result.get("obs_path"):
+                print(f"  obs file: {result['obs_path']}")
+            return 1 if result.get("status") == "failed" else 0
+
+        state = _refresh_observer_state(conn, args.session)
+        if state is not None and state.get("observer_pid") is not None:
+            pid = int(state["observer_pid"])
+            print(
+                f"Observer already running for session {args.session} "
+                f"(pid {pid})."
+            )
+            return 0
+
+        print(
+            f"Observing session {args.session} via {args.watch_backend} "
+            f"watcher (batch threshold {args.batch_threshold})."
+        )
+        result = observer.observe_sidecar(
+            conn,
+            args.session,
+            source_path=session_path,
             batch_threshold=args.batch_threshold,
+            poll_interval_sec=args.poll_interval,
+            watch_backend=args.watch_backend,
+            claude_bin=args.claude_bin,
+            timeout=args.timeout,
+            session_active_fn=lambda sid: sid in get_active_claude_session_ids(),
+            on_result=_print_observer_result,
+            on_reflector_result=lambda r: _print_observer_result(
+                r, prefix="reflector"
+            ),
         )
     finally:
         conn.close()
 
-    print(result.get("message", "(no message)"))
-    if result.get("obs_path"):
-        print(f"  obs file: {result['obs_path']}")
-    if result.get("status") == "extracted":
-        print(
-            f"  cursor:   {result['source_byte_offset']} bytes  "
-            f"({result['entry_count']} observations on file)"
-        )
-    if result.get("status") == "failed":
-        if result.get("stderr"):
-            print(f"  stderr:   {result['stderr']}", file=sys.stderr)
+    status = result.get("status")
+    if status == "already_running":
+        print(result.get("message", "Observer already running."))
+        return 0
+    if status == "no_source":
+        print(result.get("message", "No source JSONL found."), file=sys.stderr)
+        return 1
+    if status == "source_gone":
+        print(f"Observer stopped for session {args.session}: source transcript disappeared.")
+        return 0
+    if status == "session_ended":
+        print(f"Observer stopped for session {args.session}: Claude session ended.")
+        return 0
+    if status == "stopped":
+        print(f"Observer stopped for session {args.session}.")
+        return 0
+    if status == "failed":
         return 1
     return 0
 
