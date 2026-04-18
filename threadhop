@@ -4192,6 +4192,36 @@ def cmd_todos(args) -> int:
     return 0
 
 
+def cmd_decisions(args) -> int:
+    """List decision observations as compact JSONL."""
+    conn = db.init_db()
+    try:
+        results = observation_queries.refresh_unprocessed_observations(
+            conn,
+            project=args.project,
+            session_id=args.session,
+        )
+        for result in results:
+            if result.get("status") == "failed":
+                print(
+                    "threadhop decisions: observer failed for session "
+                    f"{result['session_id']}: {result.get('message', 'unknown error')}",
+                    file=sys.stderr,
+                )
+        entries = observation_queries.list_observation_entries(
+            conn,
+            observation_type="decision",
+            project=args.project,
+            session_id=args.session,
+        )
+    finally:
+        conn.close()
+
+    for entry in entries:
+        print(observation_queries.format_entry_json(entry))
+    return 0
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -4221,6 +4251,8 @@ def main():
         return 0
     if args.command == "todos":
         return cmd_todos(args)
+    if args.command == "decisions":
+        return cmd_decisions(args)
     if args.command == "observe":
         return cmd_observe(args)
     return _cli_stub(args.command)
