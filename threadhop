@@ -33,7 +33,9 @@ from textual.worker import Worker
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import db  # noqa: E402
 import indexer  # noqa: E402
+import cli_queries  # noqa: E402
 import observer  # noqa: E402
+import reflector  # noqa: E402
 
 
 def get_available_themes():
@@ -4007,7 +4009,7 @@ def build_parser():
         description=(
             "ThreadHop — Claude Code session browser.\n"
             "  No subcommand  → launch the TUI.\n"
-            "  Subcommand     → CLI mode (tag, todos, decisions, observations)."
+            "  Subcommand     → CLI mode (tag, todos, decisions, observations, conflicts)."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -4083,6 +4085,23 @@ def build_parser():
         parents=[shared],
         help="List all memory entries (todos, decisions, observations)",
         description="List everything in the memory ledger. Use --project/--session to filter.",
+    )
+
+    conflicts_p = subparsers.add_parser(
+        "conflicts",
+        parents=[shared],
+        help="List unresolved cross-session decision conflicts",
+        description=(
+            "List decision conflicts detected by the reflector. "
+            "Uses --project to filter and --resolved to mark the displayed "
+            "conflicts as reviewed."
+        ),
+    )
+    conflicts_p.add_argument(
+        "--resolved",
+        action="store_true",
+        default=False,
+        help="Mark the displayed conflicts as reviewed",
     )
 
     observe_p = subparsers.add_parser(
@@ -4161,6 +4180,27 @@ def cmd_observe(args) -> int:
     return 0
 
 
+def cmd_conflicts(args) -> int:
+    """List cross-session conflict entries as compact JSON lines."""
+    conn = db.init_db()
+    try:
+        results = cli_queries.query_conflicts(
+            conn,
+            claude_projects_dir=CLAUDE_PROJECTS,
+            project=args.project,
+            session_id=args.session,
+            mark_resolved=args.resolved,
+            observe_fn=observer.observe_session,
+            reflect_fn=reflector.reflect_session,
+        )
+    finally:
+        conn.close()
+
+    for row in results:
+        print(json.dumps(row, separators=(",", ":"), sort_keys=True))
+    return 0
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -4190,6 +4230,8 @@ def main():
         return 0
     if args.command == "observe":
         return cmd_observe(args)
+    if args.command == "conflicts":
+        return cmd_conflicts(args)
     return _cli_stub(args.command)
 
 
