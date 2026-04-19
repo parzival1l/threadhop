@@ -223,6 +223,7 @@ def observe_session(
     source_path: str | Path | None = None,
     batch_threshold: int = BATCH_THRESHOLD,
     claude_bin: str = "claude",
+    model: str = "haiku",
     timeout: float = DEFAULT_TIMEOUT_SEC,
     prompt_path: Path | None = None,
 ) -> dict[str, Any]:
@@ -408,7 +409,7 @@ def observe_session(
         proc = subprocess.run(
             [
                 claude_bin, "-p", prompt,
-                "--model", "haiku",
+                "--model", model,
                 "--permission-mode", "acceptEdits",
             ],
             check=False,

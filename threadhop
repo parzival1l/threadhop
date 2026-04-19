@@ -4108,6 +4108,23 @@ def build_parser():
             f"(default {observer.BATCH_THRESHOLD}). Lower for demos."
         ),
     )
+    observe_p.add_argument(
+        "--model",
+        default="haiku",
+        help=(
+            "Model to pass to `claude -p --model` (default: haiku). "
+            "Use 'sonnet' or 'opus' to get a stronger extractor."
+        ),
+    )
+    observe_p.add_argument(
+        "--reset",
+        action="store_true",
+        help=(
+            "Delete the observation_state row and the on-disk observations "
+            "JSONL for this session before running, so extraction restarts "
+            "from byte 0 with a clean output file."
+        ),
+    )
 
     return parser
 
@@ -4140,9 +4157,22 @@ def cmd_observe(args) -> int:
             conn, args.session, str(session_path),
             project=session_path.parent.name,
         )
+        if args.reset:
+            removed = db.delete_observation_state(conn, args.session)
+            conn.commit()
+            obs_path = db.OBS_DIR / f"{args.session}.jsonl"
+            wiped = False
+            if obs_path.exists():
+                obs_path.unlink()
+                wiped = True
+            print(
+                f"reset: removed {removed} state row(s)"
+                + (f", deleted {obs_path}" if wiped else "")
+            )
         result = observer.observe_session(
             conn, args.session,
             batch_threshold=args.batch_threshold,
+            model=args.model,
         )
     finally:
         conn.close()
