@@ -131,6 +131,12 @@ def _seed_session_row(conn, session_id: str, session_path: Path):
     )
 
 
+def _write_obs_file(obs_dir: Path, session_id: str, entries: list[dict]) -> Path:
+    path = obs_dir / f"{session_id}.jsonl"
+    path.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+    return path
+
+
 # --- Pure-function tests ---------------------------------------------------
 
 
@@ -516,6 +522,94 @@ class TestObserveSession:
         assert result["turns"] == 3
 
 
+class TestReflectSession:
+    def test_reflector_runs_when_threshold_is_met(
+        self, tmp_path, conn, obs_dir, fake_claude
+    ):
+        current_jsonl = _write_session(tmp_path, "sess-1", [_user_line("u1", "a")])
+        other_jsonl = _write_session(tmp_path, "sess-2", [_user_line("u2", "b")])
+        _seed_session_row(conn, "sess-1", current_jsonl)
+        _seed_session_row(conn, "sess-2", other_jsonl)
+
+        current_entries = [
+            {"type": "decision", "text": "Use REST", "context": "", "ts": "t1"},
+            {"type": "todo", "text": "x1", "context": "", "ts": "t2"},
+            {"type": "todo", "text": "x2", "context": "", "ts": "t3"},
+            {"type": "observation", "text": "x3", "context": "", "ts": "t4"},
+            {"type": "done", "text": "x4", "context": "", "ts": "t5"},
+        ]
+        other_entries = [
+            {"type": "decision", "text": "Use gRPC", "context": "", "ts": "t0"},
+        ]
+        current_obs = _write_obs_file(obs_dir, "sess-1", current_entries)
+        other_obs = _write_obs_file(obs_dir, "sess-2", other_entries)
+        db.upsert_observation_state(
+            conn, "sess-1", str(current_jsonl), str(current_obs),
+            source_byte_offset=current_jsonl.stat().st_size,
+            entry_count=len(current_entries),
+            reflector_entry_offset=0,
+        )
+        db.upsert_observation_state(
+            conn, "sess-2", str(other_jsonl), str(other_obs),
+            source_byte_offset=other_jsonl.stat().st_size,
+            entry_count=len(other_entries),
+            reflector_entry_offset=0,
+        )
+
+        claude = fake_claude([
+            {
+                "type": "conflict",
+                "text": "REST contradicts gRPC",
+                "refs": ["sess-1", "sess-2"],
+                "topic": "api-protocol",
+                "ts": "2026-04-17T11:00:00Z",
+            },
+        ])
+        result = observer.maybe_reflect_session(
+            conn, "sess-1",
+            threshold=5,
+            claude_bin=str(claude),
+        )
+
+        assert result["status"] == "reflected"
+        assert result["new_entries"] == 1
+        assert result["by_type"] == {"conflict": 1}
+        state = db.get_observation_state(conn, "sess-1")
+        assert state is not None
+        assert state["reflector_entry_offset"] == 6
+
+    def test_reflector_advances_offset_without_llm_when_no_new_decisions(
+        self, tmp_path, conn, obs_dir, fake_claude
+    ):
+        jsonl = _write_session(tmp_path, "sess-1", [_user_line("u1", "a")])
+        _seed_session_row(conn, "sess-1", jsonl)
+        entries = [
+            {"type": "todo", "text": "x1", "context": "", "ts": "t1"},
+            {"type": "todo", "text": "x2", "context": "", "ts": "t2"},
+            {"type": "done", "text": "x3", "context": "", "ts": "t3"},
+            {"type": "observation", "text": "x4", "context": "", "ts": "t4"},
+            {"type": "adr", "text": "x5", "context": "", "ts": "t5"},
+        ]
+        obs_path = _write_obs_file(obs_dir, "sess-1", entries)
+        db.upsert_observation_state(
+            conn, "sess-1", str(jsonl), str(obs_path),
+            source_byte_offset=jsonl.stat().st_size,
+            entry_count=len(entries),
+            reflector_entry_offset=0,
+        )
+
+        result = observer.maybe_reflect_session(
+            conn, "sess-1",
+            threshold=5,
+            claude_bin=str(fake_claude("#!/usr/bin/env bash\nexit 99\n")),
+        )
+
+        assert result["status"] == "up_to_date"
+        state = db.get_observation_state(conn, "sess-1")
+        assert state is not None
+        assert state["reflector_entry_offset"] == len(entries)
+
+
 # --- Watch-mode tests ------------------------------------------------------
 
 
@@ -798,3 +892,38 @@ class TestWatchSession:
         # Polled at the top of every iteration; exits on the 4th call.
         assert stop.calls == 4
         assert result["iterations"] == 3
+
+
+class TestObserveSidecar:
+    def test_stop_flushes_sub_threshold_tail_and_clears_pid(
+        self, tmp_path, conn, obs_dir, fake_claude
+    ):
+        jsonl = _write_session(tmp_path, "sess-1", [
+            _user_line("u1", "hi"),
+            _assistant_line("a1", "m1", "hello"),
+        ])
+        _seed_session_row(conn, "sess-1", jsonl)
+        claude = fake_claude([
+            {"type": "decision", "text": "x", "context": "",
+             "ts": "2026-04-17T10:00:00Z"},
+        ])
+
+        result = observer.observe_sidecar(
+            conn, "sess-1",
+            source_path=jsonl,
+            batch_threshold=3,
+            watch_backend=observer.WATCH_BACKEND_POLL,
+            claude_bin=str(claude),
+            should_stop=_StopAfter(0),
+            session_active_fn=lambda _sid: True,
+            sleep_fn=lambda _: None,
+        )
+
+        assert result["status"] == "stopped"
+        assert result["extractions"] == 1
+        state = db.get_observation_state(conn, "sess-1")
+        assert state is not None
+        assert state["status"] == "stopped"
+        assert state["observer_pid"] is None
+        assert state["source_byte_offset"] == jsonl.stat().st_size
+        assert (obs_dir / "sess-1.jsonl").exists()
