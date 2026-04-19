@@ -32,7 +32,7 @@ DB_PATH = DB_DIR / "sessions.db"
 # --- Schema version ---
 # Each migration N in MIGRATIONS moves the DB from version N to N+1.
 # The DB's current version lives in PRAGMA user_version.
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 # --- Migrations -----------------------------------------------------------
@@ -227,12 +227,39 @@ def _migration_004_observation_state(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_005_conflict_reviews(conn: sqlite3.Connection) -> None:
+    """Persist review state for conflict entries without mutating JSONL.
+
+    Conflict entries are append-only in the per-session observation files
+    (ADR-020). Review state therefore lives in SQLite, keyed by the same
+    dedup dimensions the reflector prompt uses: the session whose file
+    contains the conflict, the refs pair, and the semantic topic.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS conflict_reviews (
+            session_id    TEXT NOT NULL,
+            refs_key      TEXT NOT NULL,
+            topic         TEXT NOT NULL DEFAULT '',
+            reviewed_at   REAL NOT NULL,
+            PRIMARY KEY (session_id, refs_key, topic),
+            FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_conflict_reviews_session "
+        "ON conflict_reviews(session_id)"
+    )
+
+
 # Ordered list; MIGRATIONS[i] moves schema from version i to i+1.
 MIGRATIONS: list = [
     _migration_001_initial,
     _migration_002_messages,
     _migration_003_index_state,
     _migration_004_observation_state,
+    _migration_005_conflict_reviews,
 ]
 
 assert len(MIGRATIONS) == SCHEMA_VERSION, (
@@ -1006,19 +1033,32 @@ def update_reflector_offset(
     conn: sqlite3.Connection,
     session_id: str,
     reflector_entry_offset: int,
+    *,
+    entry_count: int | None = None,
 ) -> None:
     """Advance the reflector's position after a comparison pass.
 
     The reflector processes observation entries (not source bytes), so its
     offset is an entry index, not a byte offset.
     """
+    if entry_count is None:
+        conn.execute(
+            """
+            UPDATE observation_state
+            SET reflector_entry_offset = ?
+            WHERE session_id = ?
+            """,
+            (reflector_entry_offset, session_id),
+        )
+        return
     conn.execute(
         """
         UPDATE observation_state
-        SET reflector_entry_offset = ?
+        SET reflector_entry_offset = ?,
+            entry_count = ?
         WHERE session_id = ?
         """,
-        (reflector_entry_offset, session_id),
+        (reflector_entry_offset, entry_count, session_id),
     )
 
 
@@ -1093,4 +1133,61 @@ def get_running_observers(
         conn,
         "SELECT session_id, observer_pid "
         "FROM observation_state WHERE status = 'running' AND observer_pid IS NOT NULL",
+    )
+
+
+def _normalize_conflict_refs(refs: Sequence[str] | None) -> str:
+    """Canonicalize a refs pair so review keys match prompt dedup semantics."""
+    if not refs:
+        return ""
+    cleaned = sorted({str(ref).strip() for ref in refs if str(ref).strip()})
+    return "\x1f".join(cleaned)
+
+
+def is_conflict_reviewed(
+    conn: sqlite3.Connection,
+    session_id: str,
+    refs: Sequence[str] | None,
+    topic: str | None,
+) -> bool:
+    """Return True when this conflict has already been marked reviewed."""
+    row = query_one(
+        conn,
+        """
+        SELECT 1
+        FROM conflict_reviews
+        WHERE session_id = ? AND refs_key = ? AND topic = ?
+        """,
+        (session_id, _normalize_conflict_refs(refs), (topic or "")),
+    )
+    return row is not None
+
+
+def mark_conflict_reviewed(
+    conn: sqlite3.Connection,
+    session_id: str,
+    refs: Sequence[str] | None,
+    topic: str | None,
+    *,
+    reviewed_at: float | None = None,
+) -> None:
+    """Mark a conflict as reviewed.
+
+    Uses INSERT .. ON CONFLICT so repeated reviews simply refresh the
+    timestamp without creating duplicates.
+    """
+    conn.execute(
+        """
+        INSERT INTO conflict_reviews (
+            session_id, refs_key, topic, reviewed_at
+        ) VALUES (?, ?, ?, ?)
+        ON CONFLICT(session_id, refs_key, topic) DO UPDATE SET
+            reviewed_at = excluded.reviewed_at
+        """,
+        (
+            session_id,
+            _normalize_conflict_refs(refs),
+            (topic or ""),
+            reviewed_at if reviewed_at is not None else datetime.now().timestamp(),
+        ),
     )
