@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**ThreadHop** is a single-file Textual TUI for browsing, searching, and carrying context across Claude Code session transcripts. macOS-only — uses `ps`/`lsof` for active session detection.
+**ThreadHop** is a Textual TUI plus CLI for browsing, searching, and carrying context across Claude Code session transcripts. macOS-only — uses `ps`/`lsof` for active session detection.
 
 The project is expanding from a transcript viewer into a cross-session context manager with SQLite FTS search, project memory, session tagging, and a skill plugin for handoff generation. See `docs/DESIGN-DECISIONS.md` for the full architecture.
 
@@ -16,13 +16,22 @@ The project is expanding from a transcript viewer into a cross-session context m
 
 # With filters
 ./threadhop --project myproject --days 7
+
+# CLI query mode
+./threadhop todos
+./threadhop todos --project myproject
 ```
 
 No build step. The script uses `uv run --script` with PEP 723 inline metadata. Only dependency: `textual>=0.89.0`.
 
 ## Architecture
 
-**Single file**: `threadhop` (~1,345 lines Python) — everything lives here.
+Core modules:
+- `threadhop` — executable entry point, TUI, argparse routing, CLI handlers
+- `db.py` — SQLite schema, migrations, session / observation-state helpers
+- `indexer.py` — transcript normalization and FTS ingestion
+- `observer.py` — on-demand observer orchestration over transcript byte ranges
+- `observation_queries.py` — CLI query helpers for reading per-session observation JSONL
 
 ### Key Classes
 
@@ -38,6 +47,7 @@ No build step. The script uses `uv run --script` with PEP 723 inline metadata. O
 2. **Active detection**: `_get_active_claude_sessions()` runs `ps -eo pid,args`, finds `claude` processes, resolves CWD via `lsof -a -d cwd -p <pid>`, matches to session IDs
 3. **Display**: `_update_session_list()` diffs old/new session lists — full rebuild on change, in-place spinner updates otherwise
 4. **Transcript**: `load_transcript()` parses full JSONL, strips `<system-reminder>` tags, abbreviates tool calls, mounts message widgets
+5. **Observation CLI**: `threadhop todos` silently runs observer catch-up for already-tracked sessions, then reads `~/.config/threadhop/observations/<session_id>.jsonl` and prints compact JSONL rows newest-first
 
 ### Session State
 
@@ -46,7 +56,7 @@ No build step. The script uses `uv run --script` with PEP 723 inline metadata. O
 
 ### Persistent Config
 
-`~/.config/threadhop/config.json` stores theme, custom session names, session order, and last-viewed timestamps (for unread detection). Will migrate to SQLite in Phase 1.
+`~/.config/threadhop/config.json` stores app-level settings like theme. Session metadata and observation state live in SQLite at `~/.config/threadhop/sessions.db`.
 
 ## Styling
 
@@ -66,8 +76,8 @@ Every message line has native fields useful for indexing:
 - `sessionId`, `timestamp`, `cwd`, `isSidechain`
 - Assistant messages: multiple lines share the same `message.id` (streaming chunks) — must be merged for search
 
-## Planned Architecture (not yet implemented)
+## In Progress
 
-- SQLite database at `~/.config/threadhop/sessions.db` for session metadata, FTS index, bookmarks, project memory
-- Skill plugin: `/threadhop:handoff <session_id>` for LLM-compressed session handoffs
-- See `docs/DESIGN-DECISIONS.md` for full schema and implementation plan
+- Observation-backed CLI queries are landing incrementally: `todos` is implemented, `decisions` / `observations` remain stubs
+- Skill plugin work such as `/threadhop:handoff <session_id>` still depends on the observer pipeline
+- See `docs/DESIGN-DECISIONS.md` for the detailed rollout plan

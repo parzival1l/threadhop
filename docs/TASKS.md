@@ -1,6 +1,7 @@
 # ThreadHop — Implementation Task List
 
-Extracted from [DESIGN-DECISIONS.md](DESIGN-DECISIONS.md). Last reconciled 2026-04-17.
+Extracted from [DESIGN-DECISIONS.md](DESIGN-DECISIONS.md) and
+[PERFORMANCE.md](PERFORMANCE.md). Last reconciled 2026-04-19.
 
 ---
 
@@ -56,6 +57,12 @@ _Enables instant search and cross-session context sharing. All TUI features._
 
 - [ ] **42. Context-aware help overlay + command metadata registry**
   Add a full-app discoverability surface modeled on the search modal, but for commands instead of FTS results. Keep the footer minimal/contextual rather than trying to show every keybinding all the time. Define a shared command metadata registry that covers both app-level bindings and widget-local modes (session list, transcript, selection mode, reply input, search/find), and use it to drive the help overlay plus footer hints from one source of truth. The implementation should leave the final help trigger key open and must not assume `H`, since handoff shortcut work is still in flux. _(ADR-017)_
+
+- [ ] **50. Event-driven session discovery via fsevents** *(blocked by: #1, #8; supersedes polling in `_gather_session_data()`)*
+  Replace the 5 s poll with a `watchdog` observer rooted at `~/.claude/projects`. Dispatch typed Textual messages (`SessionFileChanged`, `SessionFileCreated`, `SessionFileDeleted`) on file-system events and update just the affected session row incrementally — seek to the stored byte offset, parse only the tail, update metadata + FTS. Retain polling only for cold-start discovery. Distinct from task #34 (single-session observer sidecar): this is the global session-list refresh path. Add `watchdog` to the PEP 723 dependency block. _(ADR-023, PERFORMANCE.md)_
+
+- [ ] **51. Defer transcript parse until focus with lazy tail load** *(blocked by: #8; prereq for: #52)*
+  Refactor `load_transcript()` into an async pipeline. On session focus, read ~64 KB from the tail, parse backwards from EOF, paint the visible range immediately, then stream earlier messages from a `@work` background task. Add a `TranscriptCache` LRU keyed by `session_id`, invalidated by `SessionFileChanged` events from #50. Discovery-side parse stays cheap (first 100 lines only, unchanged). _(ADR-024, PERFORMANCE.md)_
 
 - [ ] **33. Data model hardening: CHECK constraints + Pydantic schemas** *(blocked by: #1; prereq for: #8)*
   Add a migration introducing `CHECK (status IN ('active','in_progress','in_review','done','archived'))` on the `sessions` table so the enum is enforced at the DB layer, not just the app. Design Pydantic models as the validation boundary for JSONL transcript parsing — user/assistant messages, `tool_use` blocks, `tool_result` blocks — so the indexer in #8 folds over typed instances instead of raw dicts and malformed lines fail loudly. Use `Literal` types for enums (session status, message role, memory `type`). Define `Session`, `Message`, `Bookmark`, `MemoryEntry` shapes alongside their table migrations so the Python types and SQL schemas evolve together. Add `pydantic` to the script's PEP 723 dependency block. _(ADR-001, ADR-003, ADR-004)_
@@ -210,62 +217,13 @@ process — not independent. Uses `reflector_entry_offset` for incremental proce
 
 ---
 
-## Dependency Graph (critical path)
+## Phase 7: Rendering Performance
+_Scheduled after the observer ships and cross-session query surfaces
+(#14, #20-22, #45) expose enough rows to matter. Backend perf (#50,
+#51) lands in Phase 2 — rendering perf lands here._
 
-```
-#1 SQLite DB ──┬──> #2 Migration ──> #7 Tests
-               ├──> #3 Status ──┬──> #4 Keybinds (s/S)  ─────────┐
-               │                └──> #5 Archive (a/A)            │
-               ├──> #33 Data models ──> #8 Indexer ──> #9 Incremental ──> #14 Search │ ──> #32 Fuzzy
-               ├──> #44 observation_state table ──┐
-               │                                   ├──> #46 TUI obs indicator
-               │                                   ├──> #47 Transcript header
-               │                                   └──> (prereq for #18, #35)
-               │
-               │  #43 Observer prompt (independent)
-               │         ↓
-               │  #8 Indexer + #43 + #44 ──> #18 Observer core ──> #19 Incremental
-               │                                                    ├──> #20 todos
-               │                                                    ├──> #21 decisions
-               │                                                    ├──> #22 observations
-               │                                                    ├──> #45 conflicts CLI
-               │                                                    ├──> #29 Annotation detection
-               │                                                    ├──> #30 Memory rendering
-               │                                                    ├──> #34 Background observer ──> #35 Stop/resume lifecycle
-               │                                                    │                            ├──> #48 TUI obs keybindings (o/O)
-               │                                                    │                            └──> #36 Observer-triggered reflector (also needs #31)
-               │                                                    └──> #49 Reflector prompt ──> #31 Reflector core ──> #38 TUI notification
-               │                                                                                                     └──> #39 Condensation
-               ├──> #27 Bookmarks (also needs #10)
-               └──> #28 Memory ledger ──┬──> #29 Annotation detection
-                                        └──> #30 Memory rendering
+- [ ] **52. Row-window virtualisation of TranscriptView** *(blocked by: #51)*
+  Replace the `VerticalScroll`-of-all-messages with a custom virtual-scroll container (`VirtualTranscript(ScrollView)`) that mounts only the visible range + overscan buffer and recycles widget instances from per-type pools (`UserMessage`, `AssistantMessage`, `ToolMessage`). Start with fixed row height + overflow ellipsis; expand-on-focus handles tall messages. Single biggest rendering-perf win — makes long sessions render in constant cost. _(ADR-025, PERFORMANCE.md)_
 
-#6 Sidebar resize (independent)
-
-#42 Help overlay + command registry (independent)
-
-#10 Selection ──┬──> #11 Range select
-                ├──> #12 Clipboard copy ──> #25 /threadhop:context (also needs #23)
-                ├──> #13 Temp export
-                └──> #27 Bookmarks (also needs #1)
-
-#15 Subcommand routing ──> #16 tag CLI ──> #17 Auto-detect session
-                                        └──> #24 /threadhop:tag skill (also needs #23)
-
-#23 Skill packaging research ──┬──> #24 /threadhop:tag
-                                ├──> #25 /threadhop:context
-                                ├──> #26 /threadhop:handoff (runs observer first, then formats)
-                                ├──> #40 /threadhop:observe (also needs #34)
-                                └──> #41 /threadhop:insights (reads unified per-session file)
-
-Entry points for session tagging (ADR-013): #4 (TUI) · #16 (CLI) · #24 (skill) — all write to the same sessions table.
-
-Observer as core function (ADR-018): #43 prompt + #44 state table → #18 core → used by #34 (background), #26 (handoff), #20-22,45 (CLI queries), #40 (skill)
-
-Reflector as observer companion (ADR-022): #49 prompt → #31 core → triggered by #34 observer (when entry_count - reflector_entry_offset ≥ 5)
-  Reflector input: decisions from observation files (not raw transcripts). Output: type:"conflict" entries in same JSONL.
-
-Observer-reflector unified output (ADR-020): #18 observer + #31 reflector both append to observations/<session_id>.jsonl
-
-TUI observation surface (ADR-021): #44 → #46 indicator + #47 header + #48 keybindings (o/O)
-```
+- [ ] **53. Migrate data-heavy DataTables to textual-fastdatatable** *(blocked by: #14; also benefits #20, #21, #22, #45 if those land in the TUI)*
+  Swap Textual's `DataTable` for [`textual-fastdatatable`](https://github.com/tconbeer/textual-fastdatatable) at every heavy surface — search results panel, cross-session query views, observation browsers. Light surfaces (settings, help) keep the stock `DataTable`. Add `pyarrow` + `textual-fastdatatable` to the PEP 723 deps. Add `db.fetch_arrow()` helper for SQLite → Arrow conversion so query pipelines can feed the table directly. _(ADR-026, PERFORMANCE.md)_
