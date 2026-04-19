@@ -374,6 +374,7 @@ def observe_session(
     source_path: str | Path | None = None,
     batch_threshold: int = BATCH_THRESHOLD,
     claude_bin: str = "claude",
+    model: str = "haiku",
     timeout: float = DEFAULT_TIMEOUT_SEC,
     prompt_path: Path | None = None,
 ) -> dict[str, Any]:
@@ -559,7 +560,7 @@ def observe_session(
         proc = subprocess.run(
             [
                 claude_bin, "-p", prompt,
-                "--model", "haiku",
+                "--model", model,
                 "--permission-mode", "acceptEdits",
             ],
             check=False,
@@ -1040,6 +1041,7 @@ def watch_session(
     poll_interval_sec: float = WATCH_POLL_INTERVAL_SEC,
     watch_backend: str = WATCH_BACKEND_POLL,
     claude_bin: str = "claude",
+    model: str = "haiku",
     timeout: float = DEFAULT_TIMEOUT_SEC,
     prompt_path: Path | None = None,
     reflector_prompt_path: Path | None = None,
@@ -1078,6 +1080,7 @@ def watch_session(
         watch_backend: ``poll`` (portable), ``fsevents`` (macOS via
             watchdog), or ``auto`` (prefer fsevents on macOS, else poll).
         claude_bin: Forwarded to ``observe_session``.
+        model: Forwarded to ``observe_session``.
         timeout: Forwarded to ``observe_session``.
         prompt_path: Forwarded to ``observe_session``.
         reflector_prompt_path: Forwarded to ``reflect_session`` when the
@@ -1165,6 +1168,7 @@ def watch_session(
             source_path=resolved,
             batch_threshold=run_batch_threshold,
             claude_bin=claude_bin,
+            model=model,
             timeout=timeout,
             prompt_path=prompt_path,
         )
@@ -1280,6 +1284,7 @@ def observe_sidecar(
     poll_interval_sec: float = WATCH_POLL_INTERVAL_SEC,
     watch_backend: str = WATCH_BACKEND_AUTO,
     claude_bin: str = "claude",
+    model: str = "haiku",
     timeout: float = DEFAULT_TIMEOUT_SEC,
     prompt_path: Path | None = None,
     reflector_prompt_path: Path | None = None,
@@ -1349,6 +1354,7 @@ def observe_sidecar(
             poll_interval_sec=poll_interval_sec,
             watch_backend=watch_backend,
             claude_bin=claude_bin,
+            model=model,
             timeout=timeout,
             prompt_path=prompt_path,
             reflector_prompt_path=reflector_prompt_path,

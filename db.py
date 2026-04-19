@@ -1054,6 +1054,23 @@ def set_observer_stopped(
     )
 
 
+def delete_observation_state(
+    conn: sqlite3.Connection,
+    session_id: str,
+) -> int:
+    """Remove the observation_state row so the next run starts at offset 0.
+
+    Returns the number of rows deleted (0 if no row existed).
+    The on-disk observation JSONL is NOT touched — callers decide
+    whether to wipe it.
+    """
+    cur = conn.execute(
+        "DELETE FROM observation_state WHERE session_id = ?",
+        (session_id,),
+    )
+    return cur.rowcount
+
+
 def get_observed_sessions(
     conn: sqlite3.Connection,
 ) -> list[dict]:
