@@ -40,7 +40,7 @@ DB_PATH = DB_DIR / "sessions.db"
 # --- Schema version ---
 # Each migration N in MIGRATIONS moves the DB from version N to N+1.
 # The DB's current version lives in PRAGMA user_version.
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 # --- Migrations -----------------------------------------------------------
@@ -72,8 +72,9 @@ def _migration_001_initial(conn: sqlite3.Connection) -> None:
             project       TEXT,
             cwd           TEXT,
             custom_name   TEXT,
-            status        TEXT NOT NULL DEFAULT 'active',
-                -- active | in_progress | in_review | done | archived
+            status        TEXT NOT NULL DEFAULT 'active'
+                CHECK (status IN
+                    ('active', 'in_progress', 'in_review', 'done', 'archived')),
             sort_order    INTEGER,
             last_viewed   REAL,
             created_at    REAL,
@@ -323,15 +324,30 @@ def _migration_006_sessions_status_check(conn: sqlite3.Connection) -> None:
         """
     )
 
+    schema_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sessions'"
+    ).fetchone()
+    schema_sql = str(schema_row[0] or "") if schema_row is not None else ""
+    if "CHECK (status IN" in schema_sql:
+        return
+
     current_sv = conn.execute("PRAGMA schema_version").fetchone()[0]
 
     conn.execute("PRAGMA writable_schema = ON")
     try:
-        conn.execute(
-            "UPDATE sqlite_master SET sql = ? "
-            "WHERE type = 'table' AND name = 'sessions'",
-            (_SESSIONS_TABLE_DDL_WITH_CHECK,),
-        )
+        try:
+            conn.execute(
+                "UPDATE sqlite_master SET sql = ? "
+                "WHERE type = 'table' AND name = 'sessions'",
+                (_SESSIONS_TABLE_DDL_WITH_CHECK,),
+            )
+        except sqlite3.OperationalError as exc:
+            # Newer SQLite builds may hard-block sqlite_master writes even
+            # with writable_schema enabled. In that case we leave legacy DBs
+            # without the CHECK constraint rather than fail startup.
+            if "sqlite_master may not be modified" in str(exc):
+                return
+            raise
         # Bumping schema_version forces SQLite to re-parse sqlite_master
         # on the next statement — without this, the same connection keeps
         # using its cached pre-CHECK definition until it's reopened.
@@ -389,7 +405,7 @@ def _migration_007_bookmarks(conn: sqlite3.Connection) -> None:
     )
 
 
-def _migration_008_bookmark_kinds_and_notes(conn: sqlite3.Connection) -> None:
+def _migration_009_bookmark_kinds_and_notes(conn: sqlite3.Connection) -> None:
     """Evolve bookmarks from a TUI label into shared kind + note fields.
 
     Task #59 will eventually replace the built-in ``kind`` enum with SQL-backed
@@ -456,6 +472,63 @@ def _migration_008_bookmark_kinds_and_notes(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_008_trigram_search(conn: sqlite3.Connection) -> None:
+    """Task #32: trigram-backed fuzzy-search fallback.
+
+    The primary search path remains the existing porter/unicode61 prefix
+    index. This secondary FTS5 table is only consulted when the prefix
+    query returns zero hits, so the normal per-keystroke path keeps its
+    current latency profile.
+
+    The table mirrors ``messages_fts`` as external-content FTS over
+    ``messages(rowid)``. Existing rows are backfilled with FTS5's
+    ``rebuild`` command so upgraded databases can use fuzzy fallback
+    immediately without forcing a full reindex from JSONL.
+    """
+    conn.execute(
+        """
+        CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_trigram USING fts5(
+            text,
+            content='messages',
+            content_rowid='rowid',
+            tokenize='trigram'
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS messages_ai_trigram
+        AFTER INSERT ON messages BEGIN
+            INSERT INTO messages_fts_trigram(rowid, text)
+            VALUES (new.rowid, new.text);
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS messages_ad_trigram
+        AFTER DELETE ON messages BEGIN
+            INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, text)
+            VALUES ('delete', old.rowid, old.text);
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS messages_au_trigram
+        AFTER UPDATE ON messages BEGIN
+            INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, text)
+            VALUES ('delete', old.rowid, old.text);
+            INSERT INTO messages_fts_trigram(rowid, text)
+            VALUES (new.rowid, new.text);
+        END
+        """
+    )
+    conn.execute(
+        "INSERT INTO messages_fts_trigram(messages_fts_trigram) VALUES ('rebuild')"
+    )
+
+
 # Ordered list; MIGRATIONS[i] moves schema from version i to i+1.
 MIGRATIONS: list = [
     _migration_001_initial,
@@ -465,7 +538,8 @@ MIGRATIONS: list = [
     _migration_005_conflict_reviews,
     _migration_006_sessions_status_check,
     _migration_007_bookmarks,
-    _migration_008_bookmark_kinds_and_notes,
+    _migration_008_trigram_search,
+    _migration_009_bookmark_kinds_and_notes,
 ]
 
 assert len(MIGRATIONS) == SCHEMA_VERSION, (
