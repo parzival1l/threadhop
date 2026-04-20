@@ -1084,7 +1084,8 @@ If you find contradictions, append conflict entries to: observations/abc123.json
 ```
 
 **The reflector prompt** lives at `~/.config/threadhop/prompts/reflector.md`
-(alongside `observer.md`). It constrains:
+(or bundled with the app at `prompts/reflector.md`, alongside `observer.md`).
+It constrains:
 
 1. **Append-only**: Same rules as observer — forward-only, no deletions.
 2. **One JSON line per conflict**: Each conflict is a self-contained entry.
@@ -1097,14 +1098,19 @@ If you find contradictions, append conflict entries to: observations/abc123.json
 **Conflict entry format:**
 
 ```jsonl
-{"type":"conflict","text":"REST vs gRPC scope overlap — session abc decided REST for client API, session def decided gRPC for all services","refs":["abc123","def456"],"topic":"api-protocol","session":"abc123","project":"atlas","ts":"2026-04-14T12:00:00Z"}
+{"type":"conflict","text":"REST vs gRPC scope overlap — session abc decided REST for client API, session def decided gRPC for all services","refs":["abc123","def456"],"topic":"api-protocol","ts":"2026-04-14T12:00:00Z"}
 ```
 
 Fields:
+- `type`: always `"conflict"`
+- `text`: concise explanation of the contradiction
 - `refs`: array of session IDs involved in the contradiction
 - `topic`: semantic grouping key (helps dedup and display)
-- `session`: the session this entry lives in (where the reflector was triggered)
-- Other fields same as observer entries
+- `ts`: ISO 8601 timestamp
+
+The conflict entry does **not** include inline `session` or `project` fields.
+The session is implied by which observation file the entry was appended to,
+and project context comes from SQLite session mapping.
 
 **Trigger mechanism — observer spawns reflector:**
 
