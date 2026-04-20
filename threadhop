@@ -41,6 +41,7 @@ import cli_queries  # noqa: E402
 import handoff as handoff_mod  # noqa: E402
 import observation_queries  # noqa: E402
 import observer  # noqa: E402
+import search_queries  # noqa: E402
 
 
 def get_available_themes():
@@ -2006,6 +2007,7 @@ class SearchResultPage:
     limit: int
     offset: int
     elapsed_ms: float
+    used_fuzzy_fallback: bool = False
 
     @property
     def loaded_count(self) -> int:
@@ -2135,6 +2137,100 @@ def _build_search_filters(spec: SearchQuerySpec) -> tuple[list[str], dict]:
         params["until_ts"] = spec.until_ts
 
     return clauses, params
+
+
+def _search_trigram_fallback_page(
+    conn: sqlite3.Connection,
+    spec: SearchQuerySpec,
+    *,
+    limit: int,
+    offset: int,
+    where_sql: str,
+    base_params: dict,
+    timer_start: float,
+) -> SearchResultPage:
+    """Return a paged fuzzy-fallback result set for a zero-hit query."""
+    trigram_expr = search_queries._build_trigram_match_expr(list(spec.terms))
+    if not trigram_expr:
+        return SearchResultPage(
+            rows=[],
+            total_count=0,
+            limit=limit,
+            offset=offset,
+            elapsed_ms=(perf_counter() - timer_start) * 1000,
+            used_fuzzy_fallback=False,
+        )
+
+    candidate_sql = (
+        "SELECT m.uuid AS uuid, m.session_id AS session_id, "
+        "m.role AS role, m.timestamp AS timestamp, "
+        "m.text AS text, "
+        "s.custom_name AS custom_name, s.project AS project, "
+        "s.session_path AS session_path, "
+        "bm25(messages_fts_trigram) AS trigram_rank "
+        "FROM messages_fts_trigram "
+        "JOIN messages m ON m.rowid = messages_fts_trigram.rowid "
+        "LEFT JOIN sessions s ON s.session_id = m.session_id "
+        "WHERE messages_fts_trigram MATCH :q"
+        f"{where_sql} "
+        "ORDER BY trigram_rank "
+        "LIMIT :candidate_lim"
+    )
+    params = dict(base_params)
+    params["q"] = trigram_expr
+    params["candidate_lim"] = max(limit * 4, 200)
+
+    try:
+        candidates = db.query_all(conn, candidate_sql, params)
+    except sqlite3.OperationalError:
+        return SearchResultPage(
+            rows=[],
+            total_count=0,
+            limit=limit,
+            offset=offset,
+            elapsed_ms=(perf_counter() - timer_start) * 1000,
+            used_fuzzy_fallback=False,
+        )
+
+    scored: list[tuple[float, float, dict, str | None]] = []
+    for row in candidates:
+        result = search_queries._score_candidate_row(row, list(spec.terms))
+        if result is None:
+            continue
+        score, highlight_term = result
+        trigram_rank = float(row.get("trigram_rank") or 0.0)
+        scored.append((score, trigram_rank, row, highlight_term))
+
+    scored.sort(key=lambda item: (-item[0], item[1], item[2].get("timestamp") or ""))
+
+    all_rows: list[dict] = []
+    for score, _, row, highlight_term in scored:
+        all_rows.append(
+            {
+                "uuid": row.get("uuid"),
+                "session_id": row.get("session_id"),
+                "role": row.get("role"),
+                "timestamp": row.get("timestamp"),
+                "snippet": search_queries._build_fallback_snippet(
+                    str(row.get("text") or ""),
+                    highlight_term,
+                ),
+                "custom_name": row.get("custom_name"),
+                "project": row.get("project"),
+                "session_path": row.get("session_path"),
+                "score": score,
+            }
+        )
+
+    page_rows = all_rows[offset:offset + limit]
+    return SearchResultPage(
+        rows=page_rows,
+        total_count=len(all_rows),
+        limit=limit,
+        offset=offset,
+        elapsed_ms=(perf_counter() - timer_start) * 1000,
+        used_fuzzy_fallback=bool(all_rows),
+    )
 
 
 def search_messages(
@@ -2278,11 +2374,13 @@ def search_messages(
     params["off"] = offset
 
     try:
-        total_row = db.query_one(
-            conn,
-            count_sql,
-            {k: v for k, v in params.items() if k not in {"lim", "off", "mstart", "mend", "plain_query", "recent_cutoff"}},
-        ) or {}
+        count_params = {
+            k: v
+            for k, v in params.items()
+            if k not in {"lim", "off", "mstart", "mend", "plain_query", "recent_cutoff"}
+        }
+        total_row = db.query_one(conn, count_sql, count_params) or {}
+        total_count = int(total_row.get("total_count") or 0)
         rows = db.query_all(conn, page_sql, params)
     except sqlite3.OperationalError:
         # Malformed expressions still slip through on edge cases
@@ -2295,9 +2393,20 @@ def search_messages(
             elapsed_ms=0.0,
         )
 
+    if total_count == 0 and spec.terms:
+        return _search_trigram_fallback_page(
+            conn,
+            spec,
+            limit=limit,
+            offset=offset,
+            where_sql=where_sql,
+            base_params=base_params,
+            timer_start=timer_start,
+        )
+
     return SearchResultPage(
         rows=rows,
-        total_count=int(total_row.get("total_count") or 0),
+        total_count=total_count,
         limit=limit,
         offset=offset,
         elapsed_ms=(perf_counter() - timer_start) * 1000,
@@ -2309,19 +2418,19 @@ def _render_snippet(snippet: str) -> Text:
     out = Text()
     remaining = snippet or ""
     while True:
-        i = remaining.find(_FTS_MATCH_START)
+        i = remaining.find(search_queries.FTS_MATCH_START)
         if i < 0:
             out.append(remaining)
             break
         out.append(remaining[:i])
-        remaining = remaining[i + len(_FTS_MATCH_START):]
-        j = remaining.find(_FTS_MATCH_END)
+        remaining = remaining[i + len(search_queries.FTS_MATCH_START):]
+        j = remaining.find(search_queries.FTS_MATCH_END)
         if j < 0:
             # Unterminated — highlight the rest and stop.
             out.append(remaining, style="bold black on yellow")
             break
         out.append(remaining[:j], style="bold black on yellow")
-        remaining = remaining[j + len(_FTS_MATCH_END):]
+        remaining = remaining[j + len(search_queries.FTS_MATCH_END):]
     return out
 
 
@@ -2497,7 +2606,8 @@ class SearchScreen(ModalScreen):
             container.border_title = "Search"
             yield Input(
                 placeholder=(
-                    "Search — filters: project: session:current since: until:"
+                    "Search — prefix first, fuzzy fallback; "
+                    "filters: project: session:current since: until:"
                 ),
                 id="search-input",
             )
@@ -2571,6 +2681,8 @@ class SearchScreen(ModalScreen):
             f"{loaded:>{count_width}} of {page.total_count} {noun}",
             f"{page.elapsed_ms:>6.1f} ms",
         ]
+        if page.used_fuzzy_fallback:
+            parts.append("fuzzy fallback")
         if loaded < page.total_count:
             parts.append("more load as you scroll")
         status.update("  •  ".join(parts))
