@@ -17,6 +17,7 @@ The project is expanding from a transcript viewer into a cross-session context m
 
 # CLI subcommands (all accept --project / --session)
 ./threadhop tag <status>            # backlog|in_progress|in_review|done|archived
+./threadhop bookmark [kind]         # bookmark|research against latest msg or --message <uuid>
 ./threadhop todos                   # open TODOs from observations
 ./threadhop decisions               # decisions extracted by observer
 ./threadhop observations            # raw observation JSONL, newest first
@@ -97,5 +98,6 @@ Every message line has native fields useful for indexing:
 
 ## In Progress
 
+- Chat-side bookmark ingest uses `threadhop bookmark [bookmark|research]` and defaults to the latest message in the current detected session
 - Skill plugin `/threadhop:handoff <session_id>` sits on top of the observer/reflector pipeline and is still being assembled
 - See `docs/DESIGN-DECISIONS.md` for ADRs and the phase roadmap, and `docs/TASKS.md` for open tasks

@@ -40,7 +40,7 @@ DB_PATH = DB_DIR / "sessions.db"
 # --- Schema version ---
 # Each migration N in MIGRATIONS moves the DB from version N to N+1.
 # The DB's current version lives in PRAGMA user_version.
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 # --- Migrations -----------------------------------------------------------
@@ -361,7 +361,7 @@ def _migration_007_bookmarks(conn: sqlite3.Connection) -> None:
     :class:`models.Bookmark` shape declared for this table in
     ``models.py`` (task #24's model/schema lockstep rule). The tag
     *editor UX* is deferred — tracked separately — so the column exists
-    but only ``label`` has a TUI surface in this migration's companion
+    but only ``note`` has a TUI surface in this migration's companion
     commit.
     """
     conn.execute(
@@ -369,7 +369,9 @@ def _migration_007_bookmarks(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS bookmarks (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             message_uuid TEXT NOT NULL UNIQUE,
-            label        TEXT,
+            note         TEXT,
+            kind         TEXT NOT NULL DEFAULT 'bookmark'
+                CHECK (kind IN ('bookmark', 'research')),
             tags         TEXT NOT NULL DEFAULT '[]',
             created_at   REAL NOT NULL,
             FOREIGN KEY (message_uuid) REFERENCES messages(uuid)
@@ -380,6 +382,77 @@ def _migration_007_bookmarks(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_bookmarks_created_at "
         "ON bookmarks(created_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_bookmarks_kind_created_at "
+        "ON bookmarks(kind, created_at)"
+    )
+
+
+def _migration_008_bookmark_kinds_and_notes(conn: sqlite3.Connection) -> None:
+    """Evolve bookmarks from a TUI label into shared kind + note fields.
+
+    Task #59 will eventually replace the built-in ``kind`` enum with SQL-backed
+    arbitrary categories. This migration keeps today's ingest path stable by:
+
+    - renaming legacy ``label`` -> ``note`` so the data model is chat/TUI-neutral
+    - seeding every existing row as ``kind='bookmark'``
+    - retaining the one-bookmark-per-message invariant for the existing toggle UX
+
+    SQLite cannot add a CHECK constraint to an existing column in place, so we
+    rebuild the table inside the migration transaction.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(bookmarks)").fetchall()}
+    if "note" in cols and "kind" in cols and "label" not in cols:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bookmarks_kind_created_at "
+            "ON bookmarks(kind, created_at)"
+        )
+        return
+
+    note_expr = "note" if "note" in cols else ("label" if "label" in cols else "NULL")
+    kind_expr = "kind" if "kind" in cols else "'bookmark'"
+    tags_expr = "tags" if "tags" in cols else "'[]'"
+
+    conn.execute(
+        """
+        CREATE TABLE bookmarks_v2 (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_uuid TEXT NOT NULL UNIQUE,
+            note         TEXT,
+            kind         TEXT NOT NULL DEFAULT 'bookmark'
+                CHECK (kind IN ('bookmark', 'research')),
+            tags         TEXT NOT NULL DEFAULT '[]',
+            created_at   REAL NOT NULL,
+            FOREIGN KEY (message_uuid) REFERENCES messages(uuid)
+                ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        f"""
+        INSERT INTO bookmarks_v2 (
+            id, message_uuid, note, kind, tags, created_at
+        )
+        SELECT
+            id,
+            message_uuid,
+            {note_expr},
+            {kind_expr},
+            {tags_expr},
+            created_at
+        FROM bookmarks
+        """
+    )
+    conn.execute("DROP TABLE bookmarks")
+    conn.execute("ALTER TABLE bookmarks_v2 RENAME TO bookmarks")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_bookmarks_created_at "
+        "ON bookmarks(created_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_bookmarks_kind_created_at "
+        "ON bookmarks(kind, created_at)"
     )
 
 
@@ -392,6 +465,7 @@ MIGRATIONS: list = [
     _migration_005_conflict_reviews,
     _migration_006_sessions_status_check,
     _migration_007_bookmarks,
+    _migration_008_bookmark_kinds_and_notes,
 ]
 
 assert len(MIGRATIONS) == SCHEMA_VERSION, (
@@ -808,6 +882,13 @@ SESSION_STATUS_ORDER: list[str] = [
     "done",
     "archived",
 ]
+
+BOOKMARK_KIND_ORDER: list[str] = [
+    "bookmark",
+    "research",
+]
+
+_BOOKMARK_NOTE_UNSET = object()
 
 
 def get_session(
@@ -1352,17 +1433,133 @@ def _decode_bookmark_tags(row: dict | None) -> dict | None:
     return row
 
 
+def _normalize_bookmark_kind(kind: str) -> str:
+    """Validate and normalize the built-in bookmark class name."""
+    clean = (kind or "").strip().lower()
+    if clean not in BOOKMARK_KIND_ORDER:
+        raise ValueError(
+            f"invalid bookmark kind {kind!r}; "
+            f"expected one of {BOOKMARK_KIND_ORDER}"
+        )
+    return clean
+
+
+def _normalize_bookmark_note(note: str | None) -> str | None:
+    """Trim a free-text note; blank strings collapse to NULL."""
+    clean = note.strip() if note else ""
+    return clean or None
+
+
 def get_bookmark(
     conn: sqlite3.Connection, message_uuid: str
 ) -> dict | None:
     """Return the bookmark row for ``message_uuid`` or None."""
     row = query_one(
         conn,
-        "SELECT id, message_uuid, label, tags, created_at FROM bookmarks "
+        "SELECT id, message_uuid, note, kind, tags, created_at FROM bookmarks "
         "WHERE message_uuid = ?",
         (message_uuid,),
     )
     return _decode_bookmark_tags(row)
+
+
+def get_message(
+    conn: sqlite3.Connection,
+    message_uuid: str,
+    *,
+    session_id: str | None = None,
+) -> dict | None:
+    """Return one message row, optionally scoped to a specific session."""
+    sql = (
+        "SELECT uuid, session_id, role, text, timestamp, cwd, parent_uuid, "
+        "       is_sidechain, message_id "
+        "FROM messages WHERE uuid = ?"
+    )
+    params: list[str] = [message_uuid]
+    if session_id is not None:
+        sql += " AND session_id = ?"
+        params.append(session_id)
+    return query_one(conn, sql, tuple(params))
+
+
+def get_latest_message(
+    conn: sqlite3.Connection,
+    session_id: str,
+) -> dict | None:
+    """Return the newest indexed message for ``session_id``.
+
+    Uses ``rowid`` rather than ``timestamp`` as the primary ordering key so the
+    "latest visible message" matches transcript append order even when multiple
+    rows share the same second-level timestamp.
+    """
+    return query_one(
+        conn,
+        "SELECT uuid, session_id, role, text, timestamp, cwd, parent_uuid, "
+        "       is_sidechain, message_id "
+        "FROM messages WHERE session_id = ? "
+        "ORDER BY rowid DESC LIMIT 1",
+        (session_id,),
+    )
+
+
+def resolve_bookmark_target(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    message_uuid: str | None = None,
+) -> dict | None:
+    """Resolve a bookmark target to one concrete indexed message row."""
+    if message_uuid:
+        return get_message(conn, message_uuid, session_id=session_id)
+    return get_latest_message(conn, session_id)
+
+
+def upsert_bookmark(
+    conn: sqlite3.Connection,
+    message_uuid: str,
+    *,
+    kind: str = "bookmark",
+    note: str | None | object = _BOOKMARK_NOTE_UNSET,
+    created_at: float | None = None,
+) -> dict:
+    """Create or update the shared bookmark record for one message.
+
+    This is the forward-compatible ingest primitive used by chat commands today
+    and by richer UIs later. Unlike ``toggle_bookmark``, it is deterministic:
+    the row exists after the call and carries the requested built-in class.
+    """
+    kind = _normalize_bookmark_kind(kind)
+    ts = created_at if created_at is not None else datetime.now().timestamp()
+    existing = get_bookmark(conn, message_uuid)
+    if existing is None:
+        clean_note = None if note is _BOOKMARK_NOTE_UNSET else _normalize_bookmark_note(note)
+        cur = conn.execute(
+            "INSERT INTO bookmarks (message_uuid, note, kind, tags, created_at) "
+            "VALUES (?, ?, ?, '[]', ?)",
+            (message_uuid, clean_note, kind, ts),
+        )
+        return {
+            "id": cur.lastrowid,
+            "message_uuid": message_uuid,
+            "note": clean_note,
+            "kind": kind,
+            "tags": [],
+            "created_at": ts,
+        }
+
+    clean_note = (
+        existing.get("note")
+        if note is _BOOKMARK_NOTE_UNSET
+        else _normalize_bookmark_note(note)
+    )
+    conn.execute(
+        "UPDATE bookmarks SET note = ?, kind = ?, created_at = ? WHERE id = ?",
+        (clean_note, kind, ts, existing["id"]),
+    )
+    existing["note"] = clean_note
+    existing["kind"] = kind
+    existing["created_at"] = ts
+    return existing
 
 
 def toggle_bookmark(
@@ -1372,11 +1569,10 @@ def toggle_bookmark(
 ) -> dict | None:
     """Toggle a bookmark on ``message_uuid``.
 
-    Returns the new bookmark dict on create, or ``None`` on delete so
-    callers can show the right toast ("Bookmarked" vs "Removed"). New
-    rows start with an empty tag list — tag editing is a follow-up to
-    this feature, but the column exists so the schema matches
-    :class:`models.Bookmark`.
+    Returns the new bookmark dict on create, or ``None`` on delete so callers
+    can show the right toast ("Bookmarked" vs "Removed"). New rows start as the
+    built-in ``bookmark`` kind with no note; richer category editing is a
+    follow-up to this ingest path.
     """
     existing = get_bookmark(conn, message_uuid)
     if existing is not None:
@@ -1384,17 +1580,31 @@ def toggle_bookmark(
         return None
     ts = created_at if created_at is not None else datetime.now().timestamp()
     cur = conn.execute(
-        "INSERT INTO bookmarks (message_uuid, label, tags, created_at) "
-        "VALUES (?, NULL, '[]', ?)",
+        "INSERT INTO bookmarks (message_uuid, note, kind, tags, created_at) "
+        "VALUES (?, NULL, 'bookmark', '[]', ?)",
         (message_uuid, ts),
     )
     return {
         "id": cur.lastrowid,
         "message_uuid": message_uuid,
-        "label": None,
+        "note": None,
+        "kind": "bookmark",
         "tags": [],
         "created_at": ts,
     }
+
+
+def set_bookmark_note(
+    conn: sqlite3.Connection,
+    bookmark_id: int,
+    note: str | None,
+) -> None:
+    """Update a bookmark's note. Empty strings collapse to NULL."""
+    clean = _normalize_bookmark_note(note)
+    conn.execute(
+        "UPDATE bookmarks SET note = ? WHERE id = ?",
+        (clean, bookmark_id),
+    )
 
 
 def set_bookmark_label(
@@ -1402,12 +1612,8 @@ def set_bookmark_label(
     bookmark_id: int,
     label: str | None,
 ) -> None:
-    """Update a bookmark's label. Empty strings collapse to NULL."""
-    clean = label.strip() if label else ""
-    conn.execute(
-        "UPDATE bookmarks SET label = ? WHERE id = ?",
-        (clean or None, bookmark_id),
-    )
+    """Backward-compatible alias for the pre-note bookmark editor."""
+    set_bookmark_note(conn, bookmark_id, label)
 
 
 def delete_bookmark(conn: sqlite3.Connection, bookmark_id: int) -> None:
@@ -1422,12 +1628,12 @@ def list_bookmarks(
 ) -> list[dict]:
     """Return bookmarks joined with message + session metadata, newest first.
 
-    ``query`` is an optional case-insensitive substring filter applied
-    across the label, the message body, and the session's project /
+    ``query`` is an optional case-insensitive substring filter applied across
+    the note, kind, the message body, and the session's project /
     custom name — mirrors the single filter input in the browser modal.
     """
     sql = (
-        "SELECT b.id, b.message_uuid, b.label, b.tags, b.created_at, "
+        "SELECT b.id, b.message_uuid, b.note, b.kind, b.tags, b.created_at, "
         "       m.session_id, m.role, m.text, m.timestamp, "
         "       s.custom_name, s.project "
         "FROM bookmarks b "
@@ -1437,11 +1643,11 @@ def list_bookmarks(
     params: tuple = ()
     if query:
         sql += (
-            "WHERE b.label LIKE ? OR m.text LIKE ? "
+            "WHERE b.note LIKE ? OR b.kind LIKE ? OR m.text LIKE ? "
             "OR s.custom_name LIKE ? OR s.project LIKE ? "
         )
         like = f"%{query}%"
-        params = (like, like, like, like)
+        params = (like, like, like, like, like)
     sql += "ORDER BY b.created_at DESC LIMIT ?"
     params = params + (limit,)
     rows = query_all(conn, sql, params)

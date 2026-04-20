@@ -1476,11 +1476,12 @@ CREATE TABLE index_state (
 CREATE TABLE bookmarks (
     id            INTEGER PRIMARY KEY,
     message_uuid  TEXT NOT NULL,
-    session_id    TEXT NOT NULL,
-    label         TEXT,
+    note          TEXT,
+    kind          TEXT NOT NULL DEFAULT 'bookmark',
+        -- bookmark | research (task #59 later generalizes this)
     tags          TEXT,               -- JSON array
     created_at    REAL NOT NULL,
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+    FOREIGN KEY (message_uuid) REFERENCES messages(uuid)
 );
 
 -- Project memory ledger
@@ -1517,7 +1518,7 @@ CREATE TABLE observation_state (
 
 ## Skill Plugin Architecture
 
-### Principle: Four skills + bash passthrough for tagging, clear boundaries
+### Principle: Four skills + bash passthrough for tagging/bookmark ingest, clear boundaries
 
 Skills are for operations invoked mid-conversation from Claude Code. The TUI
 handles everything visual and instantaneous. The CLI handles queries and tagging
@@ -1536,7 +1537,9 @@ threadhop/
     insights.md         # /threadhop:insights
 
 # Tagging: !threadhop tag <status> (bash passthrough, no skill needed)
-# Optional: ~/.claude/hooks/threadhop-tag.sh for /tag <status> ergonomics — see README
+# Bookmark ingest: !threadhop bookmark [bookmark|research] [--note "..."]
+# Optional: ~/.claude/hooks/threadhop-tag.sh and threadhop-bookmark.sh for
+# /tag, /bookmark, /research ergonomics — see README
 ```
 
 ### What lives where
@@ -1546,7 +1549,7 @@ threadhop/
 | Search | TUI | Per-keystroke instant, visual results |
 | Message select + copy | TUI | Visual selection, clipboard transport |
 | Message export to .md | TUI | Visual selection, writes to /tmp |
-| Bookmark | TUI | Visual selection, one-key action |
+| Bookmark ingest | CLI + `!` bash passthrough + TUI | Shared primitive targets a session/message; TUI keeps a lightweight toggle seam |
 | Tag session | TUI + CLI + `!` bash passthrough | Three entry points, one DB (ADR-013) |
 | Observation queries | CLI | `threadhop todos`, `threadhop decisions` |
 | Start observation | Skill + TUI | Per-session opt-in, spawns background process |
@@ -1769,7 +1772,7 @@ For larger exports:
 - [ ] `O` key: resume observation on stopped session (ADR-021)
 
 ### Phase 5: Memory + Bookmarks
-- [ ] Build bookmark system (TUI feature)
+- [ ] Build bookmark system (shared ingest primitive + TUI/browser surfaces)
 - [ ] Explicit annotation detection (ADR:, DECISION:, TODO: markers)
 - [ ] Project memory markdown rendering from observations
 
