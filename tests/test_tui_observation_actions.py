@@ -79,20 +79,27 @@ def test_build_observe_command_targets_current_script():
     assert argv == [str(THREADHOP.resolve()), "observe", "--session", "sess-1"]
 
 
-def test_format_session_label_adds_observation_indicator():
+def test_render_session_label_text_adds_observation_indicator():
     ns = _load_threadhop_ns()
     session_data = {
         "modified": time.time(),
         "project": "proj",
         "title": "demo",
-        "is_observed": True,
+        "has_observations": True,
     }
 
-    observed = ns["format_session_label"](session_data, None, "○")
-    plain = ns["format_session_label"]({**session_data, "is_observed": False}, None, "○")
+    observed = ns["render_session_label_text"](session_data)
+    plain = ns["render_session_label_text"](
+        {**session_data, "has_observations": False}
+    )
 
-    assert ns["OBS_INDICATOR"] in observed
-    assert ns["OBS_INDICATOR"] not in plain
+    indicator = (
+        ns["OBSERVATION_MARKER"]
+        if ns["_supports_observation_emoji"]()
+        else ns["OBSERVATION_MARKER_FALLBACK"]
+    )
+    assert indicator in observed.plain
+    assert indicator not in plain.plain
 
 
 def test_action_observe_session_copies_observation_path(monkeypatch):
@@ -107,10 +114,10 @@ def test_action_observe_session_copies_observation_path(monkeypatch):
         _FakeItem(
             {
                 "session_id": "sess-1",
-                "is_observed": True,
-                "observation_obs_path": "/tmp/sess-1.jsonl",
+                "has_observations": True,
             }
-        )
+        ),
+        state={"entry_count": 2, "obs_path": "/tmp/sess-1.jsonl"},
     )
 
     ns["ClaudeSessions"].action_observe_session(app)
@@ -121,7 +128,7 @@ def test_action_observe_session_copies_observation_path(monkeypatch):
 
 def test_action_observe_session_prompts_to_start_when_unobserved():
     ns = _load_threadhop_ns()
-    app = _FakeApp(_FakeItem({"session_id": "sess-1", "is_observed": False}))
+    app = _FakeApp(_FakeItem({"session_id": "sess-1", "has_observations": False}))
 
     ns["ClaudeSessions"].action_observe_session(app)
 
@@ -140,8 +147,7 @@ def test_action_resume_observation_prompts_when_stopped_and_observed():
         _FakeItem(
             {
                 "session_id": "sess-1",
-                "is_observed": True,
-                "observation_entry_count": 4,
+                "has_observations": True,
             }
         ),
         state={"entry_count": 4, "observer_pid": None, "status": "stopped"},

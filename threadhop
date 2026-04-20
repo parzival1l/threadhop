@@ -330,10 +330,11 @@ def clear_recent_searches(config: dict | None) -> None:
 
 # --- Configuration ---
 DISPLAY_NAME_WIDTH = 22
+OBSERVATION_MARKER = "🗒"
+OBSERVATION_MARKER_FALLBACK = "≡"
 MAX_SESSIONS = 50
 REFRESH_INTERVAL = 5
 SPINNER_INTERVAL = 0.25
-OBS_INDICATOR = "≡"
 SEARCH_PAGE_SIZE = 50
 MAX_RECENT_SEARCHES = 8
 
@@ -616,6 +617,35 @@ def format_age(timestamp: float) -> str:
         return f"{int(age / 86400)}d"
 
 
+def _supports_observation_emoji() -> bool:
+    """Return whether the current terminal can safely encode the emoji marker."""
+    if os.environ.get("THREADHOP_ASCII_OBSERVATION_MARKER") == "1":
+        return False
+    encoding = sys.stdout.encoding or "utf-8"
+    try:
+        OBSERVATION_MARKER.encode(encoding)
+    except (LookupError, UnicodeEncodeError):
+        return False
+    return True
+
+
+def _observation_marker_text() -> Text:
+    """Return the ADR-021 observed-session marker."""
+    if _supports_observation_emoji():
+        return Text(OBSERVATION_MARKER, style="dim")
+    return Text(OBSERVATION_MARKER_FALLBACK, style="dim cyan")
+
+
+def _session_display_name(session_data: dict, custom_name: str | None) -> str:
+    """Resolve the user-facing session label before sidebar truncation."""
+    title = session_data.get("title", "")
+    if custom_name:
+        return custom_name
+    if title:
+        return title
+    return session_data["project"]
+
+
 def copy_to_clipboard(text: str) -> bool:
     """Copy text to the system clipboard."""
     try:
@@ -637,24 +667,46 @@ def build_observe_command(session_id: str) -> list[str]:
     return [str(Path(__file__).resolve()), "observe", "--session", session_id]
 
 
-def format_session_label(
+def render_session_label_text(
     session_data: dict,
-    custom_name: str | None,
-    status: str,
-) -> str:
-    """Render one sidebar row, including the observation indicator."""
-    age_str = format_age(session_data["modified"])
-    project = session_data["project"]
-    title = session_data.get("title", "")
-    if custom_name:
-        display = custom_name
-    elif title:
-        display = title
+    *,
+    custom_name: str | None = None,
+    spinner_frame: int = 0,
+) -> Text:
+    """Build the Rich label for one sidebar session row."""
+    is_working = session_data.get("is_working", False)
+    is_active = session_data.get("is_active", False)
+    if is_working:
+        status = SPINNER_FRAMES[spinner_frame % len(SPINNER_FRAMES)]
+    elif is_active:
+        status = "●"
     else:
-        display = project
-    display = f"{display[:DISPLAY_NAME_WIDTH]:<{DISPLAY_NAME_WIDTH}}"
-    obs = OBS_INDICATOR if session_data.get("is_observed") else " "
-    return f"{status} {display} {obs} {age_str:>4}"
+        status = "○"
+
+    display = _session_display_name(session_data, custom_name)
+    indicator = (
+        _observation_marker_text()
+        if session_data.get("has_observations")
+        else None
+    )
+    reserved_width = 0
+    if indicator is not None:
+        reserved_width = 1 + indicator.cell_len
+    name_width = max(DISPLAY_NAME_WIDTH - reserved_width, 0)
+
+    middle = Text(display[:name_width])
+    if indicator is not None:
+        middle.append(" ")
+        middle.append_text(indicator)
+    if middle.cell_len < DISPLAY_NAME_WIDTH:
+        middle.append(" " * (DISPLAY_NAME_WIDTH - middle.cell_len))
+
+    age_str = format_age(session_data["modified"])
+    text = Text()
+    text.append(f"{status} ")
+    text.append_text(middle)
+    text.append(f" {age_str:>4}")
+    return text
 
 
 class SessionItem(ListItem):
@@ -674,41 +726,55 @@ class SessionItem(ListItem):
         super().__init__()
 
     def compose(self) -> ComposeResult:
-        is_working = self.session_data.get("is_working", False)
-        is_active = self.session_data.get("is_active", False)
+        label = Static(self._render_label(), classes="session-label")
+        self._sync_label_classes(label)
+        yield label
 
-        if is_working:
-            status = SPINNER_FRAMES[self.spinner_frame % len(SPINNER_FRAMES)]
-        elif is_active:
-            status = "●"
-        else:
-            status = "○"
-
-        label = Static(
-            format_session_label(self.session_data, self.custom_name, status),
-            classes="session-label",
+    def _render_label(self) -> Text:
+        return render_session_label_text(
+            self.session_data,
+            custom_name=self.custom_name,
+            spinner_frame=self.spinner_frame,
         )
+
+    def _sync_label_classes(self, label: Static) -> None:
         if self.is_unread:
             label.add_class("unread")
-        if is_working:
+        else:
+            label.remove_class("unread")
+
+        if self.session_data.get("is_working", False):
             label.add_class("working")
-        elif is_active:
+        else:
+            label.remove_class("working")
+
+        if (
+            self.session_data.get("is_active", False)
+            and not self.session_data.get("is_working", False)
+        ):
             label.add_class("active")
+        else:
+            label.remove_class("active")
+
         if self.session_data.get("status") == "archived":
             label.add_class("archived")
-        yield label
+        else:
+            label.remove_class("archived")
+
+    def refresh_label(self) -> None:
+        try:
+            label = self.query_one(".session-label", Static)
+            label.update(self._render_label())
+            self._sync_label_classes(label)
+        except Exception:
+            pass
 
     def update_spinner(self, frame: int) -> None:
         """Update spinner animation frame"""
         if not self.session_data.get("is_working"):
             return
         self.spinner_frame = frame
-        status = SPINNER_FRAMES[frame % len(SPINNER_FRAMES)]
-        try:
-            label = self.query_one(".session-label", Static)
-            label.update(format_session_label(self.session_data, self.custom_name, status))
-        except:
-            pass
+        self.refresh_label()
 
 
 
@@ -3811,34 +3877,22 @@ class ClaudeSessions(App):
             # in-memory self.sessions for display.
             pass
 
-        # Stamp each session dict with its persisted status so the UI can
-        # group by it. Read in bulk after the upsert so new sessions get
-        # the DEFAULT 'active' from the column definition.
+        # Stamp each session dict with its persisted sidebar metadata in
+        # one bulk read after the upsert so new sessions get the DEFAULT
+        # 'active' status and the ADR-021 observation bit without
+        # per-session queries during the 5-second refresh cycle.
         try:
-            statuses = db.get_session_statuses(self.conn)
+            sidebar_state = db.get_session_sidebar_metadata(self.conn)
             for s in self.sessions:
-                s["status"] = statuses.get(s["session_id"], "active")
+                state = sidebar_state.get(s["session_id"], {})
+                s["status"] = state.get("status", "active")
+                s["has_observations"] = bool(
+                    state.get("has_observations", False)
+                )
         except Exception:
             for s in self.sessions:
                 s.setdefault("status", "active")
-
-        try:
-            observed = {
-                row["session_id"]: row
-                for row in db.get_observed_sessions(self.conn)
-            }
-            for s in self.sessions:
-                row = observed.get(s["session_id"])
-                s["is_observed"] = bool(row)
-                s["observation_entry_count"] = int(row["entry_count"]) if row else 0
-                s["observation_status"] = row.get("status") if row else None
-                s["observation_obs_path"] = row.get("obs_path") if row else None
-        except Exception:
-            for s in self.sessions:
-                s["is_observed"] = False
-                s["observation_entry_count"] = 0
-                s["observation_status"] = None
-                s["observation_obs_path"] = None
+                s.setdefault("has_observations", False)
 
         self._apply_stable_ordering()
         self._update_session_list(force_rebuild)
@@ -3930,20 +3984,13 @@ class ClaudeSessions(App):
                 if isinstance(item, SessionStatusHeader):
                     out.append(("h", item.status))
                 elif isinstance(item, SessionItem):
-                    sid = item.session_data.get("session_id", "")
-                    observed = "1" if item.session_data.get("is_observed") else "0"
-                    out.append(("s", f"{sid}:{observed}"))
+                    out.append(("s", item.session_data.get("session_id", "")))
             return out
 
-        new_fp: list[tuple[str, str]] = []
-        for kind, val in plan:
-            if kind == "header":
-                new_fp.append(("h", val))  # type: ignore[arg-type]
-                continue
-            session = val  # type: ignore[assignment]
-            sid = session.get("session_id", "")  # type: ignore[union-attr]
-            observed = "1" if session.get("is_observed") else "0"  # type: ignore[union-attr]
-            new_fp.append(("s", f"{sid}:{observed}"))
+        new_fp: list[tuple[str, str]] = [
+            ("h", val) if kind == "header" else ("s", val.get("session_id", ""))  # type: ignore[union-attr]
+            for kind, val in plan
+        ]
         current_fp = _fingerprint_children()
 
         if force_rebuild or current_fp != new_fp:
@@ -3999,29 +4046,8 @@ class ClaudeSessions(App):
                 if isinstance(item, SessionItem):
                     sid = item.session_data.get("session_id")
                     if sid in session_map:
-                        old_is_working = item.session_data.get("is_working", False)
                         item.session_data.update(session_map[sid])
-                        new_is_working = item.session_data.get("is_working", False)
-                        if new_is_working != old_is_working:
-                            item.session_data["is_working"] = new_is_working
-                            try:
-                                label = item.query_one(".session-label", Static)
-                                if new_is_working:
-                                    label.add_class("working")
-                                    item.update_spinner(self._spinner_frame)
-                                else:
-                                    label.remove_class("working")
-                                    session = item.session_data
-                                    status = "●" if session.get("is_active") else "○"
-                                    label.update(
-                                        format_session_label(
-                                            session,
-                                            item.custom_name,
-                                            status,
-                                        )
-                                    )
-                            except:
-                                pass
+                        item.refresh_label()
 
     def refresh_transcript(self) -> None:
         transcript = self.query_one("#transcript-scroll", TranscriptView)
@@ -4231,13 +4257,11 @@ class ClaudeSessions(App):
         session = item.session_data
         session_id = session.get("session_id", "")
         state = self._refresh_session_observation(session_id)
-        is_observed = bool(session.get("is_observed"))
+        is_observed = bool(session.get("has_observations"))
         if state is not None and int(state.get("entry_count") or 0) > 0:
             is_observed = True
         if is_observed:
-            obs_path = session.get("observation_obs_path")
-            if not obs_path:
-                obs_path = state.get("obs_path") if state else None
+            obs_path = state.get("obs_path") if state else None
             if obs_path and copy_to_clipboard(str(obs_path)):
                 self.notify("Observation path copied")
             elif obs_path:
@@ -4267,8 +4291,6 @@ class ClaudeSessions(App):
         entry_count = 0
         if state is not None:
             entry_count = int(state.get("entry_count") or 0)
-        elif session.get("is_observed"):
-            entry_count = int(session.get("observation_entry_count") or 0)
         if entry_count <= 0:
             self.notify("No observations to resume", severity="warning")
             return
