@@ -5,7 +5,7 @@ plugins and their in-session entry points are distributed and loaded.
 
 **TL;DR:** ThreadHop ships as a **single plugin** (a directory with a
 `.claude-plugin/plugin.json` manifest) containing a *hybrid* of one skill
-and two slash commands, all under the `/threadhop:` namespace:
+and three slash commands, all under the `/threadhop:` namespace:
 
 - `/threadhop:handoff` — **skill** (`plugin/skills/handoff/SKILL.md`).
   Model-in-the-loop because the brief wants framing, error judgment,
@@ -16,6 +16,10 @@ and two slash commands, all under the `/threadhop:` namespace:
 - `/threadhop:tag` — **command** (`plugin/commands/tag.md`). One-line
   `!`cmd`` wrapper; its `argument-hint` enumerates valid statuses so
   users discover them from the `/` picker without memorising.
+- `/threadhop:bookmark` — **command** (`plugin/commands/bookmark.md`).
+  One-line `!`cmd`` wrapper over `threadhop bookmark`. Auto-targets the
+  latest message in the current session; optional `--note "<text>"`.
+  Writes to the shared `bookmarks` SQLite table used by the TUI.
 
 The plugin is **not self-contained** — it calls bare `threadhop` from
 `$PATH`. Users install the app (e.g. `pipx install threadhop`) and the
@@ -70,6 +74,7 @@ plugin/
 │   └── handoff/
 │       └── SKILL.md                # /threadhop:handoff — rich, model-framed
 ├── commands/
+│   ├── bookmark.md                 # /threadhop:bookmark — thin !`cmd` (latest message + --note)
 │   ├── observe.md                  # /threadhop:observe — thin !`cmd`
 │   └── tag.md                      # /threadhop:tag — thin !`cmd` with argument-hint
 └── README.md
@@ -270,6 +275,7 @@ this repo under `plugin/` and points at bare `threadhop` from `$PATH`:
 - `plugin/skills/handoff/SKILL.md` — model-framed handoff brief (task #26, merged)
 - `plugin/commands/observe.md` — `!`threadhop observe`` wrapper
 - `plugin/commands/tag.md` — `!`threadhop tag`` wrapper with discoverable `argument-hint`
+- `plugin/commands/bookmark.md` — `!`threadhop bookmark`` wrapper (auto-targets latest message in current session; optional `--note`). Writes to the shared `bookmarks` SQLite table (`db.upsert_bookmark`), the same primitive the TUI's selection-mode bookmark writes to
 
 Each file is either a 93-line skill (handoff — where the model earns
 its turn) or a ~8-line command (observe, tag — pure CLI relay).

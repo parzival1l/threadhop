@@ -8,11 +8,33 @@ points. Three things ship together under one namespace:
 | `/threadhop:handoff <session_id> [--full]` | Skill (model-in-the-loop) | Runs `threadhop handoff`, frames the brief, suppresses auto-action on TODOs |
 | `/threadhop:observe` | Command (thin `!`cmd`` wrapper) | Starts the observer for the current Claude Code session; lifetime bound to that session |
 | `/threadhop:tag <status>` | Command (thin `!`cmd`` wrapper) | Tags the current session; argument-hint enumerates valid statuses |
+| `/threadhop:bookmark [--note <text>]` | Command (thin `!`cmd`` wrapper) | Bookmarks the latest message in the current session; optional free-text note; writes to the shared `bookmarks` SQLite table that the TUI also reads |
 
-Tagging also remains available as `!threadhop tag <status>` (bash
-passthrough, zero LLM turn). The slash-command form is the discoverable
-alias — Claude Code's `/` picker renders the argument-hint so users
-don't have to memorise the status set.
+Tagging and bookmarking also remain available as `!threadhop tag <status>`
+and `!threadhop bookmark` (bash passthrough, zero LLM turn). The
+slash-command forms are the discoverable aliases — Claude Code's `/`
+picker renders the argument-hint so users don't have to memorise valid
+options (statuses for tag; the `--note` flag for bookmark).
+
+## Bookmark targeting — where the note goes
+
+`/threadhop:bookmark` calls bare `threadhop bookmark` and inherits its
+behaviour exactly:
+
+- **Session**: auto-detected by walking the parent process tree for the
+  `claude` ancestor (same mechanism as `threadhop tag`).
+- **Message**: defaults to the latest indexed message in that session.
+- **Note**: stored in `bookmarks.note` in `~/.config/threadhop/sessions.db`.
+  Blank/whitespace-only notes collapse to `NULL` via
+  `db._normalize_bookmark_note`.
+- **Idempotency**: the `bookmarks` table has `UNIQUE(message_uuid)`, so
+  bookmarking the same message twice updates the existing row rather
+  than creating a duplicate.
+
+The TUI (selection-mode `Space`/`L`), the CLI (`threadhop bookmark …`),
+the bash passthrough (`!threadhop bookmark`), and this plugin command
+all write through the same `db.upsert_bookmark` primitive. One `bookmarks`
+table, one source of truth.
 
 ## Dependency: the ThreadHop CLI must be on PATH
 
@@ -43,6 +65,7 @@ plugin/
 │   └── handoff/
 │       └── SKILL.md             # real skill — rich instructions, model frames the brief
 └── commands/
+    ├── bookmark.md              # !`threadhop bookmark`
     ├── observe.md               # !`threadhop observe`
     └── tag.md                   # !`threadhop tag` with discoverable argument-hint
 ```
@@ -81,6 +104,7 @@ plugin/
 claude --plugin-dir "$(pwd)/plugin"
 # then, inside the session:
 /threadhop:tag in_progress
+/threadhop:bookmark --note "this answer is worth remembering"
 /threadhop:observe
 /threadhop:handoff <some_other_session_id>
 ```
