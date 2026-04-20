@@ -1616,11 +1616,53 @@ class TranscriptView(VerticalScroll):
     ) -> list[tuple[str, str, str | None, str | None]]:
         """Parse JSONL file and extract displayable messages.
 
-        Returns list of (role, content, timestamp, uuid) tuples. The uuid
-        is the JSONL line's own uuid — used by the search jump-to-source
-        flow to scroll the correct widget into view.
+        Returns list of (role, content, timestamp, uuid) tuples.
+
+        Assistant rows: consecutive lines sharing the same
+        ``message.id`` (streaming chunks of one logical reply) are
+        merged into a single tuple tagged with the first chunk's uuid —
+        matching the indexer's rule (ADR-003) so the bookmarks FK into
+        ``messages.uuid`` can never see an id the indexer never stored.
+
+        Tool and tool_result rows: inherit the enclosing turn's
+        canonical uuid (the same first-chunk uuid). The indexer folds
+        tool-use abbreviations into the turn's single row and never
+        indexes tool_result user lines at all, so only the turn's uuid
+        is guaranteed present in ``messages``. Pinning tool widgets to
+        that id means bookmarking any of them toggles the turn's
+        bookmark — the same semantics the deferred turn-as-unit
+        rendering will make visually explicit (see UI-IMPROVEMENTS.md).
+
+        Genuine user rows: keep the line's own uuid; a real human
+        message ends the preceding assistant turn and flushes the
+        pending group. ``toolUseResult`` user lines do NOT flush —
+        they belong to the turn in progress.
         """
         messages = []
+        # Pending assistant group accumulates text across streaming
+        # chunks sharing a message.id, and anchors the turn's canonical
+        # uuid / timestamp for any tool or tool_result widgets emitted
+        # while the group is open. Flushed on a genuine user message,
+        # a differing message.id, or EOF.
+        pending_mid: str | None = None
+        pending_uuid: str | None = None
+        pending_ts: str | None = None
+        pending_text_parts: list[str] = []
+
+        def flush_assistant() -> None:
+            nonlocal pending_mid, pending_uuid, pending_ts, pending_text_parts
+            if pending_text_parts and pending_uuid is not None:
+                messages.append((
+                    "assistant",
+                    " ".join(pending_text_parts),
+                    pending_ts,
+                    pending_uuid,
+                ))
+            pending_mid = None
+            pending_uuid = None
+            pending_ts = None
+            pending_text_parts = []
+
         try:
             with open(session_path) as f:
                 for line in f:
@@ -1635,12 +1677,24 @@ class TranscriptView(VerticalScroll):
                             continue
 
                         if msg_type == "user":
-                            tool_result = msg.get("toolUseResult")
-                            if tool_result and isinstance(tool_result, dict):
-                                result_info = self._format_tool_result(tool_result)
-                                if result_info:
-                                    messages.append(("tool_result", result_info, timestamp, uuid))
-                            elif "toolUseResult" not in msg:
+                            if "toolUseResult" in msg:
+                                # Mid-turn event — attach to the
+                                # pending assistant turn, don't flush.
+                                tool_result = msg.get("toolUseResult")
+                                if isinstance(tool_result, dict):
+                                    result_info = self._format_tool_result(tool_result)
+                                    if result_info:
+                                        anchor_uuid = pending_uuid or uuid
+                                        anchor_ts = pending_ts or timestamp
+                                        messages.append((
+                                            "tool_result",
+                                            result_info,
+                                            anchor_ts,
+                                            anchor_uuid,
+                                        ))
+                            else:
+                                # Genuine human message — ends the turn.
+                                flush_assistant()
                                 content = msg.get("message", {}).get("content", "")
                                 if isinstance(content, list):
                                     text_parts = [
@@ -1656,29 +1710,43 @@ class TranscriptView(VerticalScroll):
                                         messages.append(("user", content, timestamp, uuid))
 
                         elif msg_type == "assistant":
+                            mid = msg.get("message", {}).get("id")
+                            # New logical message → flush the previous
+                            # group and anchor on this line's uuid.
+                            if mid is None or mid != pending_mid:
+                                flush_assistant()
+                                pending_mid = mid
+                                pending_uuid = uuid
+                                pending_ts = timestamp
+
                             content = msg.get("message", {}).get("content", [])
                             if isinstance(content, list):
-                                text_parts = []
                                 for block in content:
                                     if block.get("type") == "text":
                                         text = block.get("text", "")
                                         # Strip system-reminder tags
                                         text = SYSTEM_REMINDER_RE.sub("", text).strip()
                                         if text:
-                                            text_parts.append(text)
+                                            pending_text_parts.append(text)
                                     elif block.get("type") == "tool_use":
                                         tool_name = block.get("name", "Unknown")
                                         tool_input = block.get("input", {})
                                         tool_desc = self._format_tool_use(
                                             tool_name, tool_input
                                         )
-                                        messages.append(("tool", tool_desc, timestamp, uuid))
-                                if text_parts:
-                                    messages.append(
-                                        ("assistant", " ".join(text_parts), timestamp, uuid)
-                                    )
+                                        # Pin tool widget to the turn's
+                                        # canonical uuid so it resolves
+                                        # to the same messages row the
+                                        # indexer stores for this turn.
+                                        messages.append((
+                                            "tool",
+                                            tool_desc,
+                                            pending_ts or timestamp,
+                                            pending_uuid or uuid,
+                                        ))
                     except (json.JSONDecodeError, KeyError):
                         pass
+            flush_assistant()
         except Exception:
             pass
         return messages
@@ -2347,13 +2415,21 @@ class SearchScreen(ModalScreen):
             self._show_empty_state()
             return
 
+        # Pad dynamic numbers so the status row doesn't jitter as you type:
+        # elapsed_ms grows 4.2 → 10.7 → 100.3 chars, and `loaded` grows
+        # 1 → 10 → 100 as you scroll. Terminal fonts are monospace, so the
+        # only thing moving the layout is the format-spec width itself.
         if page.total_count == 0:
-            status.update(f"No results  •  {page.elapsed_ms:.1f} ms")
+            status.update(f"No results  •  {page.elapsed_ms:>6.1f} ms")
             return
 
         noun = "result" if page.total_count == 1 else "results"
         loaded = min(self._loaded_count, self._total_count)
-        parts = [f"{loaded} of {page.total_count} {noun}", f"{page.elapsed_ms:.1f} ms"]
+        count_width = len(str(page.total_count))
+        parts = [
+            f"{loaded:>{count_width}} of {page.total_count} {noun}",
+            f"{page.elapsed_ms:>6.1f} ms",
+        ]
         if loaded < page.total_count:
             parts.append("more load as you scroll")
         status.update("  •  ".join(parts))
@@ -4203,10 +4279,13 @@ class ClaudeSessions(App):
 
     def bookmark_toggle_selection(self) -> None:
         """Selection-mode `space`: toggle a bookmark on each selected
-        message. Messages without a stored uuid (rare — synthetic or
-        pre-index) are silently skipped; the rest flip independently so
-        a range with mixed state ends up consistent with the user's
-        intent per message."""
+        message. Widgets whose uuid isn't in the indexed ``messages``
+        table yet (synthetic, pre-index, or a race with the 5 s index
+        cycle) are skipped rather than crashing the FK. Duplicates
+        within the same selection (multiple widgets resolving to the
+        same turn uuid — e.g. tool widgets pinned to the turn's
+        canonical id) are collapsed so one press produces one toggle
+        per underlying row."""
         transcript = self.query_one("#transcript-scroll", TranscriptView)
         selected = transcript.get_selected_messages()
         if not selected:
@@ -4214,10 +4293,25 @@ class ClaudeSessions(App):
         created = 0
         removed = 0
         skipped = 0
+        seen: set[str] = set()
         with db.transaction(self.conn):
             for widget in selected:
                 uuid = getattr(widget, "_uuid", None)
                 if not uuid:
+                    skipped += 1
+                    continue
+                if uuid in seen:
+                    continue
+                seen.add(uuid)
+                # Pre-check the FK target. A missing row means the
+                # indexer hasn't caught up or the widget was emitted
+                # with an id the indexer doesn't store — skip rather
+                # than let IntegrityError bubble up through on_key.
+                row = self.conn.execute(
+                    "SELECT 1 FROM messages WHERE uuid = ? LIMIT 1",
+                    (uuid,),
+                ).fetchone()
+                if row is None:
                     skipped += 1
                     continue
                 result = db.toggle_bookmark(self.conn, uuid)
@@ -4231,7 +4325,7 @@ class ClaudeSessions(App):
         if removed:
             parts.append(f"{removed} removed")
         if skipped and not parts:
-            parts.append(f"{skipped} skipped (no uuid)")
+            parts.append(f"{skipped} skipped (not indexed yet)")
         self.notify(", ".join(parts) if parts else "No bookmarks changed")
 
     def bookmark_prompt_label(self) -> None:
