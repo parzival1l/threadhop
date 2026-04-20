@@ -142,8 +142,8 @@ and transcript header (ADR-021)._
 - [ ] **23. Research Claude Code skill plugin packaging**
   Determine how Claude Code skill plugins are distributed — directory of `.md` files in `~/.claude/skills/`? npm/pip package? Verify the plugin contract before implementing skills. _(Open Question Q4)_
 
-- [ ] **24. Implement `/threadhop:tag <status>` skill** *(blocked by: #16, #23)*
-  Instant, no LLM. Detects current session ID from process context, shells out to `threadhop tag <status>`, confirms: "Tagged this session as <status>". Third of three tag entry points. _(ADR-012, ADR-013)_
+- [ ] **24. Document `!threadhop tag <status>` bash-passthrough workflow** *(blocked by: #16, #17)*
+  Replaces the earlier `/threadhop:tag` skill. In Claude Code, the `!` prefix runs a command in the host shell with zero LLM turn. Combined with #17's auto-detection (walks the parent process tree for the `claude` CLI ancestor), `!threadhop tag backlog` inside a session tags the current session without args. Scope: (a) README section "Tagging sessions from inside Claude Code" with the one-liner and the list of valid statuses, (b) confirm `threadhop tag` prints a single tight success line (`✓ tagged <short-id> as <status>`), (c) detection failure exits `2` with the helpful error already emitted by `_resolve_cli_session()`, (d) optional stretch: sample `UserPromptSubmit` hook snippet in README for users who prefer `/tag` — document that hooks don't appear in `/` autocomplete or `/help`. Third of three tag entry points. Trade-off: no `/` autocomplete discoverability; mitigated by README + optional hook. Originally a skill (needs #23); rewriting this way drops the #23 dependency since `!` passthrough is already built into Claude Code. _(ADR-012, ADR-013)_
 
 - [ ] **25. Implement `/threadhop:context` skill** *(blocked by: #12, #23)*
   Instant, no LLM. Reads clipboard via `pbpaste`, detects ThreadHop source labels, presents the content as a clearly bounded context block in the current conversation. Bridges TUI visual selection → Claude Code injection. _(ADR-012)_
@@ -249,16 +249,14 @@ process — not independent. Uses `reflector_entry_offset` for incremental proce
                 ├──> #13 Temp export
                 └──> #27 Bookmarks (also needs #1)
 
-#15 Subcommand routing ──> #16 tag CLI ──> #17 Auto-detect session
-                                        └──> #24 /threadhop:tag skill (also needs #23)
+#15 Subcommand routing ──> #16 tag CLI ──> #17 Auto-detect session ──> #24 README + `!threadhop tag` passthrough (+ optional hook)
 
-#23 Skill packaging research ──┬──> #24 /threadhop:tag
-                                ├──> #25 /threadhop:context
+#23 Skill packaging research ──┬──> #25 /threadhop:context
                                 ├──> #26 /threadhop:handoff (runs observer first, then formats)
                                 ├──> #40 /threadhop:observe (also needs #34)
                                 └──> #41 /threadhop:insights (reads unified per-session file)
 
-Entry points for session tagging (ADR-013): #4 (TUI) · #16 (CLI) · #24 (skill) — all write to the same sessions table.
+Entry points for session tagging (ADR-013): #4 (TUI) · #16 (CLI) · #24 (in-session bash passthrough `!threadhop tag`, + optional UserPromptSubmit hook) — all write to the same sessions table.
 
 Observer as core function (ADR-018): #43 prompt + #44 state table → #18 core → used by #34 (background), #26 (handoff), #20-22,45 (CLI queries), #40 (skill)
 

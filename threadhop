@@ -4186,7 +4186,7 @@ def main():
             db.set_session_status(conn, args.session, args.status)
         finally:
             conn.close()
-        print(f"Tagged session {args.session} as {args.status}")
+        print(f"✓ tagged {args.session[:8]} as {args.status}")
         return 0
     if args.command == "observe":
         return cmd_observe(args)
