@@ -40,7 +40,6 @@ import cli_queries  # noqa: E402
 import handoff as handoff_mod  # noqa: E402
 import observation_queries  # noqa: E402
 import observer  # noqa: E402
-import reflector  # noqa: E402
 
 
 def get_available_themes():
@@ -5114,8 +5113,7 @@ def cmd_conflicts(args) -> int:
             project=args.project,
             session_id=args.session,
             mark_resolved=args.resolved,
-            observe_fn=observer.observe_session,
-            reflect_fn=reflector.reflect_session,
+            reflect_fn=observer.maybe_reflect_session,
         )
     finally:
         conn.close()

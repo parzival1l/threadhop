@@ -148,7 +148,6 @@ def test_query_conflicts_filters_project_and_enriches_decisions(
         conn,
         claude_projects_dir=tmp_path / "projects-does-not-matter",
         project="atlas",
-        observe_fn=lambda *_args, **_kw: {"status": "up_to_date"},
         reflect_fn=lambda *_args, **_kw: {"status": "up_to_date"},
     )
 
@@ -214,7 +213,6 @@ def test_query_conflicts_resolved_marks_and_hides_on_next_run(
         claude_projects_dir=tmp_path / "projects-does-not-matter",
         project="atlas",
         mark_resolved=True,
-        observe_fn=lambda *_args, **_kw: {"status": "up_to_date"},
         reflect_fn=lambda *_args, **_kw: {"status": "up_to_date"},
     )
     assert len(resolved) == 1
@@ -225,7 +223,6 @@ def test_query_conflicts_resolved_marks_and_hides_on_next_run(
         conn,
         claude_projects_dir=tmp_path / "projects-does-not-matter",
         project="atlas",
-        observe_fn=lambda *_args, **_kw: {"status": "up_to_date"},
         reflect_fn=lambda *_args, **_kw: {"status": "up_to_date"},
     )
     assert unresolved == []
