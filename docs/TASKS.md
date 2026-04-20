@@ -197,8 +197,8 @@ _Contradiction detection across sessions. Reflector writes `type: "conflict"` en
 to the SAME per-session observation JSONL (ADR-020, ADR-022). Triggered by observer
 process — not independent. Uses `reflector_entry_offset` for incremental processing._
 
-- [ ] **49. Create reflector prompt** *(prereq for: #31)*
-  Write `~/.config/threadhop/prompts/reflector.md`. Constrains Haiku: append-only, one JSON line per conflict, dedup check against existing conflicts (same `refs` pair + `topic` = skip). Input shape: recent decisions from current session + all decisions from other sessions in same project. Output: `type: "conflict"` entries with `refs`, `topic`, `text` fields. _(ADR-022)_
+- [x] **49. Create reflector prompt** *(prereq for: #31)*
+  **DONE.** Reflector prompt is bundled at `prompts/reflector.md` (repo-local equivalent of `~/.config/threadhop/prompts/reflector.md`). It constrains Haiku to append-only conflict writes, one JSON line per conflict, dedup against existing conflicts using the same `refs` pair + `topic`, and consume `<current_session_decisions>`, `<project_decisions>`, and `<existing_conflicts>`. Output shape is `type: "conflict"` with `refs`, `topic`, `text`, and `ts`. _(ADR-022)_
 
 - [x] **31. Build conflict detection reflector core function** *(blocked by: #18, #49)*
   **DONE.** `reflector.py` now runs the second `claude -p --model haiku --permission-mode acceptEdits` pass against recent current-session decisions and peer decisions from other same-project observation files, appends `type: "conflict"` lines to the current session's observation JSONL, and advances `reflector_entry_offset` / `entry_count` in SQLite. Tests in `tests/test_reflector.py`. _(ADR-015, ADR-020, ADR-022)_
