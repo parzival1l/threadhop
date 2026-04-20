@@ -10,7 +10,6 @@ from typing import Any, Callable
 
 import db
 import observer
-import reflector
 
 
 def sync_sessions_from_disk(
@@ -70,8 +69,8 @@ def _select_sessions_for_refresh(
     session_id: str | None,
 ) -> list[str]:
     if session_id:
-        row = db.get_session(conn, session_id)
-        return [] if row is None else [session_id]
+        state = db.get_observation_state(conn, session_id)
+        return [] if state is None else [session_id]
 
     params: list[Any] = []
     sql = (
@@ -113,26 +112,20 @@ def query_conflicts(
     project: str | None = None,
     session_id: str | None = None,
     mark_resolved: bool = False,
-    observe_fn: Callable[..., dict[str, Any]] = observer.observe_session,
-    reflect_fn: Callable[..., dict[str, Any]] = reflector.reflect_session,
+    reflect_fn: Callable[..., dict[str, Any]] = observer.maybe_reflect_session,
 ) -> list[dict[str, Any]]:
     """Return unresolved conflicts as JSON-serializable dicts.
 
     Before scanning the observation ledger, this refreshes the sessions
-    table from disk, then runs observer + reflector for matching observed
-    sessions so the results are current.
+    table from disk, then runs the shared reflector trigger for matching
+    already-observed sessions so the results stay current without starting
+    new observer work from this query path.
     """
     sync_sessions_from_disk(conn, claude_projects_dir, project=project)
 
     for target_session_id in _select_sessions_for_refresh(
         conn, project=project, session_id=session_id
     ):
-        observed = observe_fn(conn, target_session_id)
-        if observed.get("status") == "failed":
-            _warn(
-                f"threadhop conflicts: observer failed for {target_session_id}: "
-                f"{observed.get('message', 'unknown error')}"
-            )
         reflected = reflect_fn(conn, target_session_id)
         if reflected.get("status") == "failed":
             _warn(

@@ -76,6 +76,7 @@ def _build_prompt(
         f"{_jsonl_block(existing_conflicts)}\n"
         "</existing_conflicts>\n\n"
         "## Output file\n\n"
+        f"Append observations to: {obs_path}\n"
         f"Append conflicts to: {obs_path}\n"
     )
 

@@ -51,6 +51,7 @@ from typing import Any, Callable
 
 import db
 import indexer
+import reflector
 
 
 # --- Configuration --------------------------------------------------------
@@ -64,11 +65,6 @@ BATCH_THRESHOLD = 3
 # Location of the shared observer prompt. Bundled with the app — the runtime
 # does not need anything in ``~/.config/threadhop/prompts/``.
 PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "observer.md"
-
-# Location of the reflector prompt. Same packaging rule as the observer prompt.
-REFLECTOR_PROMPT_PATH = (
-    Path(__file__).resolve().parent / "prompts" / "reflector.md"
-)
 
 # Default subprocess timeout. Haiku usually responds in seconds, but the
 # first call of a session can pay an auth/warmup cost, and extremely large
@@ -213,23 +209,6 @@ def _summary_message(turns: int, by_type: dict[str, int]) -> str:
     return f"Processed {turns} {turns_label}. {tail}."
 
 
-def _summary_entries_message(entries: int, by_type: dict[str, int]) -> str:
-    """Format a reflector-style summary for appended observation entries."""
-    parts: list[str] = []
-    for key in _TYPE_ORDER:
-        n = by_type.get(key, 0)
-        if n:
-            label = key if n == 1 else f"{key}s"
-            parts.append(f"{n} {label}")
-    for key, n in by_type.items():
-        if key in _TYPE_ORDER or not n:
-            continue
-        parts.append(f"{n} {key}")
-    tail = ", ".join(parts) if parts else "no new observations"
-    entry_label = "entry" if entries == 1 else "entries"
-    return f"Appended {entries} {entry_label}. {tail}."
-
-
 def _build_prompt(template: str, transcript: str, obs_path: Path) -> str:
     """Splice the cleaned transcript and output path into the prompt.
 
@@ -247,59 +226,6 @@ def _build_prompt(template: str, transcript: str, obs_path: Path) -> str:
         "## Output file\n\n"
         f"Append observations to: {obs_path}\n"
     )
-
-
-def _build_reflector_prompt(
-    template: str,
-    current_session_decisions: list[dict[str, Any]],
-    project_decisions: list[dict[str, Any]],
-    existing_conflicts: list[dict[str, Any]],
-    obs_path: Path,
-) -> str:
-    """Splice the reflector input sections into the prompt template."""
-    def _render(entries: list[dict[str, Any]]) -> str:
-        if not entries:
-            return "(none)"
-        return "\n".join(json.dumps(entry, ensure_ascii=True) for entry in entries)
-
-    return (
-        f"{template.rstrip()}\n\n"
-        "---\n\n"
-        "## Current session decisions\n\n"
-        "<current_session_decisions>\n"
-        f"{_render(current_session_decisions)}\n"
-        "</current_session_decisions>\n\n"
-        "## Project decisions\n\n"
-        "<project_decisions>\n"
-        f"{_render(project_decisions)}\n"
-        "</project_decisions>\n\n"
-        "## Existing conflicts\n\n"
-        "<existing_conflicts>\n"
-        f"{_render(existing_conflicts)}\n"
-        "</existing_conflicts>\n\n"
-        "## Output file\n\n"
-        f"Append observations to: {obs_path}\n"
-    )
-
-
-def _read_obs_entries(obs_path: Path) -> list[dict[str, Any]]:
-    """Parse the observation JSONL, skipping blank / invalid lines."""
-    entries: list[dict[str, Any]] = []
-    if not obs_path.exists():
-        return entries
-    with open(obs_path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                raw = json.loads(line)
-            except (json.JSONDecodeError, ValueError):
-                continue
-            if isinstance(raw, dict):
-                entries.append(raw)
-    return entries
-
 
 def _pid_is_alive(pid: int | None) -> bool:
     """Return True when ``pid`` currently exists and is signalable."""
@@ -644,209 +570,6 @@ def observe_session(
         "message": _summary_message(turns, by_type),
     }
 
-
-# --- Reflector ------------------------------------------------------------
-
-
-def reflect_session(
-    conn: sqlite3.Connection,
-    session_id: str,
-    *,
-    claude_bin: str = "claude",
-    timeout: float = DEFAULT_TIMEOUT_SEC,
-    prompt_path: Path | None = None,
-) -> dict[str, Any]:
-    """Run one reflector pass for ``session_id`` if new entries are pending.
-
-    The reflector works on the observation layer, not raw source JSONL. It
-    looks at any observation entries after ``reflector_entry_offset`` and
-    compares new decisions from the current session against decisions from
-    other observed sessions in the same project. Conflict entries are
-    appended to the same per-session observation file.
-    """
-    prompt_path = prompt_path or REFLECTOR_PROMPT_PATH
-    state = db.get_observation_state(conn, session_id)
-    if state is None:
-        return {
-            "status": "no_state",
-            "new_entries": 0,
-            "by_type": {},
-            "entry_count": 0,
-            "reflector_entry_offset": 0,
-            "message": f"No observation state for session {session_id}.",
-        }
-
-    obs_path = Path(state["obs_path"])
-    if not obs_path.exists():
-        return {
-            "status": "up_to_date",
-            "new_entries": 0,
-            "by_type": {},
-            "entry_count": 0,
-            "reflector_entry_offset": int(state["reflector_entry_offset"]),
-            "message": "No observations yet.",
-        }
-
-    entries = _read_obs_entries(obs_path)
-    before_count = len(entries)
-    prior_offset = min(int(state["reflector_entry_offset"]), before_count)
-    pending_entries = before_count - prior_offset
-    if pending_entries <= 0:
-        return {
-            "status": "up_to_date",
-            "new_entries": 0,
-            "by_type": {},
-            "entry_count": before_count,
-            "reflector_entry_offset": prior_offset,
-            "message": "Reflector already up to date.",
-        }
-
-    current_slice = entries[prior_offset:]
-    current_decisions = [
-        entry for entry in current_slice
-        if entry.get("type") == "decision"
-    ]
-    existing_conflicts = [
-        entry for entry in entries
-        if entry.get("type") == "conflict"
-    ]
-
-    session = db.get_session(conn, session_id)
-    project = session.get("project") if session else None
-    other_decisions: list[dict[str, Any]] = []
-    if project:
-        for other in db.query_all(
-            conn,
-            "SELECT session_id FROM sessions WHERE project = ? AND session_id != ?",
-            (project, session_id),
-        ):
-            other_id = other["session_id"]
-            other_state = db.get_observation_state(conn, other_id)
-            other_obs_path = (
-                Path(other_state["obs_path"])
-                if other_state is not None
-                else db.OBS_DIR / f"{other_id}.jsonl"
-            )
-            for entry in _read_obs_entries(other_obs_path):
-                if entry.get("type") == "decision":
-                    other_decisions.append(entry)
-
-    if not current_decisions or not other_decisions:
-        db.update_reflector_offset(conn, session_id, before_count)
-        return {
-            "status": "up_to_date",
-            "new_entries": 0,
-            "by_type": {},
-            "entry_count": before_count,
-            "reflector_entry_offset": before_count,
-            "message": (
-                "No new cross-session decisions to compare."
-                if current_decisions else
-                "No new decisions to compare."
-            ),
-        }
-
-    try:
-        prompt_template = prompt_path.read_text()
-    except OSError as e:
-        return {
-            "status": "failed",
-            "new_entries": 0,
-            "by_type": {},
-            "entry_count": before_count,
-            "reflector_entry_offset": prior_offset,
-            "error": f"read prompt {prompt_path}: {e}",
-            "message": f"Could not read reflector prompt: {e}",
-        }
-
-    if shutil.which(claude_bin) is None and not Path(claude_bin).exists():
-        return {
-            "status": "failed",
-            "new_entries": 0,
-            "by_type": {},
-            "entry_count": before_count,
-            "reflector_entry_offset": prior_offset,
-            "error": f"{claude_bin} not found on PATH",
-            "message": f"Could not find {claude_bin} on PATH.",
-        }
-
-    prompt = _build_reflector_prompt(
-        prompt_template,
-        current_decisions,
-        other_decisions,
-        existing_conflicts,
-        obs_path,
-    )
-
-    try:
-        proc = subprocess.run(
-            [
-                claude_bin, "-p", prompt,
-                "--model", "haiku",
-                "--permission-mode", "acceptEdits",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        return {
-            "status": "failed",
-            "new_entries": 0,
-            "by_type": {},
-            "entry_count": before_count,
-            "reflector_entry_offset": prior_offset,
-            "error": f"claude -p timed out after {timeout}s",
-            "message": f"claude -p timed out after {timeout}s.",
-        }
-    except OSError as e:
-        return {
-            "status": "failed",
-            "new_entries": 0,
-            "by_type": {},
-            "entry_count": before_count,
-            "reflector_entry_offset": prior_offset,
-            "error": f"claude -p failed to start: {e}",
-            "message": f"Could not invoke {claude_bin}: {e}",
-        }
-
-    if proc.returncode != 0:
-        return {
-            "status": "failed",
-            "new_entries": 0,
-            "by_type": {},
-            "entry_count": before_count,
-            "reflector_entry_offset": prior_offset,
-            "error": f"claude -p exited {proc.returncode}",
-            "stderr": (proc.stderr or "").strip(),
-            "message": (
-                f"claude -p exited {proc.returncode}. "
-                "Reflector offset not advanced; next run will retry."
-            ),
-        }
-
-    after_count = _count_obs_lines(obs_path)
-    new_entries = max(0, after_count - before_count)
-    by_type = (
-        _count_new_entries_by_type(obs_path, before_count)
-        if new_entries else {}
-    )
-    db.update_reflector_offset(conn, session_id, after_count)
-    return {
-        "status": "reflected",
-        "new_entries": new_entries,
-        "by_type": by_type,
-        "entry_count": after_count,
-        "reflector_entry_offset": after_count,
-        "message": (
-            "Reflector found no new conflicts."
-            if new_entries == 0 else
-            _summary_entries_message(new_entries, by_type)
-        ),
-    }
-
-
 def maybe_reflect_session(
     conn: sqlite3.Connection,
     session_id: str,
@@ -856,7 +579,7 @@ def maybe_reflect_session(
     timeout: float = DEFAULT_TIMEOUT_SEC,
     prompt_path: Path | None = None,
 ) -> dict[str, Any]:
-    """Run the reflector when enough new observation entries accumulated."""
+    """Run the shared reflector core when enough new entries accumulated."""
     state = db.get_observation_state(conn, session_id)
     if state is None:
         return {
@@ -878,13 +601,33 @@ def maybe_reflect_session(
                 "observation(s)."
             ),
         }
-    return reflect_session(
+    result = reflector.reflect_session(
         conn,
         session_id,
         claude_bin=claude_bin,
         timeout=timeout,
-        prompt_path=prompt_path,
+        prompt_path=prompt_path or reflector.PROMPT_PATH,
     )
+    status = result.get("status")
+    if status == "extracted":
+        normalized = dict(result)
+        normalized["status"] = "reflected"
+        normalized["by_type"] = (
+            {"conflict": int(result.get("new_entries", 0))}
+            if int(result.get("new_entries", 0)) > 0
+            else {}
+        )
+        return normalized
+    if status in {"no_decisions", "no_project", "no_peer_decisions"}:
+        normalized = dict(result)
+        normalized["status"] = "up_to_date"
+        normalized.setdefault("by_type", {})
+        return normalized
+    if status in {"failed", "up_to_date", "no_observations"}:
+        normalized = dict(result)
+        normalized.setdefault("by_type", {})
+        return normalized
+    return result
 
 
 # --- Watch mode -----------------------------------------------------------
