@@ -323,24 +323,27 @@ current terminal. Same detection logic the TUI already uses.
 
 ---
 
-### ADR-012: Three skills — tag, context, handoff
+### ADR-012: Two skills — context, handoff (tagging uses bash passthrough, not a skill)
 
 **Context:** Need to interact with ThreadHop from within a Claude Code session
-without switching to the TUI or a terminal. Earlier design had two skills.
-Expanded to three with clearer separation.
+without switching to the TUI or a terminal. Earlier design had three skills
+including `/threadhop:tag`; that skill was dropped in favor of the `!`
+bash passthrough (see ADR-013 evolution note) — skills invoke the LLM,
+which is pure overhead for a one-shot SQLite write.
 
-**Decision:** Three Claude Code skills with distinct roles:
+**Decision:** Two Claude Code skills with distinct roles, plus the `!`
+passthrough for tagging:
 
-| Skill | What it does | Uses LLM? |
+| Surface | What it does | Uses LLM? |
 |---|---|---|
-| `/threadhop:tag <status>` | Tags current session | No — calls `threadhop tag` CLI |
+| `!threadhop tag <status>` (bash passthrough) | Tags current session | No — direct shell invocation, no turn |
 | `/threadhop:context` | Formats clipboard content as sourced context | No — reads `pbpaste`, formats |
 | `/threadhop:handoff <id>` | Compresses a full session into a brief | Yes — sub-agent with Haiku |
 
-**`/threadhop:tag <status>`** — instant, no LLM:
-1. Detects current session ID from process context
-2. Calls `threadhop tag <status>`
-3. Confirms: "Tagged this session as backlog"
+**`!threadhop tag <status>`** — zero LLM turn:
+1. Claude Code's `!` prefix runs the command directly in the host shell
+2. `threadhop tag` auto-detects the current session id from its process ancestry
+3. Prints one tight line: `✓ tagged <short-id> as <status>`
 
 **`/threadhop:context`** — instant, no LLM:
 1. Reads clipboard (`pbpaste`) containing messages copied from TUI
@@ -355,13 +358,19 @@ Expanded to three with clearer separation.
 4. Injects the brief into the current conversation
 
 **Rationale:**
-- Tag: must work mid-conversation without context switching
+- Tag: the `!` bash passthrough is zero-LLM, already supported by
+  Claude Code, and surfaces in `!`-history autocomplete after first use.
+  No reason to burn a skill on it.
 - Context: bridges TUI (visual selection) to Claude Code (injection)
 - Handoff: the only one that needs an LLM, clearly separated
-- Three skills is still minimal — each does one thing
 
-**Rejected:** Merging context and handoff into one skill (different mechanisms,
-different cost profiles).
+**Rejected:**
+- Merging context and handoff into one skill (different mechanisms,
+  different cost profiles).
+- A dedicated `/threadhop:tag` skill: a skill invokes the LLM — pure
+  overhead for a one-shot SQLite write. Users who want slash-style
+  ergonomics can install the optional `UserPromptSubmit` hook documented
+  in the README. Trade-off accepted: no `/` autocomplete discoverability.
 
 ---
 
@@ -375,16 +384,27 @@ need to be settable from multiple places depending on the user's context.
 | Entry point | How | When you'd use it |
 |---|---|---|
 | ThreadHop TUI | Press `s` to cycle status | Triaging multiple sessions |
-| Claude Code skill | `/threadhop:tag backlog` | Mid-conversation, without leaving |
 | Terminal CLI | `threadhop tag backlog` | Quick tag from another tab |
+| In-session bash passthrough | `!threadhop tag backlog` from inside Claude Code | Mid-conversation, without leaving |
 
 All three write to the same SQLite `sessions` table. The TUI reflects
-changes from CLI/skill on the next 5s refresh.
+changes from CLI/passthrough on the next 5s refresh.
 
 **Rationale:**
 - Different moments call for different interfaces
 - Shared database means no sync issues
-- The skill is the lightest possible — shells out to the CLI
+- The in-session entry point is the `!` bash passthrough — zero LLM turn,
+  instantaneous, already built into Claude Code. An optional
+  `UserPromptSubmit` hook gives `/tag <status>` ergonomics for users who
+  want it (documented in README).
+
+**Evolution:** Earlier revisions of this ADR proposed a `/threadhop:tag`
+skill as the in-session entry point. A skill invokes the LLM — pure
+overhead for a one-shot SQLite write. The `!` passthrough delivers the
+same outcome with no model call, and its history is surfaced in
+Claude Code's `!`-history autocomplete after first use. Trade-off: no
+`/` autocomplete discoverability. Mitigated by a README section and the
+optional hook.
 
 ---
 
@@ -679,18 +699,19 @@ The loop closes: **observe → extract → surface → resolve → observe the
 resolution**. Each session can opt in independently. Observations accumulate
 across sessions. Conflicts are detected cross-session and surfaced on demand.
 
-**Updated skill count — five skills:**
+**Updated in-session surface — four skills + one bash passthrough for tagging:**
 
-| Skill | What it does | LLM? | New? |
+| Surface | What it does | LLM? | New? |
 |---|---|---|---|
-| `/threadhop:tag` | Tag session status | No | Existing (ADR-012) |
+| `!threadhop tag` (bash passthrough) | Tag session status | No | Existing (ADR-012, ADR-013) — replaces former `/threadhop:tag` skill |
 | `/threadhop:context` | Inject clipboard content | No | Existing (ADR-012) |
 | `/threadhop:handoff` | Generate handoff brief | Yes | Enhanced (ADR-016) |
 | `/threadhop:observe` | Start background observer for this session | No | New (ADR-016) |
 | `/threadhop:insights` | Pull observations + conflicts into conversation | No | New (ADR-016) |
 
-The observe skill itself is instant (spawns a process). The background
-observer uses Haiku. The insights skill is instant (reads files, formats).
+The bash-passthrough tag costs no LLM turn. The observe skill itself is
+instant (spawns a process). The background observer uses Haiku. The
+insights skill is instant (reads files, formats).
 
 **Rationale:**
 - Per-session opt-in respects the user's attention — only important
@@ -701,7 +722,7 @@ observer uses Haiku. The insights skill is instant (reads files, formats).
   black-box architecture
 - Enhanced handoff with observations is strictly better — faster (less
   input to process) and higher quality (structured vs raw)
-- Five skills is still manageable — each does exactly one thing
+- Four skills + a bash passthrough is still manageable — each does exactly one thing
 
 ---
 
@@ -1338,11 +1359,15 @@ Per-session observation files with SQLite state tracking (ADR-019)._
    - All trigger observer for unprocessed messages before displaying results
 
 ### Phase 4: Skill Plugin + TUI Observation Indicator
-_Five skills for in-session use (ADR-012, ADR-016). TUI observation
+_Four skills for in-session use (ADR-012, ADR-016), plus the
+`!threadhop tag` bash passthrough for tagging (ADR-013). TUI observation
 indicator and transcript header (ADR-021)._
 
 1. Research Claude Code skill plugin packaging/distribution
-2. `/threadhop:tag <status>` — detect session ID, call `threadhop tag` CLI
+2. `!threadhop tag <status>` — document the bash passthrough + valid
+   statuses in README. Optional: sample `UserPromptSubmit` hook for
+   `/tag <status>` ergonomics. Replaces the former `/threadhop:tag` skill
+   (ADR-013).
 3. `/threadhop:context` — read clipboard, format with source labels, inject
 4. `/threadhop:handoff <id> [--full]` — runs observer first if no observations
    exist (ADR-018), then formats from observations. No separate JSONL compression path.
@@ -1492,22 +1517,26 @@ CREATE TABLE observation_state (
 
 ## Skill Plugin Architecture
 
-### Principle: Five skills, clear boundaries
+### Principle: Four skills + bash passthrough for tagging, clear boundaries
 
 Skills are for operations invoked mid-conversation from Claude Code. The TUI
 handles everything visual and instantaneous. The CLI handles queries and tagging
-from the terminal. See ADR-012 (original three) and ADR-016 (observe + insights).
+from the terminal. In-session tagging uses Claude Code's `!` bash passthrough
+rather than a skill (zero LLM turn — see ADR-013). See ADR-012 (original
+set) and ADR-016 (observe + insights).
 
 ### Plugin: `threadhop`
 
 ```
 threadhop/
   skills/
-    tag.md              # /threadhop:tag <status>
     context.md          # /threadhop:context
     handoff.md          # /threadhop:handoff <session_id>
     observe.md          # /threadhop:observe
     insights.md         # /threadhop:insights
+
+# Tagging: !threadhop tag <status> (bash passthrough, no skill needed)
+# Optional: ~/.claude/hooks/threadhop-tag.sh for /tag <status> ergonomics — see README
 ```
 
 ### What lives where
@@ -1518,7 +1547,7 @@ threadhop/
 | Message select + copy | TUI | Visual selection, clipboard transport |
 | Message export to .md | TUI | Visual selection, writes to /tmp |
 | Bookmark | TUI | Visual selection, one-key action |
-| Tag session | TUI + Skill + CLI | All three entry points, one DB |
+| Tag session | TUI + CLI + `!` bash passthrough | Three entry points, one DB (ADR-013) |
 | Observation queries | CLI | `threadhop todos`, `threadhop decisions` |
 | Start observation | Skill + TUI | Per-session opt-in, spawns background process |
 | Pull observations/conflicts | Skill | Read per-session observation file, format for injection |
@@ -1526,18 +1555,28 @@ threadhop/
 | Handoff | Skill | Runs observer first if needed, formats from observations |
 | Observation indicator | TUI | 🗒 icon + transcript header for observed sessions |
 
-### Skill 1: `/threadhop:tag <status>` (instant, no LLM)
+### Tag entry point 3: `!threadhop tag <status>` (bash passthrough, zero LLM turn)
+
+Not a skill — Claude Code's `!` prefix runs the command directly in the
+host shell. See ADR-013 for why tagging was moved off the skill plane.
 
 ```
-User (in Claude Code): /threadhop:tag backlog
+User (in Claude Code): !threadhop tag backlog
 
-1. Skill detects current session ID from process context
-2. Calls: threadhop tag backlog --session <session_id>
-3. ThreadHop CLI writes tag to SQLite
-4. Confirms: "Tagged this session as backlog"
+1. Claude Code runs `threadhop tag backlog` in the host shell (no model turn)
+2. threadhop auto-detects the current session id by walking the parent
+   process tree for its `claude` CLI ancestor (task #17)
+3. ThreadHop CLI writes the tag to SQLite
+4. Prints one tight line: "✓ tagged <short-id> as backlog"
 ```
 
-### Skill 2: `/threadhop:context` (instant, no LLM)
+On detection failure the command exits `2` with the helpful error from
+`_resolve_cli_session()` and makes no DB write.
+
+Optional: a `UserPromptSubmit` hook can provide `/tag <status>` ergonomics
+— documented in README. Hooks do not appear in `/` autocomplete or `/help`.
+
+### Skill 1: `/threadhop:context` (instant, no LLM)
 
 Bridges the TUI (visual selection) to Claude Code (context injection).
 User copies messages from the TUI, then invokes this skill to present
@@ -1558,7 +1597,7 @@ User (in Claude Code): /threadhop:context
 4. The model now has this context and can work with it
 ```
 
-### Skill 3: `/threadhop:handoff <id> [--full]` (observer + format)
+### Skill 2: `/threadhop:handoff <id> [--full]` (observer + format)
 
 Uses the observer as its underlying function (ADR-018). There is no
 separate "compress raw JSONL" path — the handoff always works from
@@ -1590,7 +1629,7 @@ The observer function is the same regardless of entry point.
 A session observed incrementally over 2 hours produces identical
 observations to one observed in a single shot at handoff time.
 
-### Skill 4: `/threadhop:observe` (instant, spawns background process)
+### Skill 3: `/threadhop:observe` (instant, spawns background process)
 
 Per-session opt-in for background observation (ADR-016). The user decides
 which conversations are worth observing. Can be invoked at any point —
@@ -1614,7 +1653,7 @@ User (in Claude Code): /threadhop:observe
 7. User continues working — observer runs silently
 ```
 
-### Skill 5: `/threadhop:insights` (instant, no LLM)
+### Skill 4: `/threadhop:insights` (instant, no LLM)
 
 Pull-based context injection for observations and conflicts (ADR-016).
 Reads from the observer's output files and formats findings into the
@@ -1719,7 +1758,7 @@ For larger exports:
 
 ### Phase 4: Skills + TUI Observation Indicator (ADR-012, ADR-016, ADR-021)
 - [ ] Research Claude Code skill plugin packaging
-- [ ] `/threadhop:tag <status>` skill (calls CLI)
+- [ ] `!threadhop tag <status>` bash-passthrough workflow — README doc + optional UserPromptSubmit hook (ADR-013; replaces the former `/threadhop:tag` skill)
 - [ ] `/threadhop:context` skill (clipboard formatting + injection)
 - [ ] `/threadhop:handoff <id> [--full]` skill (runs observer first if needed, formats from observations)
 - [ ] `/threadhop:observe` skill (per-session opt-in, spawns background observer)

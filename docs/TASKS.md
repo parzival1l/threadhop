@@ -149,8 +149,8 @@ and transcript header (ADR-021)._
 - [ ] **23. Research Claude Code skill plugin packaging**
   Determine how Claude Code skill plugins are distributed — directory of `.md` files in `~/.claude/skills/`? npm/pip package? Verify the plugin contract before implementing skills. _(Open Question Q4)_
 
-- [ ] **24. Implement `/threadhop:tag <status>` skill** *(blocked by: #16, #23)*
-  Instant, no LLM. Detects current session ID from process context, shells out to `threadhop tag <status>`, confirms: "Tagged this session as <status>". Third of three tag entry points. _(ADR-012, ADR-013)_
+- [ ] **24. Document `!threadhop tag <status>` bash-passthrough workflow** *(blocked by: #16, #17)*
+  Replaces the earlier `/threadhop:tag` skill. In Claude Code, the `!` prefix runs a command in the host shell with zero LLM turn. Combined with #17's auto-detection (walks the parent process tree for the `claude` CLI ancestor), `!threadhop tag backlog` inside a session tags the current session without args. Scope: (a) README section "Tagging sessions from inside Claude Code" with the one-liner and the list of valid statuses, (b) confirm `threadhop tag` prints a single tight success line (`✓ tagged <short-id> as <status>`), (c) detection failure exits `2` with the helpful error already emitted by `_resolve_cli_session()`, (d) optional stretch: sample `UserPromptSubmit` hook snippet in README for users who prefer `/tag` — document that hooks don't appear in `/` autocomplete or `/help`. Third of three tag entry points. Trade-off: no `/` autocomplete discoverability; mitigated by README + optional hook. Originally a skill (needs #23); rewriting this way drops the #23 dependency since `!` passthrough is already built into Claude Code. _(ADR-012, ADR-013)_
 
 - [ ] **25. Implement `/threadhop:context` skill** *(blocked by: #12, #23)*
   Instant, no LLM. Reads clipboard via `pbpaste`, detects ThreadHop source labels, presents the content as a clearly bounded context block in the current conversation. Bridges TUI visual selection → Claude Code injection. _(ADR-012)_
@@ -227,3 +227,63 @@ _Scheduled after the observer ships and cross-session query surfaces
 
 - [ ] **53. Migrate data-heavy DataTables to textual-fastdatatable** *(blocked by: #14; also benefits #20, #21, #22, #45 if those land in the TUI)*
   Swap Textual's `DataTable` for [`textual-fastdatatable`](https://github.com/tconbeer/textual-fastdatatable) at every heavy surface — search results panel, cross-session query views, observation browsers. Light surfaces (settings, help) keep the stock `DataTable`. Add `pyarrow` + `textual-fastdatatable` to the PEP 723 deps. Add `db.fetch_arrow()` helper for SQLite → Arrow conversion so query pipelines can feed the table directly. _(ADR-026, PERFORMANCE.md)_
+
+---
+
+## Dependency Graph (critical path)
+
+```
+#1 SQLite DB ──┬──> #2 Migration ──> #7 Tests
+               ├──> #3 Status ──┬──> #4 Keybinds (s/S)  ─────────┐
+               │                └──> #5 Archive (a/A)            │
+               ├──> #33 Data models ──> #8 Indexer ──> #9 Incremental ──> #14 Search │ ──> #32 Fuzzy
+               ├──> #44 observation_state table ──┐
+               │                                   ├──> #46 TUI obs indicator
+               │                                   ├──> #47 Transcript header
+               │                                   └──> (prereq for #18, #35)
+               │
+               │  #43 Observer prompt (independent)
+               │         ↓
+               │  #8 Indexer + #43 + #44 ──> #18 Observer core ──> #19 Incremental
+               │                                                    ├──> #20 todos
+               │                                                    ├──> #21 decisions
+               │                                                    ├──> #22 observations
+               │                                                    ├──> #45 conflicts CLI
+               │                                                    ├──> #29 Annotation detection
+               │                                                    ├──> #30 Memory rendering
+               │                                                    ├──> #34 Background observer ──> #35 Stop/resume lifecycle
+               │                                                    │                            ├──> #48 TUI obs keybindings (o/O)
+               │                                                    │                            └──> #36 Observer-triggered reflector (also needs #31)
+               │                                                    └──> #49 Reflector prompt ──> #31 Reflector core ──> #38 TUI notification
+               │                                                                                                     └──> #39 Condensation
+               ├──> #27 Bookmarks (also needs #10)
+               └──> #28 Memory ledger ──┬──> #29 Annotation detection
+                                        └──> #30 Memory rendering
+
+#6 Sidebar resize (independent)
+
+#42 Help overlay + command registry (independent)
+
+#10 Selection ──┬──> #11 Range select
+                ├──> #12 Clipboard copy ──> #25 /threadhop:context (also needs #23)
+                ├──> #13 Temp export
+                └──> #27 Bookmarks (also needs #1)
+
+#15 Subcommand routing ──> #16 tag CLI ──> #17 Auto-detect session ──> #24 README + `!threadhop tag` passthrough (+ optional hook)
+
+#23 Skill packaging research ──┬──> #25 /threadhop:context
+                                ├──> #26 /threadhop:handoff (runs observer first, then formats)
+                                ├──> #40 /threadhop:observe (also needs #34)
+                                └──> #41 /threadhop:insights (reads unified per-session file)
+
+Entry points for session tagging (ADR-013): #4 (TUI) · #16 (CLI) · #24 (in-session bash passthrough `!threadhop tag`, + optional UserPromptSubmit hook) — all write to the same sessions table.
+
+Observer as core function (ADR-018): #43 prompt + #44 state table → #18 core → used by #34 (background), #26 (handoff), #20-22,45 (CLI queries), #40 (skill)
+
+Reflector as observer companion (ADR-022): #49 prompt → #31 core → triggered by #34 observer (when entry_count - reflector_entry_offset ≥ 5)
+  Reflector input: decisions from observation files (not raw transcripts). Output: type:"conflict" entries in same JSONL.
+
+Observer-reflector unified output (ADR-020): #18 observer + #31 reflector both append to observations/<session_id>.jsonl
+
+TUI observation surface (ADR-021): #44 → #46 indicator + #47 header + #48 keybindings (o/O)
+```

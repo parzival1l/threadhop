@@ -69,6 +69,63 @@ threadhop --days 7                     # last 7 days only
 | `r` | Refresh session list |
 | `q` | Quit |
 
+## Tagging sessions from inside Claude Code
+
+Use Claude Code's `!` bash passthrough to tag the current session without leaving the chat. The `!` prefix runs the command in the host shell — no LLM turn, instantaneous — and `threadhop tag` auto-detects the session by walking the parent process tree for its `claude` ancestor.
+
+```
+!threadhop tag in_review
+```
+
+Output:
+
+```
+✓ tagged 8f3b2a1c as in_review
+```
+
+Valid statuses: `active`, `in_progress`, `in_review`, `done`, `archived`.
+
+The TUI reflects the new status on its next refresh (5s). From another terminal tab, pass the id explicitly instead: `threadhop tag in_review --session <id>`.
+
+If detection fails (e.g. running outside a Claude Code terminal), the command exits `2` with a helpful error and no DB write.
+
+### Optional: `/tag` via a UserPromptSubmit hook
+
+Prefer a slash-style trigger? A Claude Code `UserPromptSubmit` hook can intercept `/tag <status>`, shell out to `threadhop tag`, and block the prompt from reaching the model. Note: hooks are not surfaced in `/` autocomplete or `/help` — `!threadhop tag` remains the recommended, discoverable surface. The hook below is purely for users who want the slash ergonomics.
+
+1. Drop this script at `~/.claude/hooks/threadhop-tag.sh` and `chmod +x` it:
+
+    ```bash
+    #!/usr/bin/env bash
+    INPUT=$(cat)
+    PROMPT=$(printf '%s' "$INPUT" | jq -r '.prompt')
+    if [[ "$PROMPT" =~ ^/tag[[:space:]]+([A-Za-z_]+)[[:space:]]*$ ]]; then
+      STATUS="${BASH_REMATCH[1]}"
+      threadhop tag "$STATUS" >&2
+      exit 2   # blocks the prompt — it never reaches the model
+    fi
+    exit 0
+    ```
+
+2. Register it in `~/.claude/settings.json`:
+
+    ```json
+    {
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "matcher": "",
+            "hooks": [
+              { "type": "command", "command": "~/.claude/hooks/threadhop-tag.sh" }
+            ]
+          }
+        ]
+      }
+    }
+    ```
+
+The hook reads the prompt from stdin as JSON, matches `/tag <status>`, invokes `threadhop tag`, and exits `2` — which tells Claude Code to block the submission and show the stderr output to the user.
+
 ## Roadmap
 
 - Cross-session search (SQLite FTS5, per-keystroke)
