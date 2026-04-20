@@ -14,6 +14,14 @@ Typical usage:
     db.set_setting(conn, "theme", "textual-dark")
     theme = db.get_setting(conn, "theme")
     rows = db.query_all(conn, "SELECT * FROM sessions WHERE status = ?", ("active",))
+
+Schema / Python-type co-evolution (task #24):
+Each SQL table has a matching Pydantic shape in ``models.py`` (``Session``,
+``Message``, ``Bookmark``, ``MemoryEntry``). When a migration adds or renames
+a column, update the matching model in the same change — the two are the
+contract between SQL and Python and must not drift. Enum-like columns use
+``CHECK`` constraints here and ``Literal`` types there, so an invalid value
+is rejected at the DB layer *and* the parse layer.
 """
 
 from __future__ import annotations
@@ -32,7 +40,7 @@ DB_PATH = DB_DIR / "sessions.db"
 # --- Schema version ---
 # Each migration N in MIGRATIONS moves the DB from version N to N+1.
 # The DB's current version lives in PRAGMA user_version.
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 # --- Migrations -----------------------------------------------------------
@@ -253,6 +261,94 @@ def _migration_005_conflict_reviews(conn: sqlite3.Connection) -> None:
     )
 
 
+_SESSIONS_TABLE_DDL_WITH_CHECK = """\
+CREATE TABLE sessions (
+    session_id    TEXT PRIMARY KEY,
+    session_path  TEXT NOT NULL,
+    project       TEXT,
+    cwd           TEXT,
+    custom_name   TEXT,
+    status        TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN
+            ('active', 'in_progress', 'in_review', 'done', 'archived')),
+    sort_order    INTEGER,
+    last_viewed   REAL,
+    created_at    REAL,
+    modified_at   REAL
+)"""
+
+
+def _migration_006_sessions_status_check(conn: sqlite3.Connection) -> None:
+    """Enforce the session status enum at the DB layer (ADR-004, task #24).
+
+    Pairs with :data:`models.SessionStatus` — the ``Literal`` there and the
+    ``CHECK`` here list the same values. Updating one without the other is
+    a bug; keep them in lockstep.
+
+    SQLite has no ``ALTER TABLE ... ADD CONSTRAINT``. The textbook workaround
+    (create ``sessions_new``, copy, ``DROP``, ``RENAME``) breaks in our
+    context because ``observation_state`` and ``conflict_reviews``
+    (migrations 004 and 005) hold ``FOREIGN KEY`` references to
+    ``sessions(session_id)``. With ``PRAGMA foreign_keys = ON`` (set in
+    :func:`connect`), the rebuild either fails at ``DROP TABLE`` or fails
+    at ``COMMIT``, and ``PRAGMA foreign_keys = OFF`` is a no-op inside the
+    migration runner's open transaction.
+
+    Instead, patch the stored ``CREATE TABLE`` DDL directly via
+    ``PRAGMA writable_schema``. The table keeps its rowids, its indexes,
+    and its identity — no rows are moved, child FKs don't re-resolve, and
+    the CHECK takes effect for all subsequent writes. The
+    ``PRAGMA schema_version`` bump forces this connection to invalidate
+    its parsed-schema cache so the CHECK fires on the next INSERT without
+    requiring callers to reopen the connection.
+
+    Steps:
+
+    1. Normalize any pre-existing rows whose status somehow slipped past
+       the app-level validation — otherwise the next write touching
+       ``sessions`` would trip the new CHECK on legacy data.
+    2. With ``writable_schema = ON``, replace the stored ``CREATE TABLE``
+       text in ``sqlite_master`` with a version that includes the CHECK.
+    3. Bump ``schema_version`` so SQLite reloads the schema definition in
+       this connection's cache.
+    4. Run ``PRAGMA integrity_check`` to verify the patched schema parses
+       cleanly before the migration runner commits.
+    """
+    conn.execute(
+        """
+        UPDATE sessions
+        SET status = 'active'
+        WHERE status NOT IN
+            ('active', 'in_progress', 'in_review', 'done', 'archived')
+        """
+    )
+
+    current_sv = conn.execute("PRAGMA schema_version").fetchone()[0]
+
+    conn.execute("PRAGMA writable_schema = ON")
+    try:
+        conn.execute(
+            "UPDATE sqlite_master SET sql = ? "
+            "WHERE type = 'table' AND name = 'sessions'",
+            (_SESSIONS_TABLE_DDL_WITH_CHECK,),
+        )
+        # Bumping schema_version forces SQLite to re-parse sqlite_master
+        # on the next statement — without this, the same connection keeps
+        # using its cached pre-CHECK definition until it's reopened.
+        conn.execute(f"PRAGMA schema_version = {current_sv + 1}")
+    finally:
+        conn.execute("PRAGMA writable_schema = OFF")
+
+    # Guard rail: if the DDL swap produced anything SQLite can't parse,
+    # integrity_check reports it here so the migration rolls back rather
+    # than shipping a corrupt schema.
+    rows = conn.execute("PRAGMA integrity_check").fetchall()
+    if rows and rows[0][0] != "ok":
+        raise RuntimeError(
+            f"integrity_check failed after sessions DDL patch: {rows}"
+        )
+
+
 # Ordered list; MIGRATIONS[i] moves schema from version i to i+1.
 MIGRATIONS: list = [
     _migration_001_initial,
@@ -260,6 +356,7 @@ MIGRATIONS: list = [
     _migration_003_index_state,
     _migration_004_observation_state,
     _migration_005_conflict_reviews,
+    _migration_006_sessions_status_check,
 ]
 
 assert len(MIGRATIONS) == SCHEMA_VERSION, (
