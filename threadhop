@@ -645,7 +645,6 @@ def _session_display_name(session_data: dict, custom_name: str | None) -> str:
         return title
     return session_data["project"]
 
-
 def copy_to_clipboard(text: str) -> bool:
     """Copy text to the system clipboard."""
     try:
@@ -665,8 +664,6 @@ def copy_to_clipboard(text: str) -> bool:
 def build_observe_command(session_id: str) -> list[str]:
     """Spawn the CLI sidecar through the current executable script."""
     return [str(Path(__file__).resolve()), "observe", "--session", session_id]
-
-
 def render_session_label_text(
     session_data: dict,
     *,
