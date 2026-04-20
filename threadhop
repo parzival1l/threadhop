@@ -16,6 +16,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -40,6 +41,7 @@ import cli_queries  # noqa: E402
 import handoff as handoff_mod  # noqa: E402
 import observation_queries  # noqa: E402
 import observer  # noqa: E402
+import search_queries  # noqa: E402
 
 
 def get_available_themes():
@@ -1510,143 +1512,24 @@ class TranscriptView(VerticalScroll):
 #   assistant:      — only role = 'assistant'
 # Remaining whitespace-separated tokens become FTS5 prefix terms.
 
-# Sentinel characters bracketing matched spans in the SQL `snippet()`
-# output. Using control chars avoids collisions with user text. Parsed
-# back out by `_render_snippet` into Rich Text with a highlight style.
-_FTS_MATCH_START = "\x01"
-_FTS_MATCH_END = "\x02"
-
-
-def _build_fts_query(raw: str) -> tuple[str, str | None, str | None]:
-    """Parse raw input into (fts_match_expr, role_filter, project_filter).
-
-    The FTS5 expression uses AND semantics across prefix terms
-    (e.g. ``rate* lim*``). Non-filter tokens are sanitized to word chars
-    only so stray punctuation can't produce an invalid MATCH expression.
-    An empty expression means no searchable terms were supplied —
-    callers may still return filter-only results (see `search_messages`).
-    """
-    tokens = raw.strip().split()
-    role: str | None = None
-    project: str | None = None
-    terms: list[str] = []
-    for tok in tokens:
-        low = tok.lower()
-        if low == "user:":
-            role = "user"
-        elif low == "assistant:":
-            role = "assistant"
-        elif low.startswith("project:"):
-            val = tok[len("project:"):]
-            if val:
-                project = val
-        else:
-            # Keep only word chars (letters/digits/underscore). FTS5's
-            # unicode61 tokenizer is fine with these, and stripping
-            # punctuation prevents syntax errors at MATCH time.
-            clean = re.sub(r"[^\w]", "", tok)
-            if clean:
-                terms.append(clean + "*")
-    return " ".join(terms), role, project
-
-
-def search_messages(
-    conn: sqlite3.Connection,
-    raw_query: str,
-    limit: int = 50,
-) -> list[dict]:
-    """Run the FTS5 search for the search panel.
-
-    Returns rows with keys: uuid, session_id, role, timestamp, snippet,
-    custom_name, project, session_path. ``snippet`` contains
-    _FTS_MATCH_START / _FTS_MATCH_END sentinels around each match span.
-
-    A malformed FTS5 expression (shouldn't happen after sanitization, but
-    defensive) returns an empty list rather than propagating the
-    exception up into the TUI event loop.
-    """
-    fts_expr, role, project = _build_fts_query(raw_query)
-
-    # No search terms: allow a filter-only query so typing just
-    # `project:foo` lists recent messages in that project.
-    if not fts_expr:
-        if not role and not project:
-            return []
-        sql = (
-            "SELECT m.uuid AS uuid, m.session_id AS session_id, "
-            "m.role AS role, m.timestamp AS timestamp, "
-            "substr(m.text, 1, 160) AS snippet, "
-            "s.custom_name AS custom_name, s.project AS project, "
-            "s.session_path AS session_path "
-            "FROM messages m "
-            "LEFT JOIN sessions s ON s.session_id = m.session_id "
-            "WHERE 1=1"
-        )
-        params: dict = {}
-        if role:
-            sql += " AND m.role = :role"
-            params["role"] = role
-        if project:
-            sql += " AND s.project LIKE :project"
-            params["project"] = f"%{project}%"
-        sql += " ORDER BY m.timestamp DESC LIMIT :lim"
-        params["lim"] = limit
-        try:
-            return db.query_all(conn, sql, params)
-        except sqlite3.OperationalError:
-            return []
-
-    sql = (
-        "SELECT m.uuid AS uuid, m.session_id AS session_id, "
-        "m.role AS role, m.timestamp AS timestamp, "
-        "snippet(messages_fts, 0, :mstart, :mend, '…', 16) AS snippet, "
-        "s.custom_name AS custom_name, s.project AS project, "
-        "s.session_path AS session_path "
-        "FROM messages_fts "
-        "JOIN messages m ON m.rowid = messages_fts.rowid "
-        "LEFT JOIN sessions s ON s.session_id = m.session_id "
-        "WHERE messages_fts MATCH :q"
-    )
-    params = {
-        "q": fts_expr,
-        "mstart": _FTS_MATCH_START,
-        "mend": _FTS_MATCH_END,
-    }
-    if role:
-        sql += " AND m.role = :role"
-        params["role"] = role
-    if project:
-        sql += " AND s.project LIKE :project"
-        params["project"] = f"%{project}%"
-    sql += " ORDER BY rank LIMIT :lim"
-    params["lim"] = limit
-
-    try:
-        return db.query_all(conn, sql, params)
-    except sqlite3.OperationalError:
-        # Malformed expressions still slip through on edge cases
-        # (e.g. a bare `*`). Surface as "no results" rather than crash.
-        return []
-
-
 def _render_snippet(snippet: str) -> Text:
     """Convert an FTS5 snippet with sentinel-wrapped matches to Rich Text."""
     out = Text()
     remaining = snippet or ""
     while True:
-        i = remaining.find(_FTS_MATCH_START)
+        i = remaining.find(search_queries.FTS_MATCH_START)
         if i < 0:
             out.append(remaining)
             break
         out.append(remaining[:i])
-        remaining = remaining[i + len(_FTS_MATCH_START):]
-        j = remaining.find(_FTS_MATCH_END)
+        remaining = remaining[i + len(search_queries.FTS_MATCH_START):]
+        j = remaining.find(search_queries.FTS_MATCH_END)
         if j < 0:
             # Unterminated — highlight the rest and stop.
             out.append(remaining, style="bold black on yellow")
             break
         out.append(remaining[:j], style="bold black on yellow")
-        remaining = remaining[j + len(_FTS_MATCH_END):]
+        remaining = remaining[j + len(search_queries.FTS_MATCH_END):]
     return out
 
 
@@ -1795,7 +1678,7 @@ class SearchScreen(ModalScreen):
             container.border_title = "Search"
             yield Input(
                 placeholder=(
-                    "Search (prefix match) — "
+                    "Search (prefix first, fuzzy fallback) — "
                     "filters: project:<name> user: assistant:"
                 ),
                 id="search-input",
@@ -1838,7 +1721,11 @@ class SearchScreen(ModalScreen):
             return
 
         try:
-            rows = search_messages(self.conn, raw, limit=50)
+            started_at = time.perf_counter()
+            rows, used_fallback = search_queries.search_messages(
+                self.conn, raw, limit=50
+            )
+            elapsed_ms = (time.perf_counter() - started_at) * 1000.0
         except Exception as e:  # noqa: BLE001
             results_list.clear()
             status.update(f"Search error: {e}")
@@ -1850,11 +1737,15 @@ class SearchScreen(ModalScreen):
 
         count = len(rows)
         if count == 0:
-            status.update("No results")
+            status.update(f"No results in {elapsed_ms:.1f} ms")
         else:
             noun = "result" if count == 1 else "results"
+            prefix = "Fuzzy fallback: " if used_fallback else ""
             status.update(
-                f"{count} {noun}" + (" (showing first 50)" if count >= 50 else "")
+                prefix
+                + f"{count} {noun}"
+                + (" (showing first 50)" if count >= 50 else "")
+                + f" in {elapsed_ms:.1f} ms"
             )
 
     def on_key(self, event) -> None:
