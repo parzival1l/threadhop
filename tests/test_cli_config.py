@@ -141,3 +141,34 @@ def test_set_observe_enabled_rejects_invalid_values(
 
     assert rc == 2
     assert "observe.enabled expects true/false" in capsys.readouterr().err
+
+
+def test_set_observe_enabled_preserves_existing_app_config(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    threadhop_ns: dict,
+):
+    config_file = _point_config_at_tmp(threadhop_ns, tmp_path)
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    config_file.write_text(json.dumps({
+        "theme": "textual-light",
+        "sidebar_width": 42,
+        "export_retention_days": 14,
+    }))
+
+    rc = threadhop_ns["cmd_config"](
+        SimpleNamespace(
+            config_command="set",
+            key="observe.enabled",
+            value="true",
+        )
+    )
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "observe.enabled = true"
+    assert json.loads(config_file.read_text()) == {
+        "theme": "textual-light",
+        "sidebar_width": 42,
+        "export_retention_days": 14,
+        "observe.enabled": True,
+    }
