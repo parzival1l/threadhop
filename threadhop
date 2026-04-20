@@ -56,9 +56,11 @@ def get_available_themes():
 # App-level keys that live in config.json post-migration. Session-level
 # state (session_names, session_order, last_viewed) lives in SQLite per
 # ADR-001. Anything unknown is preserved on save so future settings
-# (sidebar_width, export_retention_days, user-added keys) don't get
-# silently dropped.
-APP_CONFIG_KEYS = {"theme", "sidebar_width", "export_retention_days"}
+# (sidebar_width, export_retention_days, observe.enabled, user-added keys)
+# don't get silently dropped.
+APP_CONFIG_KEYS = {
+    "theme", "sidebar_width", "export_retention_days", "observe.enabled"
+}
 
 EXPORT_DIR = Path("/tmp/threadhop")
 EXPORT_RETENTION_DAYS_DEFAULT = 7
@@ -216,13 +218,14 @@ def cleanup_export_markdown_files(
         retention_days=retention_days,
         recent_grace_seconds=int(recent_grace_period.total_seconds()),
     )
+CLI_CONFIG_KEYS = {"observe.enabled"}
 
 
 def load_config(conn):
     """Return the combined in-memory config.
 
-    App-level keys (`theme`, `sidebar_width`, `export_retention_days`)
-    come from config.json.
+    App-level keys (`theme`, `sidebar_width`, `export_retention_days`,
+    `observe.enabled`) come from config.json.
     Session-level keys (`session_names`, `session_order`, `last_viewed`)
     come from the SQLite `sessions` table — this is the ADR-001 split.
 
@@ -249,6 +252,7 @@ def load_config(conn):
     config["export_retention_days"] = _coerce_retention_days(
         config.get("export_retention_days", EXPORT_RETENTION_DAYS_DEFAULT)
     )
+    config.setdefault("observe.enabled", False)
 
     # 2. Session-level from SQLite.
     try:
@@ -267,11 +271,15 @@ def load_config(conn):
 
 def save_app_config(config):
     """Persist only app-level keys (theme, sidebar_width,
-    export_retention_days, unknown extras) to config.json.
+    export_retention_days, observe.enabled, unknown extras) to config.json.
 
     Session-level keys are deliberately excluded — they live in SQLite
     now and are written through at each mutation site (rename, reorder,
     view) rather than dumped wholesale here.
+    
+    Returns ``True`` when the write succeeded, ``False`` on ``OSError``.
+    Existing call sites that do not check the return value keep their
+    legacy best-effort behaviour.
     """
     try:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -280,8 +288,54 @@ def save_app_config(config):
             if k not in ("session_names", "session_order", "last_viewed")
         }
         CONFIG_FILE.write_text(json.dumps(app_only, indent=2))
+        return True
     except OSError:
+        return False
+
+
+def _load_app_config_file() -> dict:
+    """Return the raw config.json object, or {} if unreadable/missing."""
+    try:
+        if CONFIG_FILE.exists():
+            raw = json.loads(CONFIG_FILE.read_text())
+            if isinstance(raw, dict):
+                return raw
+    except (OSError, json.JSONDecodeError):
         pass
+    return {}
+
+
+def _parse_boolish(value: str) -> bool | None:
+    """Parse common CLI spellings for a boolean config value."""
+    lowered = value.strip().lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _config_value_to_text(value) -> str:
+    """Render a config value back to simple CLI output."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    if isinstance(value, (int, float, str)):
+        return str(value)
+    return json.dumps(value)
+
+
+def _coerce_config_value(key: str, raw_value: str):
+    """Validate and normalize supported config values."""
+    if key == "observe.enabled":
+        parsed = _parse_boolish(raw_value)
+        if parsed is None:
+            raise ValueError(
+                "observe.enabled expects true/false (also accepts 1/0, on/off, yes/no)."
+            )
+        return parsed
+    raise ValueError(f"Unsupported config key: {key}")
 
 
 def get_recent_searches(config: dict | None) -> list[str]:
@@ -5639,6 +5693,41 @@ def build_parser():
         ),
     )
 
+    config_p = subparsers.add_parser(
+        "config",
+        help="Read or update app-level config values",
+        description=(
+            "Read or update settings stored in "
+            "~/.config/threadhop/config.json. Currently the supported "
+            "CLI-managed key is `observe.enabled`, a durable flag for "
+            "hook-driven observer auto-start."
+        ),
+    )
+    config_subparsers = config_p.add_subparsers(
+        dest="config_command",
+        required=True,
+    )
+    config_get_p = config_subparsers.add_parser(
+        "get",
+        help="Print a config value",
+    )
+    config_get_p.add_argument(
+        "key",
+        choices=sorted(CLI_CONFIG_KEYS),
+    )
+    config_set_p = config_subparsers.add_parser(
+        "set",
+        help="Persist a config value",
+    )
+    config_set_p.add_argument(
+        "key",
+        choices=sorted(CLI_CONFIG_KEYS),
+    )
+    config_set_p.add_argument(
+        "value",
+        help="Value to persist (for observe.enabled: true/false).",
+    )
+
     handoff_p = subparsers.add_parser(
         "handoff",
         help="Produce a handoff brief for a session",
@@ -5879,6 +5968,47 @@ def cmd_observe(args) -> int:
     return 0
 
 
+def cmd_config(args) -> int:
+    """Read or update app-level config.json values."""
+    if args.config_command == "get":
+        config = _load_app_config_file()
+        if args.key == "observe.enabled":
+            value = config.get(args.key, False)
+        else:
+            if args.key not in config:
+                print(
+                    f"threadhop config: {args.key} is not set.",
+                    file=sys.stderr,
+                )
+                return 1
+            value = config[args.key]
+        print(_config_value_to_text(value))
+        return 0
+
+    if args.config_command == "set":
+        try:
+            value = _coerce_config_value(args.key, args.value)
+        except ValueError as e:
+            print(f"threadhop config: {e}", file=sys.stderr)
+            return 2
+        config = _load_app_config_file()
+        config[args.key] = value
+        if not save_app_config(config):
+            print(
+                f"threadhop config: could not write {CONFIG_FILE}.",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"{args.key} = {_config_value_to_text(value)}")
+        return 0
+
+    print(
+        f"threadhop config: unsupported action {args.config_command}",
+        file=sys.stderr,
+    )
+    return 2
+
+
 def cmd_conflicts(args) -> int:
     """List cross-session conflict entries as compact JSON lines."""
     conn = db.init_db()
@@ -6084,6 +6214,8 @@ def main():
         return cmd_todos(args)
     if args.command == "decisions":
         return cmd_decisions(args)
+    if args.command == "config":
+        return cmd_config(args)
     if args.command == "observe":
         return cmd_observe(args)
     if args.command == "conflicts":

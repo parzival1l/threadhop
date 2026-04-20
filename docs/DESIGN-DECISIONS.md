@@ -494,8 +494,8 @@ Reflector process (claude -p --model haiku, companion to observer)
 # CLI: observe a specific session from another terminal
 threadhop observe --session <id> &
 
-# Auto-observe all sessions (NOT default, opt-in via config)
-threadhop config set observe.auto true
+# Auto-observe all sessions (NOT default, opt-in via config-backed hook)
+threadhop config set observe.enabled true
 ```
 
 The primary model is per-session opt-in via the skill. Most conversations
@@ -575,7 +575,7 @@ second skill (`/threadhop:insights`). Neither requires the TUI.
   design decisions, complex debugging sessions
 - Per-session opt-in means zero cost for throwaway sessions
 - A global auto-observe flag remains available as a power-user option
-  (`threadhop config set observe.auto true`) but is NOT the default
+  (`threadhop config set observe.enabled true`) but is NOT the default
 
 **Trigger point 1 — beginning of conversation:**
 
