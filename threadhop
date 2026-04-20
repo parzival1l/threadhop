@@ -540,6 +540,8 @@ COMMAND_REGISTRY: list[Command] = [
     ),
     Command(("n",), "Rename session", SCOPE_SESSION_LIST, "rename_session", footer=True),
     Command(("g",), "Copy resume command", SCOPE_SESSION_LIST, "copy_session_id"),
+    Command(("o",), "Copy observation path / start observing", SCOPE_SESSION_LIST, "observe_session"),
+    Command(("O",), "Resume observation", SCOPE_SESSION_LIST, "resume_observation"),
     Command(("s",), "Cycle status forward", SCOPE_SESSION_LIST, "cycle_status_forward"),
     Command(("S",), "Cycle status backward", SCOPE_SESSION_LIST, "cycle_status_backward"),
     Command(("a",), "Archive session", SCOPE_SESSION_LIST, "archive_session"),
@@ -697,7 +699,25 @@ def _session_display_name(session_data: dict, custom_name: str | None) -> str:
         return title
     return session_data["project"]
 
+def copy_to_clipboard(text: str) -> bool:
+    """Copy text to the system clipboard."""
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["pbcopy"], input=text.encode(), check=True)
+        else:
+            subprocess.run(
+                ["xclip", "-selection", "clipboard"],
+                input=text.encode(),
+                check=True,
+            )
+        return True
+    except Exception:
+        return False
 
+
+def build_observe_command(session_id: str) -> list[str]:
+    """Spawn the CLI sidecar through the current executable script."""
+    return [str(Path(__file__).resolve()), "observe", "--session", session_id]
 def render_session_label_text(
     session_data: dict,
     *,
@@ -3121,6 +3141,62 @@ class LabelPromptScreen(ModalScreen):
         self.action_submit()
 
 
+class ConfirmScreen(ModalScreen):
+    """Minimal yes/no confirmation modal for TUI actions."""
+
+    BINDINGS = [
+        Binding("y", "confirm", "Yes", priority=True, show=False),
+        Binding("n", "cancel", "No", priority=True, show=False),
+        Binding("enter", "confirm", "Yes", priority=True, show=False),
+        Binding("escape", "cancel", "No", priority=True, show=False),
+    ]
+
+    CSS = """
+    ConfirmScreen {
+        layout: vertical;
+        align: center middle;
+        background: $background 70%;
+    }
+
+    #confirm-container {
+        width: 72;
+        max-width: 90%;
+        height: auto;
+        background: $surface;
+        border: thick $accent;
+        padding: 1 2;
+        layout: vertical;
+    }
+
+    #confirm-title {
+        color: $text;
+        text-style: bold;
+    }
+
+    #confirm-hint {
+        height: 1;
+        margin-top: 1;
+        color: $text-muted;
+        text-style: italic;
+    }
+    """
+
+    def __init__(self, title: str):
+        super().__init__()
+        self._title = title
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm-container"):
+            yield Static(self._title, id="confirm-title")
+            yield Static("y/Enter = yes • n/Esc = no", id="confirm-hint")
+
+    def action_confirm(self) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
 class HelpScreen(ModalScreen):
     """Full-app help overlay grouped by scope (ADR-017, task #42).
 
@@ -4176,18 +4252,107 @@ class ClaudeSessions(App):
         session_id = list_view.highlighted_child.session_data.get("session_id", "")
         cmd = f"claude -r {session_id}"
         try:
-            if sys.platform == "darwin":
-                subprocess.run(["pbcopy"], input=cmd.encode(), check=True)
-            else:
-                subprocess.run(
-                    ["xclip", "-selection", "clipboard"],
-                    input=cmd.encode(),
-                    check=True,
-                )
+            if not copy_to_clipboard(cmd):
+                raise RuntimeError("clipboard unavailable")
             self.notify(f"Copied: {cmd}")
         except Exception:
             # Fallback: just show the command
             self.notify(f"Resume: {cmd}", timeout=10)
+
+    def _highlighted_session_item(self) -> SessionItem | None:
+        list_view = self.query_one("#session-list", ListView)
+        item = list_view.highlighted_child
+        if isinstance(item, SessionItem):
+            return item
+        return None
+
+    def _spawn_observer(self, session_id: str) -> bool:
+        try:
+            subprocess.Popen(
+                build_observe_command(session_id),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return True
+        except Exception as e:
+            self.notify(f"Failed to start observer: {e}", severity="error")
+            return False
+
+    def _refresh_session_observation(self, session_id: str) -> dict | None:
+        try:
+            return _refresh_observer_state(self.conn, session_id)
+        except Exception:
+            return None
+
+    def _confirm_observer_start(self, session_id: str, prompt: str, success_message: str) -> None:
+        def _after(confirm: bool | None) -> None:
+            if not confirm:
+                return
+            state = self._refresh_session_observation(session_id)
+            if state is not None and state.get("observer_pid") is not None:
+                self.notify("Observer already running")
+                return
+            if self._spawn_observer(session_id):
+                self.notify(success_message)
+
+        self.push_screen(ConfirmScreen(prompt), _after)
+
+    def action_observe_session(self) -> None:
+        if self._input_has_focus():
+            return
+        item = self._highlighted_session_item()
+        if item is None:
+            return
+        session = item.session_data
+        session_id = session.get("session_id", "")
+        state = self._refresh_session_observation(session_id)
+        is_observed = bool(session.get("has_observations"))
+        if state is not None and int(state.get("entry_count") or 0) > 0:
+            is_observed = True
+        if is_observed:
+            obs_path = state.get("obs_path") if state else None
+            if obs_path and copy_to_clipboard(str(obs_path)):
+                self.notify("Observation path copied")
+            elif obs_path:
+                self.notify(str(obs_path), timeout=10)
+            else:
+                self.notify("Observation path unavailable", severity="warning")
+            return
+
+        if state is not None and state.get("observer_pid") is not None:
+            self.notify("Observer already running")
+            return
+        self._confirm_observer_start(
+            session_id,
+            "No observations yet. Start observing? (y/n)",
+            "Observer starting in background",
+        )
+
+    def action_resume_observation(self) -> None:
+        if self._input_has_focus():
+            return
+        item = self._highlighted_session_item()
+        if item is None:
+            return
+        session = item.session_data
+        session_id = session.get("session_id", "")
+        state = self._refresh_session_observation(session_id)
+        entry_count = 0
+        if state is not None:
+            entry_count = int(state.get("entry_count") or 0)
+        if entry_count <= 0:
+            self.notify("No observations to resume", severity="warning")
+            return
+        if state is not None and state.get("observer_pid") is not None:
+            self.notify("Observer already running")
+            return
+        self._confirm_observer_start(
+            session_id,
+            "Resume observation from last offset? (y/n)",
+            "Observation resumed in background",
+        )
 
     def _input_has_focus(self) -> bool:
         if self.query_one("#reply-input", TextArea).has_focus:
