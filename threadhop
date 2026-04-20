@@ -2,6 +2,8 @@
 # /// script
 # dependencies = [
 #   "textual>=0.89.0",
+#   "watchdog>=4.0.0",
+#   "pydantic>=2.0",
 # ]
 # ///
 """ThreadHop — cross-session context manager for Claude Code"""
@@ -10,6 +12,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -33,8 +36,10 @@ from textual.worker import Worker
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import db  # noqa: E402
 import indexer  # noqa: E402
+import cli_queries  # noqa: E402
 import observation_queries  # noqa: E402
 import observer  # noqa: E402
+import reflector  # noqa: E402
 
 
 def get_available_themes():
@@ -168,6 +173,7 @@ SCOPE_SELECTION = "selection"
 SCOPE_REPLY = "reply"
 SCOPE_FIND = "find"
 SCOPE_SEARCH = "search"
+SCOPE_BOOKMARKS = "bookmarks"
 
 SCOPE_ORDER: list[str] = [
     SCOPE_GLOBAL,
@@ -177,6 +183,7 @@ SCOPE_ORDER: list[str] = [
     SCOPE_REPLY,
     SCOPE_FIND,
     SCOPE_SEARCH,
+    SCOPE_BOOKMARKS,
 ]
 
 SCOPE_LABELS: dict[str, str] = {
@@ -187,6 +194,7 @@ SCOPE_LABELS: dict[str, str] = {
     SCOPE_REPLY: "Reply input",
     SCOPE_FIND: "Find bar",
     SCOPE_SEARCH: "Search modal",
+    SCOPE_BOOKMARKS: "Bookmarks modal",
 }
 
 # Pretty-print Textual key strings for the help overlay and footer.
@@ -253,6 +261,7 @@ COMMAND_REGISTRY: list[Command] = [
     Command(("T",), "Previous theme", SCOPE_GLOBAL, "toggle_theme_prev"),
     Command(("/",), "Search all sessions", SCOPE_GLOBAL, "open_search", footer=True),
     Command(("ctrl+f",), "Find in transcript", SCOPE_GLOBAL, "open_find", footer=True),
+    Command(("b",), "Browse bookmarks", SCOPE_GLOBAL, "open_bookmarks", footer=True),
     Command(("left_square_bracket",), "Shrink sidebar", SCOPE_GLOBAL, "shrink_sidebar"),
     Command(("right_square_bracket",), "Grow sidebar", SCOPE_GLOBAL, "grow_sidebar"),
 
@@ -305,6 +314,8 @@ COMMAND_REGISTRY: list[Command] = [
     Command(("v",), "Toggle range select", SCOPE_SELECTION, footer=True),
     Command(("y",), "Copy selection", SCOPE_SELECTION, footer=True),
     Command(("e",), "Export to /tmp", SCOPE_SELECTION, footer=True),
+    Command(("space",), "Toggle bookmark", SCOPE_SELECTION, footer=True),
+    Command(("L",), "Label bookmark", SCOPE_SELECTION),
     Command(("m", "escape"), "Exit selection", SCOPE_SELECTION, footer=True),
 
     # --- Reply input ---
@@ -328,6 +339,13 @@ COMMAND_REGISTRY: list[Command] = [
     Command(("up", "down", "ctrl+n", "ctrl+p"), "Navigate results", SCOPE_SEARCH, footer=True),
     Command(("enter",), "Open result", SCOPE_SEARCH, footer=True),
     Command(("escape",), "Close search", SCOPE_SEARCH, footer=True),
+
+    # --- Bookmark browser modal (widget-local; BookmarkBrowserScreen.on_key) ---
+    Command(("up", "down", "ctrl+n", "ctrl+p"), "Navigate bookmarks", SCOPE_BOOKMARKS, footer=True),
+    Command(("enter",), "Jump to message", SCOPE_BOOKMARKS, footer=True),
+    Command(("L",), "Edit label", SCOPE_BOOKMARKS, footer=True),
+    Command(("d",), "Delete bookmark", SCOPE_BOOKMARKS, footer=True),
+    Command(("escape",), "Close", SCOPE_BOOKMARKS, footer=True),
 ]
 
 
@@ -590,6 +608,14 @@ class TranscriptView(VerticalScroll):
                 self._export_selection()
                 event.stop()
                 event.prevent_default()
+            elif event.key == "space":
+                self.app.bookmark_toggle_selection()
+                event.stop()
+                event.prevent_default()
+            elif event.key == "L":
+                self.app.bookmark_prompt_label()
+                event.stop()
+                event.prevent_default()
             elif event.key == "escape":
                 if self._range_mode:
                     self._exit_range_mode()
@@ -606,7 +632,10 @@ class TranscriptView(VerticalScroll):
         # Start at the last message — recent context is usually what you want
         self._selected_index = len(messages) - 1
         self._update_selection(messages)
-        self.app.notify("Selection mode: j/k move, v range, y copy, e export, m/Esc exit")
+        self.app.notify(
+            "Selection mode: j/k move, v range, y copy, e export, "
+            "space bookmark, L label, m/Esc exit"
+        )
         # Nudge the contextual footer — selection mode has its own scope.
         try:
             self.app.refresh_footer()
@@ -701,7 +730,7 @@ class TranscriptView(VerticalScroll):
                 f"({pos}/{total}) (j/k extend, v/Esc cancel)"
             )
         else:
-            self.border_title = f"Transcript ── SELECT {pos}/{total} (j/k move, v range, y/e copy/export, m/Esc exit)"
+            self.border_title = f"Transcript ── SELECT {pos}/{total} (j/k move, v range, y/e copy/export, space bookmark, L label, m/Esc exit)"
 
     def _clear_selection(self):
         for widget in self._get_message_widgets():
@@ -1918,6 +1947,401 @@ class SearchScreen(ModalScreen):
         self.dismiss((row["session_id"], row["uuid"], terms))
 
 
+class BookmarkItem(ListItem):
+    """One row in the bookmark browser.
+
+    Layout mirrors SearchResultItem so the two modals feel like siblings:
+    label / role marker + snippet, then session · project · timestamp.
+    Bookmarks without a label fall back to the message role marker alone.
+    """
+
+    def __init__(self, row: dict):
+        self.row = row
+        super().__init__()
+
+    def compose(self) -> ComposeResult:
+        role = self.row.get("role", "")
+        role_icon = "▶" if role == "user" else "●"
+        role_style = "bold cyan" if role == "user" else "bold green"
+        label = (self.row.get("label") or "").strip()
+
+        first_line = Text()
+        first_line.append("★ ", style="bold yellow")
+        if label:
+            first_line.append(label, style="bold")
+            first_line.append("  ", style="dim")
+        first_line.append(f"{role_icon} ", style=role_style)
+        # Trim the stored text to a single-line snippet — the full body
+        # is reachable via Enter → jump.
+        raw_text = (self.row.get("text") or "").strip().replace("\n", " ")
+        snippet = raw_text[:160] + ("…" if len(raw_text) > 160 else "")
+        first_line.append(snippet)
+
+        session_name = (
+            self.row.get("custom_name")
+            or self.row.get("project")
+            or (self.row.get("session_id", "") or "")[:8]
+        )
+        project = self.row.get("project") or ""
+        ts_raw = self.row.get("timestamp") or ""
+        ts_str = ts_raw[:16]
+        try:
+            dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            ts_str = dt.strftime("%Y-%m-%d %H:%M")
+        except (ValueError, AttributeError):
+            pass
+
+        meta = Text()
+        meta.append("  ", style="dim")
+        meta.append(str(session_name), style="bold")
+        if project and project != session_name:
+            meta.append("  ·  ", style="dim")
+            meta.append(str(project), style="cyan")
+        meta.append("  ·  ", style="dim")
+        meta.append(ts_str, style="dim")
+
+        yield Static(Group(first_line, meta), classes="bookmark-item")
+
+
+class BookmarkBrowserScreen(ModalScreen):
+    """Modal bookmark browser (task #18).
+
+    Shares the SearchScreen layout — filter Input on top, ListView of
+    results, status + hint lines at the bottom — so keyboard muscle
+    memory carries over. Filter runs case-insensitive substring matches
+    over label / message body / project / custom name via
+    ``db.list_bookmarks``.
+
+    Dismiss payload:
+      - ``(session_id, message_uuid)`` when the user hits Enter on a row
+      - ``None`` on Escape
+
+    The caller routes the payload through ``_jump_to_search_result``
+    which handles all three cases (same session, sidebar session,
+    cross-project/out-of-view session).
+    """
+
+    DEBOUNCE_SECONDS = 0.08
+
+    BINDINGS = [
+        Binding("enter", "open_result", "Open", priority=True, show=False),
+    ]
+
+    CSS = """
+    BookmarkBrowserScreen {
+        layout: vertical;
+        align: center top;
+        background: $background 70%;
+    }
+
+    #bookmark-container {
+        width: 90%;
+        max-width: 140;
+        height: 85%;
+        margin-top: 1;
+        background: $surface;
+        border: thick $accent;
+        layout: vertical;
+    }
+
+    #bookmark-input {
+        margin: 0;
+        border: none;
+        background: $boost;
+    }
+
+    #bookmark-input:focus {
+        background: $boost;
+    }
+
+    #bookmark-results {
+        height: 1fr;
+        background: $surface;
+    }
+
+    #bookmark-status {
+        height: 1;
+        padding: 0 1;
+        color: $text-muted;
+        background: $boost;
+    }
+
+    #bookmark-help {
+        height: 1;
+        padding: 0 1;
+        color: $text-muted;
+        background: $boost;
+        text-style: italic;
+    }
+
+    .bookmark-item {
+        padding: 0 1;
+    }
+
+    BookmarkItem {
+        padding: 0;
+    }
+    """
+
+    def __init__(self, conn: sqlite3.Connection):
+        super().__init__()
+        self.conn = conn
+        self._filter_timer = None
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="bookmark-container") as container:
+            container.border_title = "Bookmarks"
+            yield Input(
+                placeholder="Filter bookmarks by label, text, or session…",
+                id="bookmark-input",
+            )
+            yield Static("", id="bookmark-status")
+            yield ListView(id="bookmark-results")
+            yield Static(
+                "↑/↓ navigate • Enter jump • L label • d delete • Esc close",
+                id="bookmark-help",
+            )
+
+    def on_mount(self) -> None:
+        self._refresh_results("")
+        self.query_one("#bookmark-input", Input).focus()
+
+    def on_input_changed(self, event) -> None:
+        try:
+            if event.input.id != "bookmark-input":
+                return
+        except AttributeError:
+            return
+        if self._filter_timer is not None:
+            try:
+                self._filter_timer.stop()
+            except Exception:
+                pass
+        value = event.value
+        self._filter_timer = self.set_timer(
+            self.DEBOUNCE_SECONDS, lambda v=value: self._refresh_results(v)
+        )
+
+    def _refresh_results(self, raw_query: str) -> None:
+        """Reload the results list from the DB. Preserves cursor position
+        when possible so in-place edits (label / delete) don't jump the
+        user back to the top."""
+        results_list = self.query_one("#bookmark-results", ListView)
+        status = self.query_one("#bookmark-status", Static)
+
+        prev_idx = results_list.index
+        results_list.clear()
+
+        query = raw_query.strip() or None
+        try:
+            rows = db.list_bookmarks(self.conn, query=query, limit=200)
+        except Exception as e:  # noqa: BLE001
+            status.update(f"Bookmark query error: {e}")
+            return
+
+        for row in rows:
+            results_list.append(BookmarkItem(row))
+
+        count = len(rows)
+        if count == 0:
+            status.update("No bookmarks" if query is None else "No bookmarks match")
+        else:
+            noun = "bookmark" if count == 1 else "bookmarks"
+            status.update(
+                f"{count} {noun}" + (" (showing first 200)" if count >= 200 else "")
+            )
+
+        # Restore cursor if still in range — otherwise clamp.
+        if count:
+            if prev_idx is None:
+                results_list.index = 0
+            else:
+                results_list.index = min(prev_idx, count - 1)
+
+    def on_key(self, event) -> None:
+        key = event.key
+        if key == "escape":
+            event.stop()
+            event.prevent_default()
+            self.dismiss(None)
+        elif key in ("down", "ctrl+n"):
+            event.stop()
+            event.prevent_default()
+            self._move_selection(1)
+        elif key in ("up", "ctrl+p"):
+            event.stop()
+            event.prevent_default()
+            self._move_selection(-1)
+        elif key == "L":
+            event.stop()
+            event.prevent_default()
+            self._edit_label_selected()
+        elif key == "d":
+            event.stop()
+            event.prevent_default()
+            self._delete_selected()
+
+    def action_open_result(self) -> None:
+        self._open_selected()
+
+    def on_input_submitted(self, event) -> None:
+        try:
+            if event.input.id != "bookmark-input":
+                return
+        except AttributeError:
+            return
+        event.stop()
+        self._open_selected()
+
+    def _move_selection(self, delta: int) -> None:
+        lv = self.query_one("#bookmark-results", ListView)
+        count = len(lv.children)
+        if count == 0:
+            return
+        if lv.index is None:
+            lv.index = 0 if delta > 0 else count - 1
+            return
+        lv.index = max(0, min(count - 1, lv.index + delta))
+
+    def _current_row(self) -> dict | None:
+        lv = self.query_one("#bookmark-results", ListView)
+        if not lv.children:
+            return None
+        idx = lv.index if lv.index is not None else 0
+        if idx < 0 or idx >= len(lv.children):
+            idx = 0
+        item = lv.children[idx]
+        if not isinstance(item, BookmarkItem):
+            return None
+        return item.row
+
+    def _open_selected(self) -> None:
+        row = self._current_row()
+        if row is None:
+            return
+        self.dismiss((row["session_id"], row["message_uuid"]))
+
+    def _edit_label_selected(self) -> None:
+        row = self._current_row()
+        if row is None:
+            return
+        bookmark_id = row["id"]
+        current = row.get("label") or ""
+
+        def _apply(new_label: str | None) -> None:
+            if new_label is None:
+                return
+            try:
+                db.set_bookmark_label(self.conn, bookmark_id, new_label)
+            except Exception as e:  # noqa: BLE001
+                self.app.notify(f"Label update failed: {e}", severity="error")
+                return
+            # Refresh in place so the edited label renders immediately.
+            raw = self.query_one("#bookmark-input", Input).value or ""
+            self._refresh_results(raw)
+            shown = new_label.strip() or "(no label)"
+            self.app.notify(f"Label: {shown}")
+
+        self.app.push_screen(LabelPromptScreen(current), _apply)
+
+    def _delete_selected(self) -> None:
+        row = self._current_row()
+        if row is None:
+            return
+        try:
+            db.delete_bookmark(self.conn, row["id"])
+        except Exception as e:  # noqa: BLE001
+            self.app.notify(f"Delete failed: {e}", severity="error")
+            return
+        raw = self.query_one("#bookmark-input", Input).value or ""
+        self._refresh_results(raw)
+        self.app.notify("Bookmark removed")
+
+
+class LabelPromptScreen(ModalScreen):
+    """Tiny modal that captures a single line of text.
+
+    Used both when setting a label from selection mode and when editing
+    one from the browser. Returns the submitted string on Enter, or
+    ``None`` on Escape — caller decides whether an empty submission
+    means "clear" (bookmark browser does that via set_bookmark_label's
+    blank-collapses-to-NULL behaviour).
+    """
+
+    BINDINGS = [
+        Binding("enter", "submit", "Save", priority=True, show=False),
+        Binding("escape", "cancel", "Cancel", priority=True, show=False),
+    ]
+
+    CSS = """
+    LabelPromptScreen {
+        layout: vertical;
+        align: center middle;
+        background: $background 70%;
+    }
+
+    #label-container {
+        width: 70;
+        max-width: 90%;
+        height: auto;
+        background: $surface;
+        border: thick $accent;
+        padding: 1 2;
+        layout: vertical;
+    }
+
+    #label-title {
+        height: 1;
+        text-style: bold;
+        color: $text;
+    }
+
+    #label-input {
+        margin-top: 1;
+    }
+
+    #label-hint {
+        height: 1;
+        margin-top: 1;
+        color: $text-muted;
+        text-style: italic;
+    }
+    """
+
+    def __init__(self, initial: str = ""):
+        super().__init__()
+        self._initial = initial
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="label-container"):
+            yield Static("Bookmark label", id="label-title")
+            yield Input(
+                value=self._initial,
+                placeholder="Label (blank = clear)",
+                id="label-input",
+            )
+            yield Static("Enter to save • Esc to cancel", id="label-hint")
+
+    def on_mount(self) -> None:
+        self.query_one("#label-input", Input).focus()
+
+    def action_submit(self) -> None:
+        value = self.query_one("#label-input", Input).value or ""
+        self.dismiss(value)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_input_submitted(self, event) -> None:
+        try:
+            if event.input.id != "label-input":
+                return
+        except AttributeError:
+            return
+        event.stop()
+        self.action_submit()
+
+
 class HelpScreen(ModalScreen):
     """Full-app help overlay grouped by scope (ADR-017, task #42).
 
@@ -2470,60 +2894,7 @@ class ClaudeSessions(App):
         For `claude -r` (no ID) or `claude -c`, we match by CWD to find the
         most recent session in that project.
         """
-        active_ids = set()
-        cwd_pids = {}  # pid -> cwd for processes without explicit session IDs
-
-        try:
-            # Get all claude CLI processes (not Claude.app, not Windsurf extension)
-            result = subprocess.run(
-                ["ps", "-eo", "pid,args"],
-                capture_output=True, text=True, timeout=5,
-            )
-            for line in result.stdout.strip().split("\n"):
-                line = line.strip()
-                if not line:
-                    continue
-                parts = line.split(None, 1)
-                if len(parts) < 2:
-                    continue
-                pid_str, args = parts
-                is_interactive, explicit_id = _parse_claude_process_args(args)
-                if not is_interactive:
-                    continue
-
-                if explicit_id:
-                    active_ids.add(explicit_id)
-                else:
-                    try:
-                        cwd_pids[int(pid_str)] = None
-                    except ValueError:
-                        pass
-
-            # For processes without explicit IDs, get their CWD via lsof
-            if cwd_pids:
-                pid_list = ",".join(str(p) for p in cwd_pids)
-                result = subprocess.run(
-                    ["lsof", "-a", "-d", "cwd", "-p", pid_list, "-Fn"],
-                    capture_output=True, text=True, timeout=5,
-                )
-                current_pid = None
-                for line in result.stdout.strip().split("\n"):
-                    if line.startswith("p"):
-                        current_pid = int(line[1:])
-                    elif line.startswith("n") and current_pid:
-                        cwd_pids[current_pid] = line[1:]
-
-                # Match CWD to most recent session in that project
-                for pid, cwd in cwd_pids.items():
-                    if not cwd:
-                        continue
-                    sid = _resolve_session_id_by_cwd(cwd)
-                    if sid:
-                        active_ids.add(sid)
-        except Exception:
-            pass
-
-        return active_ids
+        return get_active_claude_session_ids()
 
     def _gather_session_data(self) -> dict:
         """Gather session data from JSONL files"""
@@ -3169,6 +3540,104 @@ class ClaudeSessions(App):
         if self._input_has_focus():
             return
         self.push_screen(SearchScreen(self.conn), self._on_search_dismissed)
+
+    def action_open_bookmarks(self) -> None:
+        """Open the bookmark browser modal (task #18).
+
+        Skips while a text input holds focus so `b` still types when the
+        user is composing a reply / filtering search. Dismiss payload is
+        ``(session_id, message_uuid)``; we reuse the search jump path so
+        bookmarks in out-of-sidebar sessions load just like search hits.
+        """
+        if self._input_has_focus():
+            return
+        self.push_screen(
+            BookmarkBrowserScreen(self.conn),
+            self._on_bookmark_dismissed,
+        )
+
+    def _on_bookmark_dismissed(self, result) -> None:
+        """Route a bookmark pick through the same jump path as search
+        results. ``None`` means the user hit Escape without picking."""
+        if result is None:
+            return
+        try:
+            session_id, message_uuid = result
+        except (TypeError, ValueError):
+            return
+        self._jump_to_search_result(session_id, message_uuid, search_terms=None)
+
+    def bookmark_toggle_selection(self) -> None:
+        """Selection-mode `space`: toggle a bookmark on each selected
+        message. Messages without a stored uuid (rare — synthetic or
+        pre-index) are silently skipped; the rest flip independently so
+        a range with mixed state ends up consistent with the user's
+        intent per message."""
+        transcript = self.query_one("#transcript-scroll", TranscriptView)
+        selected = transcript.get_selected_messages()
+        if not selected:
+            return
+        created = 0
+        removed = 0
+        skipped = 0
+        with db.transaction(self.conn):
+            for widget in selected:
+                uuid = getattr(widget, "_uuid", None)
+                if not uuid:
+                    skipped += 1
+                    continue
+                result = db.toggle_bookmark(self.conn, uuid)
+                if result is None:
+                    removed += 1
+                else:
+                    created += 1
+        parts = []
+        if created:
+            parts.append(f"{created} bookmarked")
+        if removed:
+            parts.append(f"{removed} removed")
+        if skipped and not parts:
+            parts.append(f"{skipped} skipped (no uuid)")
+        self.notify(", ".join(parts) if parts else "No bookmarks changed")
+
+    def bookmark_prompt_label(self) -> None:
+        """Selection-mode `L`: prompt for a label on the (single) focused
+        message. For range selections we label the cursor message only —
+        bulk labeling is an anti-pattern for a short free-text field."""
+        transcript = self.query_one("#transcript-scroll", TranscriptView)
+        messages = transcript._get_message_widgets()
+        if not transcript._selection_mode or not messages:
+            return
+        idx = transcript._selected_index
+        if idx < 0 or idx >= len(messages):
+            return
+        widget = messages[idx]
+        uuid = getattr(widget, "_uuid", None)
+        if not uuid:
+            self.notify("Message has no uuid — cannot bookmark", severity="warning")
+            return
+
+        existing = db.get_bookmark(self.conn, uuid)
+        current = existing["label"] if existing and existing.get("label") else ""
+
+        def _apply(new_label: str | None) -> None:
+            if new_label is None:
+                return
+            # If the message isn't bookmarked yet, create one first so
+            # we have an id to label. This makes `L` on an unbookmarked
+            # message behave like "bookmark + label in one step".
+            row = db.get_bookmark(self.conn, uuid)
+            if row is None:
+                row = db.toggle_bookmark(self.conn, uuid)
+                if row is None:
+                    # Extremely unlikely — the toggle raced a delete.
+                    self.notify("Could not create bookmark", severity="error")
+                    return
+            db.set_bookmark_label(self.conn, row["id"], new_label)
+            shown = (new_label or "").strip() or "(no label)"
+            self.notify(f"Bookmark label: {shown}")
+
+        self.push_screen(LabelPromptScreen(current), _apply)
 
     def action_open_find(self) -> None:
         """Toggle the persistent in-transcript find bar.
@@ -3846,6 +4315,61 @@ def _parse_claude_process_args(args: str) -> tuple[bool, str | None]:
     return (is_interactive, explicit_id)
 
 
+def get_active_claude_session_ids() -> set[str]:
+    """Detect running interactive Claude session ids on macOS/Linux."""
+    active_ids = set()
+    cwd_pids = {}  # pid -> cwd for processes without explicit session IDs
+
+    try:
+        result = subprocess.run(
+            ["ps", "-eo", "pid,args"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(None, 1)
+            if len(parts) < 2:
+                continue
+            pid_str, args = parts
+            is_interactive, explicit_id = _parse_claude_process_args(args)
+            if not is_interactive:
+                continue
+
+            if explicit_id:
+                active_ids.add(explicit_id)
+            else:
+                try:
+                    cwd_pids[int(pid_str)] = None
+                except ValueError:
+                    pass
+
+        if cwd_pids:
+            pid_list = ",".join(str(p) for p in cwd_pids)
+            result = subprocess.run(
+                ["lsof", "-a", "-d", "cwd", "-p", pid_list, "-Fn"],
+                capture_output=True, text=True, timeout=5,
+            )
+            current_pid = None
+            for line in result.stdout.strip().split("\n"):
+                if line.startswith("p"):
+                    current_pid = int(line[1:])
+                elif line.startswith("n") and current_pid:
+                    cwd_pids[current_pid] = line[1:]
+
+            for cwd in cwd_pids.values():
+                if not cwd:
+                    continue
+                sid = _resolve_session_id_by_cwd(cwd)
+                if sid:
+                    active_ids.add(sid)
+    except Exception:
+        pass
+
+    return active_ids
+
+
 def _resolve_session_id_by_cwd(cwd: str) -> str | None:
     """Given a claude process CWD, return the most-recently-modified session id
     in the matching `~/.claude/projects/<encoded>` directory."""
@@ -3965,6 +4489,148 @@ def _cli_stub(command):
     return 0
 
 
+def _ensure_cli_session_row(
+    conn: sqlite3.Connection,
+    session_id: str,
+) -> dict | None:
+    """Return the session row for ``session_id``, seeding it from disk if needed."""
+    row = db.get_session(conn, session_id)
+    if row is not None:
+        return row
+    session_path = find_session_path(session_id)
+    if session_path is None:
+        return None
+    db.upsert_session(
+        conn, session_id, str(session_path),
+        project=session_path.parent.name,
+    )
+    return db.get_session(conn, session_id)
+
+
+def _query_cli_sessions(
+    conn: sqlite3.Connection,
+    *,
+    project: str | None = None,
+    session_id: str | None = None,
+) -> list[dict]:
+    """Resolve the sessions targeted by a CLI query.
+
+    Project filtering intentionally goes through SQLite's ``sessions`` table
+    (ADR-019) rather than inferring the project from observation filenames.
+    """
+    if session_id:
+        row = _ensure_cli_session_row(conn, session_id)
+        return [row] if row is not None else []
+
+    sql = (
+        "SELECT session_id, session_path, project, modified_at "
+        "FROM sessions"
+    )
+    params: list[str] = []
+    if project:
+        sql += " WHERE project LIKE ?"
+        params.append(f"%{project}%")
+    sql += " ORDER BY modified_at IS NULL, modified_at DESC, session_id"
+    return db.query_all(conn, sql, tuple(params))
+
+
+def _obs_path_for_session(
+    conn: sqlite3.Connection,
+    session_id: str,
+) -> Path:
+    """Return the canonical observation-file path for ``session_id``."""
+    state = db.get_observation_state(conn, session_id)
+    if state is not None and state.get("obs_path"):
+        return Path(state["obs_path"])
+    return db.OBS_DIR / f"{session_id}.jsonl"
+
+
+def _catch_up_cli_observations(
+    conn: sqlite3.Connection,
+    sessions: list[dict],
+) -> list[str]:
+    """Run the observer once per targeted session, collecting hard failures."""
+    errors: list[str] = []
+    for row in sessions:
+        sid = row["session_id"]
+        result = observer.observe_session(conn, sid)
+        if result.get("status") == "failed":
+            errors.append(
+                f"{sid}: {result.get('message') or result.get('error') or 'observer failed'}"
+            )
+    return errors
+
+
+def _sessions_with_observation_files(
+    conn: sqlite3.Connection,
+    sessions: list[dict],
+) -> tuple[list[dict], list[Path]]:
+    """Filter ``sessions`` down to rows that already participate in observations."""
+    filtered_sessions: list[dict] = []
+    obs_paths: list[Path] = []
+    for row in sessions:
+        obs_path = _obs_path_for_session(conn, row["session_id"])
+        state = db.get_observation_state(conn, row["session_id"])
+        if not obs_path.exists() and state is None:
+            continue
+        filtered_sessions.append(row)
+        obs_paths.append(obs_path)
+    return filtered_sessions, obs_paths
+
+
+def _load_observation_lines(
+    conn: sqlite3.Connection,
+    *,
+    project: str | None = None,
+    session_id: str | None = None,
+) -> tuple[list[str], list[str]]:
+    """Read observation JSONL lines, newest-first, preserving raw line text."""
+    errors: list[str] = []
+    if session_id:
+        sessions = _query_cli_sessions(
+            conn, project=project, session_id=session_id,
+        )
+        errors.extend(_catch_up_cli_observations(conn, sessions))
+        obs_paths = [_obs_path_for_session(conn, row["session_id"]) for row in sessions]
+    elif project:
+        sessions = _query_cli_sessions(conn, project=project)
+        sessions, obs_paths = _sessions_with_observation_files(conn, sessions)
+        errors.extend(_catch_up_cli_observations(conn, sessions))
+    else:
+        obs_paths = sorted(db.OBS_DIR.glob("*.jsonl"))
+        session_rows: list[dict] = []
+        for obs_path in obs_paths:
+            row = db.get_session(conn, obs_path.stem)
+            if row is not None:
+                session_rows.append(row)
+        errors.extend(_catch_up_cli_observations(conn, session_rows))
+
+    ranked: list[tuple[str, int, str]] = []
+    seq = 0
+    for obs_path in obs_paths:
+        if not obs_path.exists():
+            continue
+        try:
+            with open(obs_path) as f:
+                for line_no, raw_line in enumerate(f, start=1):
+                    raw = raw_line.rstrip("\n")
+                    if not raw.strip():
+                        continue
+                    try:
+                        entry = json.loads(raw)
+                    except (json.JSONDecodeError, ValueError) as e:
+                        errors.append(f"{obs_path}:{line_no}: invalid JSON: {e}")
+                        continue
+                    ts = entry.get("ts")
+                    ranked.append((ts if isinstance(ts, str) else "", seq, raw))
+                    seq += 1
+        except OSError as e:
+            errors.append(f"{obs_path}: {e}")
+
+    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [raw for _ts, _seq, raw in ranked], errors
+
+
 def _resolve_cli_session(args) -> int:
     """Populate args.session via auto-detection when omitted.
 
@@ -4008,7 +4674,7 @@ def build_parser():
         description=(
             "ThreadHop — Claude Code session browser.\n"
             "  No subcommand  → launch the TUI.\n"
-            "  Subcommand     → CLI mode (tag, todos, decisions, observations)."
+            "  Subcommand     → CLI mode (tag, todos, decisions, observations, conflicts)."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -4082,22 +4748,59 @@ def build_parser():
     subparsers.add_parser(
         "observations",
         parents=[shared],
-        help="List all memory entries (todos, decisions, observations)",
-        description="List everything in the memory ledger. Use --project/--session to filter.",
+        help="Dump observations JSONL, newest first",
+        description=(
+            "Dump all observation entries as raw JSON lines, newest first. "
+            "Reads per-session files under ~/.config/threadhop/observations/ "
+            "and uses SQLite session metadata for --project filtering."
+        ),
+    )
+
+    conflicts_p = subparsers.add_parser(
+        "conflicts",
+        parents=[shared],
+        help="List unresolved cross-session decision conflicts",
+        description=(
+            "List decision conflicts detected by the reflector. "
+            "Uses --project to filter and --resolved to mark the displayed "
+            "conflicts as reviewed."
+        ),
+    )
+    conflicts_p.add_argument(
+        "--resolved",
+        action="store_true",
+        default=False,
+        help="Mark the displayed conflicts as reviewed",
     )
 
     observe_p = subparsers.add_parser(
         "observe",
         parents=[shared],
-        help="Run the observer once on a session (on-demand mode)",
+        help="Run the background observer sidecar for a session",
         description=(
-            "Run the Haiku observer on new messages for a session, once. "
-            "Reads from the recorded source_byte_offset, extracts typed "
-            "observations into ~/.config/threadhop/observations/<id>.jsonl, "
-            "and advances the cursor. This is the on-demand mode of the "
-            "observer — the background sidecar / watch mode (task #34) "
-            "lands separately."
+            "Run the observer sidecar for a session. The process performs an "
+            "initial catch-up extraction, then watches the transcript for new "
+            "messages, appends observations into "
+            "~/.config/threadhop/observations/<id>.jsonl, and triggers the "
+            "reflector when enough new observations accumulate. Use --once "
+            "for the old on-demand single-pass mode."
         ),
+    )
+    mode_group = observe_p.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--once",
+        action="store_true",
+        help="Run a single observation pass and exit",
+    )
+    mode_group.add_argument(
+        "--stop",
+        action="store_true",
+        help="Stop the observer for this session",
+    )
+    mode_group.add_argument(
+        "--stop-all",
+        action="store_true",
+        help="Stop every running observer",
     )
     observe_p.add_argument(
         "--batch-threshold",
@@ -4108,57 +4811,282 @@ def build_parser():
             f"(default {observer.BATCH_THRESHOLD}). Lower for demos."
         ),
     )
+    observe_p.add_argument(
+        "--poll-interval",
+        type=float,
+        default=observer.WATCH_POLL_INTERVAL_SEC,
+        help=(
+            "Watcher fallback poll interval in seconds "
+            f"(default {observer.WATCH_POLL_INTERVAL_SEC})."
+        ),
+    )
+    observe_p.add_argument(
+        "--watch-backend",
+        choices=[
+            observer.WATCH_BACKEND_AUTO,
+            observer.WATCH_BACKEND_POLL,
+            observer.WATCH_BACKEND_FSEVENTS,
+        ],
+        default=observer.WATCH_BACKEND_AUTO,
+        help="Watch backend for background mode (default: auto).",
+    )
+    observe_p.add_argument(
+        "--model",
+        default="haiku",
+        help=(
+            "Model to pass to `claude -p --model` (default: haiku). "
+            "Use 'sonnet' or 'opus' to get a stronger extractor."
+        ),
+    )
+    observe_p.add_argument(
+        "--claude-bin",
+        type=str,
+        default="claude",
+        help="Path to the claude CLI binary used for observer/reflector runs",
+    )
+    observe_p.add_argument(
+        "--timeout",
+        type=float,
+        default=observer.DEFAULT_TIMEOUT_SEC,
+        help=(
+            "Timeout in seconds for each observer/reflector claude call "
+            f"(default {observer.DEFAULT_TIMEOUT_SEC})."
+        ),
+    )
+    observe_p.add_argument(
+        "--reset",
+        action="store_true",
+        help=(
+            "Delete the observation_state row and the on-disk observations "
+            "JSONL for this session before running, so extraction restarts "
+            "from byte 0 with a clean output file."
+        ),
+    )
 
     return parser
 
 
-def cmd_observe(args) -> int:
-    """Run the observer once for the given session and print a summary.
+def _refresh_observer_state(conn, session_id: str) -> dict | None:
+    """Return the observation_state row, correcting stale running PIDs."""
+    state = db.get_observation_state(conn, session_id)
+    if state is None:
+        return None
+    pid = state.get("observer_pid")
+    if state.get("status") == "running" and pid is not None:
+        if not observer._pid_is_alive(int(pid)):
+            db.set_observer_stopped(conn, session_id)
+            state = db.get_observation_state(conn, session_id)
+    return state
 
-    Partial implementation of task #34 — on-demand only. No watch mode,
-    no PID tracking, no fsevents — those belong to the background
-    sidecar. This handler is what the demo uses and what the
-    ``/threadhop:observe`` skill will eventually shell out to.
-    """
-    rc = _resolve_cli_session(args)
-    if rc != 0:
-        return rc
-    session_path = find_session_path(args.session)
-    if session_path is None:
+
+def _print_observer_result(result: dict, *, prefix: str = "observer") -> None:
+    message = result.get("message")
+    if message:
+        print(f"[{prefix}] {message}")
+    if prefix == "observer" and result.get("status") == "extracted":
         print(
-            f"threadhop observe: no transcript found for session "
-            f"{args.session} under {CLAUDE_PROJECTS}.",
-            file=sys.stderr,
+            f"[{prefix}] cursor {result['source_byte_offset']} bytes; "
+            f"{result['entry_count']} observations on file"
         )
-        return 1
+    if result.get("status") == "failed" and result.get("stderr"):
+        print(f"[{prefix}] stderr: {result['stderr']}", file=sys.stderr)
 
+
+def _stop_observer_session(conn, session_id: str) -> int:
+    state = _refresh_observer_state(conn, session_id)
+    if state is None or state.get("observer_pid") is None:
+        print(f"Observer is not running for session {session_id}.")
+        return 0
+
+    pid = int(state["observer_pid"])
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        db.set_observer_stopped(conn, session_id)
+        print(
+            f"Observer PID {pid} for session {session_id} was stale; "
+            "state corrected to stopped."
+        )
+        return 0
+    print(f"Sent SIGTERM to observer for session {session_id} (pid {pid}).")
+    return 0
+
+
+def _stop_all_observers(conn) -> int:
+    rows = db.get_running_observers(conn)
+    if not rows:
+        print("No running observers.")
+        return 0
+
+    stopped = 0
+    stale = 0
+    for row in rows:
+        session_id = row["session_id"]
+        pid = int(row["observer_pid"])
+        try:
+            os.kill(pid, signal.SIGTERM)
+            stopped += 1
+        except ProcessLookupError:
+            db.set_observer_stopped(conn, session_id)
+            stale += 1
+    print(f"Sent SIGTERM to {stopped} observer(s).")
+    if stale:
+        print(f"Corrected {stale} stale observer PID(s).")
+    return 0
+
+
+def cmd_observe(args) -> int:
+    """Run or manage the per-session observer sidecar."""
     conn = db.init_db()
     try:
-        # Seed the sessions row so the observer can resolve source_path on
-        # its first run (same pattern the `tag` handler uses).
+        if args.stop_all:
+            return _stop_all_observers(conn)
+
+        rc = _resolve_cli_session(args)
+        if rc != 0:
+            return rc
+
+        if args.stop:
+            return _stop_observer_session(conn, args.session)
+
+        session_path = find_session_path(args.session)
+        if session_path is None:
+            print(
+                f"threadhop observe: no transcript found for session "
+                f"{args.session} under {CLAUDE_PROJECTS}.",
+                file=sys.stderr,
+            )
+            return 1
+
         db.upsert_session(
             conn, args.session, str(session_path),
             project=session_path.parent.name,
         )
-        result = observer.observe_session(
-            conn, args.session,
+        state = _refresh_observer_state(conn, args.session)
+        if args.reset and state is not None and state.get("observer_pid") is not None:
+            pid = int(state["observer_pid"])
+            print(
+                f"threadhop observe: cannot reset session {args.session} while "
+                f"observer pid {pid} is still running. Stop it first.",
+                file=sys.stderr,
+            )
+            return 1
+        if args.reset:
+            removed = db.delete_observation_state(conn, args.session)
+            conn.commit()
+            obs_path = db.OBS_DIR / f"{args.session}.jsonl"
+            wiped = False
+            if obs_path.exists():
+                obs_path.unlink()
+                wiped = True
+            print(
+                f"reset: removed {removed} state row(s)"
+                + (f", deleted {obs_path}" if wiped else "")
+            )
+
+        if args.once:
+            result = observer.observe_session(
+                conn, args.session,
+                batch_threshold=args.batch_threshold,
+                claude_bin=args.claude_bin,
+                model=args.model,
+                timeout=args.timeout,
+            )
+            _print_observer_result(result)
+            if result.get("obs_path"):
+                print(f"  obs file: {result['obs_path']}")
+            return 1 if result.get("status") == "failed" else 0
+
+        state = _refresh_observer_state(conn, args.session)
+        if state is not None and state.get("observer_pid") is not None:
+            pid = int(state["observer_pid"])
+            print(
+                f"Observer already running for session {args.session} "
+                f"(pid {pid})."
+            )
+            return 0
+
+        print(
+            f"Observing session {args.session} via {args.watch_backend} "
+            f"watcher (batch threshold {args.batch_threshold})."
+        )
+        result = observer.observe_sidecar(
+            conn,
+            args.session,
+            source_path=session_path,
             batch_threshold=args.batch_threshold,
+            poll_interval_sec=args.poll_interval,
+            watch_backend=args.watch_backend,
+            claude_bin=args.claude_bin,
+            model=args.model,
+            timeout=args.timeout,
+            session_active_fn=lambda sid: sid in get_active_claude_session_ids(),
+            on_result=_print_observer_result,
+            on_reflector_result=lambda r: _print_observer_result(
+                r, prefix="reflector"
+            ),
         )
     finally:
         conn.close()
 
-    print(result.get("message", "(no message)"))
-    if result.get("obs_path"):
-        print(f"  obs file: {result['obs_path']}")
-    if result.get("status") == "extracted":
-        print(
-            f"  cursor:   {result['source_byte_offset']} bytes  "
-            f"({result['entry_count']} observations on file)"
-        )
-    if result.get("status") == "failed":
-        if result.get("stderr"):
-            print(f"  stderr:   {result['stderr']}", file=sys.stderr)
+    status = result.get("status")
+    if status == "already_running":
+        print(result.get("message", "Observer already running."))
+        return 0
+    if status == "no_source":
+        print(result.get("message", "No source JSONL found."), file=sys.stderr)
         return 1
+    if status == "source_gone":
+        print(f"Observer stopped for session {args.session}: source transcript disappeared.")
+        return 0
+    if status == "session_ended":
+        print(f"Observer stopped for session {args.session}: Claude session ended.")
+        return 0
+    if status == "stopped":
+        print(f"Observer stopped for session {args.session}.")
+        return 0
+    if status == "failed":
+        return 1
+    return 0
+
+
+def cmd_conflicts(args) -> int:
+    """List cross-session conflict entries as compact JSON lines."""
+    conn = db.init_db()
+    try:
+        results = cli_queries.query_conflicts(
+            conn,
+            claude_projects_dir=CLAUDE_PROJECTS,
+            project=args.project,
+            session_id=args.session,
+            mark_resolved=args.resolved,
+            observe_fn=observer.observe_session,
+            reflect_fn=reflector.reflect_session,
+        )
+    finally:
+        conn.close()
+
+    for row in results:
+        print(json.dumps(row, separators=(",", ":"), sort_keys=True))
+    return 0
+
+
+def cmd_observations(args) -> int:
+    """Dump raw observation JSONL lines, newest first."""
+    conn = db.init_db()
+    try:
+        lines, errors = _load_observation_lines(
+            conn,
+            project=args.project,
+            session_id=args.session,
+        )
+    finally:
+        conn.close()
+
+    for raw in lines:
+        print(raw)
+    for err in errors:
+        print(f"threadhop observations: {err}", file=sys.stderr)
     return 0
 
 
@@ -4181,6 +5109,36 @@ def cmd_todos(args) -> int:
         entries = observation_queries.list_observation_entries(
             conn,
             observation_type="todo",
+            project=args.project,
+            session_id=args.session,
+        )
+    finally:
+        conn.close()
+
+    for entry in entries:
+        print(observation_queries.format_entry_json(entry))
+    return 0
+
+
+def cmd_decisions(args) -> int:
+    """List decision observations as compact JSONL."""
+    conn = db.init_db()
+    try:
+        results = observation_queries.refresh_unprocessed_observations(
+            conn,
+            project=args.project,
+            session_id=args.session,
+        )
+        for result in results:
+            if result.get("status") == "failed":
+                print(
+                    "threadhop decisions: observer failed for session "
+                    f"{result['session_id']}: {result.get('message', 'unknown error')}",
+                    file=sys.stderr,
+                )
+        entries = observation_queries.list_observation_entries(
+            conn,
+            observation_type="decision",
             project=args.project,
             session_id=args.session,
         )
@@ -4221,8 +5179,14 @@ def main():
         return 0
     if args.command == "todos":
         return cmd_todos(args)
+    if args.command == "decisions":
+        return cmd_decisions(args)
     if args.command == "observe":
         return cmd_observe(args)
+    if args.command == "conflicts":
+        return cmd_conflicts(args)
+    if args.command == "observations":
+        return cmd_observations(args)
     return _cli_stub(args.command)
 
 
