@@ -17,6 +17,7 @@ The project is expanding from a transcript viewer into a cross-session context m
 
 # CLI subcommands (all accept --project / --session)
 ./threadhop tag <status>            # backlog|in_progress|in_review|done|archived
+./threadhop bookmark [kind]         # bookmark|research against latest msg or --message <uuid>
 ./threadhop todos                   # open TODOs from observations
 ./threadhop decisions               # decisions extracted by observer
 ./threadhop observations            # raw observation JSONL, newest first
@@ -97,6 +98,7 @@ Every message line has native fields useful for indexing:
 
 ## In Progress
 
-- Claude Code plugin scaffolded at `plugin/` — one skill (`/threadhop:handoff`, task #26 merged) plus two commands (`/threadhop:observe`, `/threadhop:tag`), all under the `/threadhop:` namespace. Plugin is PATH-dependent on a separately-installed `threadhop` CLI (see `docs/skill-packaging.md`).
+- Claude Code plugin scaffolded at `plugin/` — one skill (`/threadhop:handoff`, task #26 merged) plus three commands (`/threadhop:observe`, `/threadhop:tag`, `/threadhop:bookmark`), all under the `/threadhop:` namespace. Plugin is PATH-dependent on a separately-installed `threadhop` CLI (see `docs/skill-packaging.md`).
+- Chat-side bookmark ingest: `!threadhop bookmark [--note "..."]` (bash passthrough) and `/threadhop:bookmark` (plugin) both target the latest indexed message in the auto-detected session. Shared primitive with the TUI — same `bookmarks` table, same normalization.
 - Phase 5 release work (marketplace.json, CLI-side discoverability for `threadhop tag` no-args, interactive install verification) still open.
 - See `docs/DESIGN-DECISIONS.md` for ADRs and the phase roadmap, and `docs/TASKS.md` for open tasks.

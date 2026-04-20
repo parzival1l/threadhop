@@ -494,8 +494,8 @@ Reflector process (claude -p --model haiku, companion to observer)
 # CLI: observe a specific session from another terminal
 threadhop observe --session <id> &
 
-# Auto-observe all sessions (NOT default, opt-in via config)
-threadhop config set observe.auto true
+# Auto-observe all sessions (NOT default, opt-in via config-backed hook)
+threadhop config set observe.enabled true
 ```
 
 The primary model is per-session opt-in via the skill. Most conversations
@@ -575,7 +575,7 @@ second skill (`/threadhop:insights`). Neither requires the TUI.
   design decisions, complex debugging sessions
 - Per-session opt-in means zero cost for throwaway sessions
 - A global auto-observe flag remains available as a power-user option
-  (`threadhop config set observe.auto true`) but is NOT the default
+  (`threadhop config set observe.enabled true`) but is NOT the default
 
 **Trigger point 1 — beginning of conversation:**
 
@@ -1084,7 +1084,8 @@ If you find contradictions, append conflict entries to: observations/abc123.json
 ```
 
 **The reflector prompt** lives at `~/.config/threadhop/prompts/reflector.md`
-(alongside `observer.md`). It constrains:
+(or bundled with the app at `prompts/reflector.md`, alongside `observer.md`).
+It constrains:
 
 1. **Append-only**: Same rules as observer — forward-only, no deletions.
 2. **One JSON line per conflict**: Each conflict is a self-contained entry.
@@ -1097,14 +1098,19 @@ If you find contradictions, append conflict entries to: observations/abc123.json
 **Conflict entry format:**
 
 ```jsonl
-{"type":"conflict","text":"REST vs gRPC scope overlap — session abc decided REST for client API, session def decided gRPC for all services","refs":["abc123","def456"],"topic":"api-protocol","session":"abc123","project":"atlas","ts":"2026-04-14T12:00:00Z"}
+{"type":"conflict","text":"REST vs gRPC scope overlap — session abc decided REST for client API, session def decided gRPC for all services","refs":["abc123","def456"],"topic":"api-protocol","ts":"2026-04-14T12:00:00Z"}
 ```
 
 Fields:
+- `type`: always `"conflict"`
+- `text`: concise explanation of the contradiction
 - `refs`: array of session IDs involved in the contradiction
 - `topic`: semantic grouping key (helps dedup and display)
-- `session`: the session this entry lives in (where the reflector was triggered)
-- Other fields same as observer entries
+- `ts`: ISO 8601 timestamp
+
+The conflict entry does **not** include inline `session` or `project` fields.
+The session is implied by which observation file the entry was appended to,
+and project context comes from SQLite session mapping.
 
 **Trigger mechanism — observer spawns reflector:**
 
@@ -1476,11 +1482,12 @@ CREATE TABLE index_state (
 CREATE TABLE bookmarks (
     id            INTEGER PRIMARY KEY,
     message_uuid  TEXT NOT NULL,
-    session_id    TEXT NOT NULL,
-    label         TEXT,
+    note          TEXT,
+    kind          TEXT NOT NULL DEFAULT 'bookmark',
+        -- bookmark | research (task #59 later generalizes this)
     tags          TEXT,               -- JSON array
     created_at    REAL NOT NULL,
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+    FOREIGN KEY (message_uuid) REFERENCES messages(uuid)
 );
 
 -- Project memory ledger
@@ -1517,7 +1524,7 @@ CREATE TABLE observation_state (
 
 ## Skill Plugin Architecture
 
-### Principle: Four skills + bash passthrough for tagging, clear boundaries
+### Principle: Four skills + bash passthrough for tagging/bookmark ingest, clear boundaries
 
 Skills are for operations invoked mid-conversation from Claude Code. The TUI
 handles everything visual and instantaneous. The CLI handles queries and tagging
@@ -1540,9 +1547,15 @@ plugin/
 │   └── handoff/
 │       └── SKILL.md                     # /threadhop:handoff — model-framed brief
 └── commands/
+    ├── bookmark.md                      # /threadhop:bookmark — !`threadhop bookmark`
     ├── observe.md                       # /threadhop:observe — !`threadhop observe`
     └── tag.md                           # /threadhop:tag — !`threadhop tag` + argument-hint
 ```
+
+All three commands also remain available as bash passthroughs
+(`!threadhop tag|bookmark|observe …`) for users who prefer zero-LLM-turn
+invocation. The slash forms' advantage is discoverability through the
+`argument-hint` frontmatter shown in the `/` picker.
 
 Tagging also stays available as `!threadhop tag <status>` (bash
 passthrough, zero LLM turn). The slash form's advantage is
@@ -1555,7 +1568,7 @@ discoverability — the argument-hint enumerates valid statuses.
 | Search | TUI | Per-keystroke instant, visual results |
 | Message select + copy | TUI | Visual selection, clipboard transport |
 | Message export to .md | TUI | Visual selection, writes to /tmp |
-| Bookmark | TUI | Visual selection, one-key action |
+| Bookmark ingest | TUI + CLI + `!` bash passthrough + `/threadhop:bookmark` | Four entry points, one `bookmarks` table — TUI selection-mode, chat passthrough, plugin slash command, and CLI all write through `db.upsert_bookmark` via the same normalization |
 | Tag session | TUI + CLI + `!` bash passthrough + `/threadhop:tag` | Four entry points, one DB (ADR-013) |
 | Observation queries | CLI | `threadhop todos`, `threadhop decisions`, etc. |
 | Start observation | `/threadhop:observe` + TUI | Per-session opt-in; observer lifetime bound to the Claude Code session that started it |
@@ -1777,7 +1790,7 @@ For larger exports:
 - [ ] `O` key: resume observation on stopped session (ADR-021)
 
 ### Phase 5: Memory + Bookmarks
-- [ ] Build bookmark system (TUI feature)
+- [ ] Build bookmark system (shared ingest primitive + TUI/browser surfaces)
 - [ ] Explicit annotation detection (ADR:, DECISION:, TODO: markers)
 - [ ] Project memory markdown rendering from observations
 

@@ -122,11 +122,11 @@ _Observer-first architecture. Observer uses `claude -p --model haiku --permissio
 - [x] **19. Incremental observer processing (byte offset per session)** *(blocked by: #18)*
   **DONE.** `observer.watch_session()` is the watch-mode layer on top of `observe_session()`. Runs an initial catch-up extraction, then polls `source_path.stat().st_size` and re-invokes the observer whenever the file has grown past the recorded cursor. Polling is the ADR-015 fallback; the per-iteration `sleep_fn` is the swap point where task #34 can plug in fsevents/kqueue without breaking the contract. Failures are tallied and never raised, so transient Haiku errors don't kill the watcher. Tests in `tests/test_observer.py::TestWatchSession`. _(ADR-010, ADR-015, ADR-019)_
 
-- [ ] **34. Build background observer sidecar (`threadhop observe`)** *(blocked by: #18, #19)*
-  Background process mode for the observer (ADR-015). `threadhop observe --session <id>` watches the session's JSONL via fsevents (macOS) with polling fallback. Batches new messages (~3-4 trigger extraction). Records PID in `observation_state.observer_pid`. Exits when Claude Code session ends or `--stop` is sent. _(ADR-015)_
+- [x] **34. Build background observer sidecar (`threadhop observe`)** *(blocked by: #18, #19)*
+  **DONE.** `observer.observe_sidecar()` now owns PID registration, SIGTERM/SIGINT stop handling, final-flush semantics, and reflector coordination on top of `watch_session()`. `threadhop observe [--session <id>]` performs catch-up extraction, watches via macOS fsevents when available with polling fallback, records `observation_state.observer_pid`, and exits cleanly when the Claude session ends or a stop request arrives. Tests in `tests/test_observer.py::TestObserveSidecar` plus CLI coverage in `tests/test_cli_observe.py`. _(ADR-015)_
 
-- [ ] **35. Observer stop/resume lifecycle** *(blocked by: #34, #44)*
-  Stop mechanisms: `threadhop observe --stop [--session <id>]` sends SIGTERM to recorded PID. `threadhop observe --stop-all` stops all running observers. Observer handles SIGTERM gracefully: flushes pending observations, updates byte offset, sets `status = 'stopped'`. Resume: reads `source_byte_offset`, processes only new bytes. Stale PID detection via `kill -0 $PID` — corrects status to 'stopped' if process dead. Entry points for enabling: (1) manual `threadhop observe --session <id> &`, (2) Claude Code hook in `.claude/settings.json`, (3) `threadhop config set observe.enabled true`. _(ADR-015, ADR-019)_
+- [x] **35. Observer stop/resume lifecycle** *(blocked by: #34, #44)*
+  **DONE.** `threadhop observe --stop [--session <id>]` and `--stop-all` now terminate observers by recorded PID, correct stale `status='running'` rows when `kill -0`/`os.kill(..., 0)` shows the process is gone, and leave the sidecar to flush any pending sub-threshold tail before setting `status='stopped'`. Resume continues from `observation_state.source_byte_offset`, so only new transcript bytes are processed. Enabling surfaces are documented for manual background launch, Claude Code hook-driven auto-start, and the durable `threadhop config set observe.enabled true` flag. Tests in `tests/test_cli_observe.py` and `tests/test_observer.py`. _(ADR-015, ADR-019)_
 
 - [ ] **20. Implement `threadhop todos [--project]` CLI query** *(blocked by: #18, #19)*
   Runs observer for unprocessed messages, then prints open TODOs from per-session observation files. Filterable by `--project`. _(ADR-010, ADR-011, ADR-019)_
@@ -179,7 +179,7 @@ and transcript header (ADR-021)._
 _Cross-session knowledge persistence (beyond the raw observations log)._
 
 - [ ] **27. Build bookmark system** *(blocked by: #1, #10)*
-  Add `bookmarks` table to schema. Toggle bookmark from message selection mode with `space`. Support labels and tags (JSON array). Build bookmark browser panel in TUI.
+  Add `bookmarks` table to schema and a shared bookmark-ingest primitive. Keep the initial built-in classes intentionally narrow: `bookmark` and `research`. Support an optional short note and retain tags (JSON array) as forward-compatible storage. TUI `space` keeps the lightweight toggle path for plain bookmarks, while chat/skill/plugin integrations call the same shared primitive through a scriptable CLI entrypoint. Build bookmark browser panel in TUI.
 
 - [ ] **28. Build project memory ledger** *(blocked by: #1)*
   Add `memory` table to schema. Support typed entries: `decision | todo | done | adr | observation`. Append-only, filterable by project/type/date. Manual entry from TUI (type + text). Distinct from per-session observation files: this is for curated/explicit entries with `source: 'explicit'`. _(ADR-005)_
@@ -197,8 +197,8 @@ _Contradiction detection across sessions. Reflector writes `type: "conflict"` en
 to the SAME per-session observation JSONL (ADR-020, ADR-022). Triggered by observer
 process — not independent. Uses `reflector_entry_offset` for incremental processing._
 
-- [ ] **49. Create reflector prompt** *(prereq for: #31)*
-  Write `~/.config/threadhop/prompts/reflector.md`. Constrains Haiku: append-only, one JSON line per conflict, dedup check against existing conflicts (same `refs` pair + `topic` = skip). Input shape: recent decisions from current session + all decisions from other sessions in same project. Output: `type: "conflict"` entries with `refs`, `topic`, `text` fields. _(ADR-022)_
+- [x] **49. Create reflector prompt** *(prereq for: #31)*
+  **DONE.** Reflector prompt is bundled at `prompts/reflector.md` (repo-local equivalent of `~/.config/threadhop/prompts/reflector.md`). It constrains Haiku to append-only conflict writes, one JSON line per conflict, dedup against existing conflicts using the same `refs` pair + `topic`, and consume `<current_session_decisions>`, `<project_decisions>`, and `<existing_conflicts>`. Output shape is `type: "conflict"` with `refs`, `topic`, `text`, and `ts`. _(ADR-022)_
 
 - [x] **31. Build conflict detection reflector core function** *(blocked by: #18, #49)*
   **DONE.** `reflector.py` now runs the second `claude -p --model haiku --permission-mode acceptEdits` pass against recent current-session decisions and peer decisions from other same-project observation files, appends `type: "conflict"` lines to the current session's observation JSONL, and advances `reflector_entry_offset` / `entry_count` in SQLite. Tests in `tests/test_reflector.py`. _(ADR-015, ADR-020, ADR-022)_
