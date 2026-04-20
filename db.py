@@ -40,7 +40,7 @@ DB_PATH = DB_DIR / "sessions.db"
 # --- Schema version ---
 # Each migration N in MIGRATIONS moves the DB from version N to N+1.
 # The DB's current version lives in PRAGMA user_version.
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 # --- Migrations -----------------------------------------------------------
@@ -349,6 +349,40 @@ def _migration_006_sessions_status_check(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migration_007_bookmarks(conn: sqlite3.Connection) -> None:
+    """Task #18: bookmarks table.
+
+    Users pin messages for later recall via `space` in selection mode.
+    One bookmark per message (UNIQUE on ``message_uuid``) so the keybind
+    is a pure toggle. ``FK … ON DELETE CASCADE`` keeps the table free
+    of orphan rows if a message is ever reindexed out from under a pin.
+
+    ``tags`` is a JSON-encoded array of strings, mirroring the
+    :class:`models.Bookmark` shape declared for this table in
+    ``models.py`` (task #24's model/schema lockstep rule). The tag
+    *editor UX* is deferred — tracked separately — so the column exists
+    but only ``label`` has a TUI surface in this migration's companion
+    commit.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bookmarks (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_uuid TEXT NOT NULL UNIQUE,
+            label        TEXT,
+            tags         TEXT NOT NULL DEFAULT '[]',
+            created_at   REAL NOT NULL,
+            FOREIGN KEY (message_uuid) REFERENCES messages(uuid)
+                ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_bookmarks_created_at "
+        "ON bookmarks(created_at)"
+    )
+
+
 # Ordered list; MIGRATIONS[i] moves schema from version i to i+1.
 MIGRATIONS: list = [
     _migration_001_initial,
@@ -357,6 +391,7 @@ MIGRATIONS: list = [
     _migration_004_observation_state,
     _migration_005_conflict_reviews,
     _migration_006_sessions_status_check,
+    _migration_007_bookmarks,
 ]
 
 assert len(MIGRATIONS) == SCHEMA_VERSION, (
@@ -1288,3 +1323,147 @@ def mark_conflict_reviewed(
             reviewed_at if reviewed_at is not None else datetime.now().timestamp(),
         ),
     )
+
+
+# --- Bookmarks ------------------------------------------------------------
+# Users pin messages via `space` in selection mode; the browser modal
+# reads back via ``list_bookmarks``. Timestamps are Unix epoch floats to
+# match ``sessions.modified_at`` and the rest of the time columns here.
+#
+# ``tags`` is stored as a JSON-encoded array to match ``models.Bookmark``
+# (task #24's lockstep rule). Helpers decode to ``list[str]`` on read so
+# callers never see the raw JSON.
+
+
+def _decode_bookmark_tags(row: dict | None) -> dict | None:
+    """Decode ``row['tags']`` from JSON to a list. Mutates ``row`` in place
+    and returns it; ``None`` passes through."""
+    if row is None:
+        return None
+    raw = row.get("tags")
+    if isinstance(raw, str):
+        try:
+            decoded = json.loads(raw) if raw else []
+        except json.JSONDecodeError:
+            decoded = []
+        row["tags"] = decoded if isinstance(decoded, list) else []
+    elif raw is None:
+        row["tags"] = []
+    return row
+
+
+def get_bookmark(
+    conn: sqlite3.Connection, message_uuid: str
+) -> dict | None:
+    """Return the bookmark row for ``message_uuid`` or None."""
+    row = query_one(
+        conn,
+        "SELECT id, message_uuid, label, tags, created_at FROM bookmarks "
+        "WHERE message_uuid = ?",
+        (message_uuid,),
+    )
+    return _decode_bookmark_tags(row)
+
+
+def toggle_bookmark(
+    conn: sqlite3.Connection,
+    message_uuid: str,
+    created_at: float | None = None,
+) -> dict | None:
+    """Toggle a bookmark on ``message_uuid``.
+
+    Returns the new bookmark dict on create, or ``None`` on delete so
+    callers can show the right toast ("Bookmarked" vs "Removed"). New
+    rows start with an empty tag list — tag editing is a follow-up to
+    this feature, but the column exists so the schema matches
+    :class:`models.Bookmark`.
+    """
+    existing = get_bookmark(conn, message_uuid)
+    if existing is not None:
+        conn.execute("DELETE FROM bookmarks WHERE id = ?", (existing["id"],))
+        return None
+    ts = created_at if created_at is not None else datetime.now().timestamp()
+    cur = conn.execute(
+        "INSERT INTO bookmarks (message_uuid, label, tags, created_at) "
+        "VALUES (?, NULL, '[]', ?)",
+        (message_uuid, ts),
+    )
+    return {
+        "id": cur.lastrowid,
+        "message_uuid": message_uuid,
+        "label": None,
+        "tags": [],
+        "created_at": ts,
+    }
+
+
+def set_bookmark_label(
+    conn: sqlite3.Connection,
+    bookmark_id: int,
+    label: str | None,
+) -> None:
+    """Update a bookmark's label. Empty strings collapse to NULL."""
+    clean = label.strip() if label else ""
+    conn.execute(
+        "UPDATE bookmarks SET label = ? WHERE id = ?",
+        (clean or None, bookmark_id),
+    )
+
+
+def delete_bookmark(conn: sqlite3.Connection, bookmark_id: int) -> None:
+    """Remove a bookmark by row id. No-op if the row doesn't exist."""
+    conn.execute("DELETE FROM bookmarks WHERE id = ?", (bookmark_id,))
+
+
+def list_bookmarks(
+    conn: sqlite3.Connection,
+    query: str | None = None,
+    limit: int = 500,
+) -> list[dict]:
+    """Return bookmarks joined with message + session metadata, newest first.
+
+    ``query`` is an optional case-insensitive substring filter applied
+    across the label, the message body, and the session's project /
+    custom name — mirrors the single filter input in the browser modal.
+    """
+    sql = (
+        "SELECT b.id, b.message_uuid, b.label, b.tags, b.created_at, "
+        "       m.session_id, m.role, m.text, m.timestamp, "
+        "       s.custom_name, s.project "
+        "FROM bookmarks b "
+        "JOIN messages m ON m.uuid = b.message_uuid "
+        "LEFT JOIN sessions s ON s.session_id = m.session_id "
+    )
+    params: tuple = ()
+    if query:
+        sql += (
+            "WHERE b.label LIKE ? OR m.text LIKE ? "
+            "OR s.custom_name LIKE ? OR s.project LIKE ? "
+        )
+        like = f"%{query}%"
+        params = (like, like, like, like)
+    sql += "ORDER BY b.created_at DESC LIMIT ?"
+    params = params + (limit,)
+    rows = query_all(conn, sql, params)
+    for row in rows:
+        _decode_bookmark_tags(row)
+    return rows
+
+
+def get_bookmarked_uuids(
+    conn: sqlite3.Connection,
+    session_id: str | None = None,
+) -> set[str]:
+    """Return the set of bookmarked message UUIDs, optionally scoped
+    to one session. Used by the transcript view to tag pinned widgets
+    when rendering."""
+    if session_id is not None:
+        rows = conn.execute(
+            "SELECT b.message_uuid FROM bookmarks b "
+            "JOIN messages m ON m.uuid = b.message_uuid "
+            "WHERE m.session_id = ?",
+            (session_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT message_uuid FROM bookmarks").fetchall()
+    return {r[0] for r in rows}
