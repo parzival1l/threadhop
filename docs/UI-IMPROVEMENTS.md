@@ -173,14 +173,33 @@ in Go — but ~90% of the functional ideas ship in Textual today.
 
 ## Turn-as-unit transcript rendering
 
-Captured 2026-04-20 alongside the bookmark-FK crash fix. The crash
-itself was resolved by a smaller change: the renderer now merges
-consecutive assistant JSONL lines sharing a `message.id` into one
-block, matching the indexer's rule (ADR-003). That closed the id
-mismatch between what the renderer emitted and what the database
-stored.
+Captured 2026-04-20 alongside the bookmark-FK crash fix.
 
-The deeper observation surfaced during that fix is worth keeping:
+### What already landed (interim fix)
+
+The crash was resolved by two small id-layer changes in the renderer
+(`threadhop._parse_messages`) plus a defensive guard in
+`bookmark_toggle_selection`:
+
+- Consecutive assistant JSONL lines sharing a `message.id` now merge
+  into one assistant tuple tagged with the first chunk's uuid —
+  matching the indexer's rule (ADR-003).
+- `tool_use` widgets and `tool_result` widgets now inherit the
+  enclosing turn's canonical uuid instead of their own JSONL line's
+  uuid. `toolUseResult` user lines no longer flush the pending
+  assistant turn — they're mid-turn events.
+- `bookmark_toggle_selection` pre-checks the FK target with a SELECT,
+  dedups duplicate uuids within a selection, and shows a "skipped
+  (not indexed yet)" toast instead of crashing on any remaining
+  mismatch.
+
+Net effect: bookmarks now work on any widget inside an assistant turn
+(prose, tool call, tool result) because they all resolve to the same
+turn id — the one the indexer actually stores. This is
+**turn-as-unit semantics applied only to the identity layer**;
+rendering is still per-widget.
+
+### What's still open (visual refactor)
 
 **The unit of meaning in a Claude conversation is the turn, not the
 JSONL event.** Today the renderer walks the file line by line and

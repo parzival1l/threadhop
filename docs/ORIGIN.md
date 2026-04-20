@@ -1,43 +1,88 @@
 # Origin & Attribution
 
-ThreadHop began as a macOS port of [claude-sessions](https://github.com/thomasrice/claude-sessions)
-by [Thomas Rice](https://www.thomasrice.com/) ([@thomasrice_au](https://x.com/thomasrice_au)),
-originally built for [Omarchy](https://omarchy.org) / Hyprland on Linux.
+ThreadHop started in early 2026 as a macOS port of
+[claude-sessions](https://github.com/thomasrice/claude-sessions) by
+[Thomas Rice](https://www.thomasrice.com/)
+([@thomasrice_au](https://x.com/thomasrice_au)) — a ~1,345-line single-file
+Textual TUI for viewing Claude Code transcripts on
+[Omarchy](https://omarchy.org) / Hyprland. The first fork replaced the
+Linux-specific bits (`hyprctl`, `wtype`, `/proc`) with `ps`/`lsof` and
+`claude -p --resume` so it would run on macOS.
 
-## What the original provided
+ThreadHop has since grown well past that starting point and is maintained as
+an independent project. This document exists to credit the original work and
+to explain how the two relate today.
 
-A Textual TUI for viewing Claude Code session transcripts on Hyprland/Linux:
-- Session list with active detection via `hyprctl` (Hyprland window manager)
-- Transcript viewer with basic message rendering
-- Reply via `wtype` (Wayland keyboard simulator)
-- Session tracking hook using `/proc` filesystem
+## What ThreadHop is now
 
-## What changed in the macOS fork
+A cross-session context manager for Claude Code — not just a transcript
+viewer. The tree is ~12k lines across ten modules, a CLI with its own
+subcommands, a Claude Code skill plugin, and SQLite-backed persistence.
 
-The initial fork by [@parzival1l](https://github.com/parzival1l) replaced all
-Linux/Hyprland dependencies with portable alternatives:
+Capabilities that did not exist in the original:
 
-- **Replaced `hyprctl`** with `ps`/`lsof` process scanning for active session detection
-- **Replaced `wtype`** with `claude -p --resume <id>` for message sending
-- **Removed `/proc` dependency** — macOS uses `ps`/`lsof` instead of the PID-tracking hook
-- **Added system-reminder stripping** — filters `<system-reminder>` tags from transcript display
-- **Rewrote transcript rendering** — full scrollable conversation with distinct User/Assistant/Tool widgets
-- **Added session titles** — displays AI-generated or custom titles from JSONL metadata
-- **Added day-scale age display** — shows `Xd` for sessions older than 24 hours
-- **Increased session limit** — raised from 20 to 50
+- **SQLite + FTS5 backend** (`db.py`, `indexer.py`, `search_queries.py`) —
+  full-text search across every indexed session, assistant streaming chunks
+  merged by `message.id`, Pydantic validation mirrored by SQL CHECK
+  constraints (ADR-003, ADR-004, task #24).
+- **Observer pipeline** (`observer.py`, `prompts/observer.md`) — a sidecar
+  that replays the same cleaned transcript the TUI shows through
+  `claude -p --model haiku` to extract TODOs, decisions, and observations
+  into per-session JSONL. Supports poll and fsevents watch backends and
+  resumes from a persisted byte offset (ADR-018, ADR-019).
+- **Reflector** (`reflector.py`, `prompts/reflector.md`) — compares decisions
+  across sibling sessions in the same project and appends `type: "conflict"`
+  rows back into the observation JSONL (ADR-020). `conflicts --resolved`
+  writes review state into the `conflict_reviews` table instead of mutating
+  the append-only file.
+- **CLI surface** (`cli_queries.py`, `observation_queries.py`) —
+  `threadhop tag / todos / decisions / observations / conflicts / observe`
+  with auto-detection of the current session via the parent process tree,
+  designed to be invoked from inside a Claude Code chat via `!`
+  passthrough.
+- **Session tagging, bookmarks, project memory, reply selection**, an
+  in-TUI command registry with a help overlay, message-range selection,
+  day-scale age display, AI-generated session titles.
+- **Handoff skill plugin** (`handoff.py`, `skills/handoff`,
+  `prompts/handoff.md`) — `/threadhop:handoff <session_id>` compresses a
+  session into a brief on top of the observer/reflector output.
+- **Migration tooling** (`migration.py`) — one-time, idempotent,
+  transactional move of session metadata out of `config.json` into SQLite,
+  preserving unknown keys (ADR-001).
 
-## Why ThreadHop is a separate repository
+The original's scope was a single-file viewer on one window manager;
+ThreadHop's scope is persistent, queryable, cross-session memory with a
+pluggable extraction layer. The only shared surface area is the idea of a
+Textual TUI listing `~/.claude/projects/**/*.jsonl` and rendering one of
+them as a conversation.
 
-The fork diverged significantly from the original:
+## What remains from claude-sessions
 
-- **~1,000 lines rewritten** out of a ~1,345-line original — effectively a full rewrite
-- **Scope expanded** from transcript viewing to cross-session context management (search, memory, handoff, session tagging)
-- **Target platform changed** from Hyprland/Linux to macOS-first
-- **Architecture expanding** from single-file viewer to SQLite-backed system with a skill plugin
+Small but worth naming:
 
-To avoid noisy PR diffs on the upstream and to reflect the different direction,
-ThreadHop was established as an independent repository with full attribution to the original work.
+- The basic TUI shape — a two-column layout with a session list on the left
+  and a transcript on the right — came from the original.
+- The MIT license is inherited from the original project.
+- A handful of early keybindings (`j`/`k`, `q`, theme cycling) survived the
+  rewrite because they are the obvious choices for a Textual app.
+
+Everything else — widget hierarchy, data model, persistence, discovery
+pipeline, CLI, observer/reflector/handoff — is ThreadHop code.
+
+## Why a separate repository
+
+- Scope is different: transcript viewer vs. cross-session context manager.
+- Target platform is different: Hyprland/Linux vs. macOS-first (uses `ps`
+  and `lsof` for active-session detection; the `hooks/` directory in the
+  original was a `/proc`-based Linux artifact and is not used here).
+- Architecture is different: single-file script vs. ten-module package
+  backed by SQLite, FTS5, and a skill plugin.
+- Upstream PRs at this scale would be noisy and unwelcome, and the
+  projects are aimed at different users.
+
+Independent repository, full attribution, shared license.
 
 ## License
 
-ThreadHop inherits the MIT license from the original claude-sessions project.
+MIT, inherited from [claude-sessions](https://github.com/thomasrice/claude-sessions).
+See `LICENSE` for the full text.
