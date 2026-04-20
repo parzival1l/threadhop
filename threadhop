@@ -4893,6 +4893,17 @@ def _print_observer_result(result: dict, *, prefix: str = "observer") -> None:
 
 
 def _stop_observer_session(conn, session_id: str) -> int:
+    state = db.get_observation_state(conn, session_id)
+    if state is not None and state.get("status") == "running":
+        pid = state.get("observer_pid")
+        if pid is not None and not observer._pid_is_alive(int(pid)):
+            db.set_observer_stopped(conn, session_id)
+            print(
+                f"Observer PID {pid} for session {session_id} was stale; "
+                "state corrected to stopped."
+            )
+            return 0
+
     state = _refresh_observer_state(conn, session_id)
     if state is None or state.get("observer_pid") is None:
         print(f"Observer is not running for session {session_id}.")
