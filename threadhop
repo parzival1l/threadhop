@@ -3,6 +3,7 @@
 # dependencies = [
 #   "textual>=0.89.0",
 #   "watchdog>=4.0.0",
+#   "pydantic>=2.0",
 # ]
 # ///
 """ThreadHop — cross-session context manager for Claude Code"""
