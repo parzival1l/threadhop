@@ -17,8 +17,9 @@ import sqlite3
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from time import perf_counter
 
 from rich.console import Group
 from rich.markdown import Markdown
@@ -121,11 +122,57 @@ def save_app_config(config):
         pass
 
 
+def get_recent_searches(config: dict | None) -> list[str]:
+    """Return deduped recent searches from app config."""
+    if not isinstance(config, dict):
+        return []
+    raw = config.get("recent_searches", [])
+    if not isinstance(raw, list):
+        return []
+
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        query = item.strip()
+        if not query or query in seen:
+            continue
+        seen.add(query)
+        cleaned.append(query)
+    return cleaned
+
+
+def save_recent_search(config: dict | None, raw_query: str) -> list[str]:
+    """Persist one recent search at the front of config.json."""
+    if not isinstance(config, dict):
+        return []
+    query = raw_query.strip()
+    if not query:
+        return get_recent_searches(config)
+
+    recent = [q for q in get_recent_searches(config) if q != query]
+    recent.insert(0, query)
+    config["recent_searches"] = recent[:MAX_RECENT_SEARCHES]
+    save_app_config(config)
+    return list(config["recent_searches"])
+
+
+def clear_recent_searches(config: dict | None) -> None:
+    """Remove persisted recent searches from config.json."""
+    if not isinstance(config, dict):
+        return
+    config["recent_searches"] = []
+    save_app_config(config)
+
+
 # --- Configuration ---
 DISPLAY_NAME_WIDTH = 22
 MAX_SESSIONS = 50
 REFRESH_INTERVAL = 5
 SPINNER_INTERVAL = 0.25
+SEARCH_PAGE_SIZE = 50
+MAX_RECENT_SEARCHES = 8
 
 # --- Paths ---
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
@@ -337,7 +384,9 @@ COMMAND_REGISTRY: list[Command] = [
 
     # --- Search modal (widget-local; SearchScreen.on_key) ---
     Command(("up", "down", "ctrl+n", "ctrl+p"), "Navigate results", SCOPE_SEARCH, footer=True),
+    Command(("pageup", "pagedown"), "Jump through results", SCOPE_SEARCH),
     Command(("enter",), "Open result", SCOPE_SEARCH, footer=True),
+    Command(("ctrl+x",), "Clear query/history", SCOPE_SEARCH),
     Command(("escape",), "Close search", SCOPE_SEARCH, footer=True),
 
     # --- Bookmark browser modal (widget-local; BookmarkBrowserScreen.on_key) ---
@@ -1505,9 +1554,11 @@ class TranscriptView(VerticalScroll):
 # source message.
 #
 # Filter syntax parsed from the raw query string:
-#   project:<name>  — substring match against sessions.project
-#   user:           — only role = 'user'
-#   assistant:      — only role = 'assistant'
+#   project:<name>    — substring match against sessions.project
+#   session:current   — restrict to the active transcript session
+#   since:/until:     — YYYY-MM-DD or full ISO timestamp range filters
+#   user:             — only role = 'user'
+#   assistant:        — only role = 'assistant'
 # Remaining whitespace-separated tokens become FTS5 prefix terms.
 
 # Sentinel characters bracketing matched spans in the SQL `snippet()`
@@ -1517,19 +1568,86 @@ _FTS_MATCH_START = "\x01"
 _FTS_MATCH_END = "\x02"
 
 
-def _build_fts_query(raw: str) -> tuple[str, str | None, str | None]:
-    """Parse raw input into (fts_match_expr, role_filter, project_filter).
+@dataclass(frozen=True)
+class SearchQuerySpec:
+    """Parsed search input plus derived filter metadata."""
 
-    The FTS5 expression uses AND semantics across prefix terms
-    (e.g. ``rate* lim*``). Non-filter tokens are sanitized to word chars
-    only so stray punctuation can't produce an invalid MATCH expression.
-    An empty expression means no searchable terms were supplied —
-    callers may still return filter-only results (see `search_messages`).
+    raw: str
+    fts_expr: str
+    terms: tuple[str, ...]
+    plain_query: str
+    role: str | None = None
+    project: str | None = None
+    session_id: str | None = None
+    since_ts: str | None = None
+    until_ts: str | None = None
+    until_is_exclusive: bool = False
+
+
+@dataclass(frozen=True)
+class SearchResultPage:
+    """One page of results plus metadata for the search modal."""
+
+    rows: list[dict]
+    total_count: int
+    limit: int
+    offset: int
+    elapsed_ms: float
+
+    @property
+    def loaded_count(self) -> int:
+        return self.offset + len(self.rows)
+
+    @property
+    def has_more(self) -> bool:
+        return self.loaded_count < self.total_count
+
+
+def _parse_search_date(value: str, *, upper_bound: bool) -> tuple[str | None, bool]:
+    """Parse a date/date-time filter into an ISO UTC bound.
+
+    Returns ``(iso_utc, is_exclusive)``. Date-only ``until:YYYY-MM-DD``
+    becomes the next day's midnight and is treated as exclusive so the
+    whole day is included.
     """
+    raw = (value or "").strip()
+    if not raw:
+        return None, False
+
+    try:
+        if len(raw) == 10:
+            dt = datetime.fromisoformat(raw).replace(tzinfo=timezone.utc)
+            if upper_bound:
+                dt += timedelta(days=1)
+                return dt.strftime("%Y-%m-%dT%H:%M:%SZ"), True
+            return dt.strftime("%Y-%m-%dT%H:%M:%SZ"), False
+
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None, False
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ"), False
+
+
+def _build_fts_query(
+    raw: str,
+    *,
+    current_session_id: str | None = None,
+) -> SearchQuerySpec:
+    """Parse raw input into a structured search query spec."""
     tokens = raw.strip().split()
     role: str | None = None
     project: str | None = None
+    session_id: str | None = None
+    since_ts: str | None = None
+    until_ts: str | None = None
+    until_is_exclusive = False
     terms: list[str] = []
+
     for tok in tokens:
         low = tok.lower()
         if low == "user:":
@@ -1537,42 +1655,116 @@ def _build_fts_query(raw: str) -> tuple[str, str | None, str | None]:
         elif low == "assistant:":
             role = "assistant"
         elif low.startswith("project:"):
-            val = tok[len("project:"):]
+            val = tok[len("project:"):].strip()
             if val:
                 project = val
+        elif low.startswith("session:"):
+            val = tok[len("session:"):].strip()
+            if val:
+                if val.lower() == "current":
+                    session_id = current_session_id
+                else:
+                    session_id = val
+        elif low.startswith("since:"):
+            parsed, _ = _parse_search_date(tok[len("since:"):], upper_bound=False)
+            if parsed:
+                since_ts = parsed
+        elif low.startswith("until:"):
+            parsed, exclusive = _parse_search_date(
+                tok[len("until:"):],
+                upper_bound=True,
+            )
+            if parsed:
+                until_ts = parsed
+                until_is_exclusive = exclusive
         else:
             # Keep only word chars (letters/digits/underscore). FTS5's
             # unicode61 tokenizer is fine with these, and stripping
             # punctuation prevents syntax errors at MATCH time.
             clean = re.sub(r"[^\w]", "", tok)
             if clean:
-                terms.append(clean + "*")
-    return " ".join(terms), role, project
+                terms.append(clean)
+
+    return SearchQuerySpec(
+        raw=raw.strip(),
+        fts_expr=" ".join(f"{term}*" for term in terms),
+        terms=tuple(terms),
+        plain_query=" ".join(terms).lower(),
+        role=role,
+        project=project,
+        session_id=session_id,
+        since_ts=since_ts,
+        until_ts=until_ts,
+        until_is_exclusive=until_is_exclusive,
+    )
+
+
+def _build_search_filters(spec: SearchQuerySpec) -> tuple[list[str], dict]:
+    """Return shared SQL filter clauses for FTS and filter-only search."""
+    clauses: list[str] = []
+    params: dict[str, str] = {}
+
+    if spec.role:
+        clauses.append("m.role = :role")
+        params["role"] = spec.role
+    if spec.project:
+        clauses.append("s.project LIKE :project")
+        params["project"] = f"%{spec.project}%"
+    if spec.session_id:
+        clauses.append("m.session_id = :session_id")
+        params["session_id"] = spec.session_id
+    if spec.since_ts:
+        clauses.append("m.timestamp >= :since_ts")
+        params["since_ts"] = spec.since_ts
+    if spec.until_ts:
+        op = "<" if spec.until_is_exclusive else "<="
+        clauses.append(f"m.timestamp {op} :until_ts")
+        params["until_ts"] = spec.until_ts
+
+    return clauses, params
 
 
 def search_messages(
     conn: sqlite3.Connection,
     raw_query: str,
-    limit: int = 50,
-) -> list[dict]:
+    limit: int = SEARCH_PAGE_SIZE,
+    offset: int = 0,
+    *,
+    current_session_id: str | None = None,
+) -> SearchResultPage:
     """Run the FTS5 search for the search panel.
 
-    Returns rows with keys: uuid, session_id, role, timestamp, snippet,
-    custom_name, project, session_path. ``snippet`` contains
+    Returns paged rows with keys: uuid, session_id, role, timestamp,
+    snippet, custom_name, project, session_path. ``snippet`` contains
     _FTS_MATCH_START / _FTS_MATCH_END sentinels around each match span.
-
-    A malformed FTS5 expression (shouldn't happen after sanitization, but
-    defensive) returns an empty list rather than propagating the
-    exception up into the TUI event loop.
     """
-    fts_expr, role, project = _build_fts_query(raw_query)
+    spec = _build_fts_query(raw_query, current_session_id=current_session_id)
+    where_clauses, base_params = _build_search_filters(spec)
+    where_sql = ""
+    if where_clauses:
+        where_sql = " AND " + " AND ".join(where_clauses)
+
+    timer_start = perf_counter()
 
     # No search terms: allow a filter-only query so typing just
-    # `project:foo` lists recent messages in that project.
-    if not fts_expr:
-        if not role and not project:
-            return []
-        sql = (
+    # `project:foo` or `session:current` lists recent matching messages.
+    if not spec.fts_expr:
+        if not where_clauses:
+            return SearchResultPage(
+                rows=[],
+                total_count=0,
+                limit=limit,
+                offset=offset,
+                elapsed_ms=0.0,
+            )
+
+        count_sql = (
+            "SELECT COUNT(*) AS total_count "
+            "FROM messages m "
+            "LEFT JOIN sessions s ON s.session_id = m.session_id "
+            f"WHERE 1=1{where_sql}"
+        )
+        page_sql = (
             "SELECT m.uuid AS uuid, m.session_id AS session_id, "
             "m.role AS role, m.timestamp AS timestamp, "
             "substr(m.text, 1, 160) AS snippet, "
@@ -1580,53 +1772,123 @@ def search_messages(
             "s.session_path AS session_path "
             "FROM messages m "
             "LEFT JOIN sessions s ON s.session_id = m.session_id "
-            "WHERE 1=1"
+            f"WHERE 1=1{where_sql} "
+            "ORDER BY m.timestamp DESC "
+            "LIMIT :lim OFFSET :off"
         )
-        params: dict = {}
-        if role:
-            sql += " AND m.role = :role"
-            params["role"] = role
-        if project:
-            sql += " AND s.project LIKE :project"
-            params["project"] = f"%{project}%"
-        sql += " ORDER BY m.timestamp DESC LIMIT :lim"
+        params = dict(base_params)
         params["lim"] = limit
+        params["off"] = offset
         try:
-            return db.query_all(conn, sql, params)
+            total_row = db.query_one(conn, count_sql, base_params) or {}
+            rows = db.query_all(conn, page_sql, params)
         except sqlite3.OperationalError:
-            return []
+            return SearchResultPage(
+                rows=[],
+                total_count=0,
+                limit=limit,
+                offset=offset,
+                elapsed_ms=0.0,
+            )
 
-    sql = (
+        return SearchResultPage(
+            rows=rows,
+            total_count=int(total_row.get("total_count") or 0),
+            limit=limit,
+            offset=offset,
+            elapsed_ms=(perf_counter() - timer_start) * 1000,
+        )
+
+    recent_cutoff = (
+        datetime.now(timezone.utc) - timedelta(days=30)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    normalized_text_sql = " ".join(
+        """
+        lower(
+            replace(
+                replace(
+                    replace(
+                        replace(
+                            replace(
+                                replace(
+                                    replace(' ' || m.text || ' ', char(10), ' '),
+                                    '.', ' '
+                                ),
+                                ',', ' '
+                            ),
+                            ';', ' '
+                        ),
+                        ':', ' '
+                    ),
+                    '!', ' '
+                ),
+                '?', ' '
+            )
+        )
+        """.split()
+    )
+    base_from_sql = (
+        "FROM messages_fts "
+        "JOIN messages m ON m.rowid = messages_fts.rowid "
+        "LEFT JOIN sessions s ON s.session_id = m.session_id "
+        "WHERE messages_fts MATCH :q"
+        f"{where_sql}"
+    )
+    count_sql = "SELECT COUNT(*) AS total_count " + base_from_sql
+    page_sql = (
         "SELECT m.uuid AS uuid, m.session_id AS session_id, "
         "m.role AS role, m.timestamp AS timestamp, "
         "snippet(messages_fts, 0, :mstart, :mend, '…', 16) AS snippet, "
         "s.custom_name AS custom_name, s.project AS project, "
         "s.session_path AS session_path "
-        "FROM messages_fts "
-        "JOIN messages m ON m.rowid = messages_fts.rowid "
-        "LEFT JOIN sessions s ON s.session_id = m.session_id "
-        "WHERE messages_fts MATCH :q"
+        + base_from_sql
+        + " ORDER BY "
+        "CASE "
+        "WHEN :plain_query = '' THEN 0 "
+        f"WHEN instr({normalized_text_sql}, ' ' || :plain_query || ' ') > 0 THEN 0 "
+        "ELSE 1 "
+        "END ASC, "
+        "CASE WHEN m.timestamp >= :recent_cutoff THEN 0 ELSE 1 END ASC, "
+        "bm25(messages_fts) ASC, "
+        "m.timestamp DESC "
+        "LIMIT :lim OFFSET :off"
     )
-    params = {
-        "q": fts_expr,
+    params = dict(base_params)
+    params.update({
+        "q": spec.fts_expr,
         "mstart": _FTS_MATCH_START,
         "mend": _FTS_MATCH_END,
-    }
-    if role:
-        sql += " AND m.role = :role"
-        params["role"] = role
-    if project:
-        sql += " AND s.project LIKE :project"
-        params["project"] = f"%{project}%"
-    sql += " ORDER BY rank LIMIT :lim"
+        "plain_query": spec.plain_query,
+        "recent_cutoff": recent_cutoff,
+    })
     params["lim"] = limit
+    params["off"] = offset
 
     try:
-        return db.query_all(conn, sql, params)
+        total_row = db.query_one(
+            conn,
+            count_sql,
+            {k: v for k, v in params.items() if k not in {"lim", "off", "mstart", "mend", "plain_query", "recent_cutoff"}},
+        ) or {}
+        rows = db.query_all(conn, page_sql, params)
     except sqlite3.OperationalError:
         # Malformed expressions still slip through on edge cases
         # (e.g. a bare `*`). Surface as "no results" rather than crash.
-        return []
+        return SearchResultPage(
+            rows=[],
+            total_count=0,
+            limit=limit,
+            offset=offset,
+            elapsed_ms=0.0,
+        )
+
+    return SearchResultPage(
+        rows=rows,
+        total_count=int(total_row.get("total_count") or 0),
+        limit=limit,
+        offset=offset,
+        elapsed_ms=(perf_counter() - timer_start) * 1000,
+    )
 
 
 def _render_snippet(snippet: str) -> Text:
@@ -1700,6 +1962,20 @@ class SearchResultItem(ListItem):
         yield Static(Group(snippet_line, meta), classes="search-result")
 
 
+class RecentSearchItem(ListItem):
+    """One row in the recent-search list shown for an empty query."""
+
+    def __init__(self, query: str):
+        self.query = query
+        super().__init__()
+
+    def compose(self) -> ComposeResult:
+        label = Text()
+        label.append("Recent  ", style="dim")
+        label.append(self.query, style="bold")
+        yield Static(label, classes="search-result")
+
+
 class SearchScreen(ModalScreen):
     """Modal full-text search over indexed messages (task #14).
 
@@ -1709,10 +1985,10 @@ class SearchScreen(ModalScreen):
     to the dismiss callback; Escape dismisses with ``None``.
     """
 
-    # Debounce delay between keystroke and the FTS query. 80 ms keeps
-    # typing responsive while avoiding a query per character on fast
-    # typists — plenty of headroom over FTS5's sub-ms query time.
-    DEBOUNCE_SECONDS = 0.08
+    # Debounce delay between keystroke and the FTS query. 120 ms leaves
+    # enough slack for the extra COUNT() query and lazy-paging status
+    # updates without making fast typing feel sticky.
+    DEBOUNCE_SECONDS = 0.12
 
     # The app binds `enter` with priority=True to start_reply_or_send, and
     # app priority bindings fire even while a modal is up. Re-bind enter
@@ -1782,33 +2058,46 @@ class SearchScreen(ModalScreen):
     }
     """
 
-    def __init__(self, conn: sqlite3.Connection):
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        config: dict | None = None,
+        current_session_id: str | None = None,
+    ):
         super().__init__()
         self.conn = conn
+        self.config = config
+        self.current_session_id = current_session_id
         # Single outstanding debounce timer. Each new keystroke stops
         # the previous timer before scheduling the next one, so only
         # the final keystroke in a typing burst triggers a query.
         self._search_timer = None
+        self._active_query = ""
+        self._loaded_count = 0
+        self._total_count = 0
+        self._last_elapsed_ms = 0.0
+        self._loading_more = False
 
     def compose(self) -> ComposeResult:
         with Vertical(id="search-container") as container:
             container.border_title = "Search"
             yield Input(
                 placeholder=(
-                    "Search (prefix match) — "
-                    "filters: project:<name> user: assistant:"
+                    "Search — filters: project: session:current since: until:"
                 ),
                 id="search-input",
             )
             yield Static("Type to search…", id="search-status")
             yield ListView(id="search-results")
             yield Static(
-                "↑/↓ or ctrl+n/ctrl+p navigate • Enter jump • Esc close",
+                "↑/↓ or PgUp/PgDn navigate • Enter jump • Ctrl+X clear history • Esc close",
                 id="search-help",
             )
 
     def on_mount(self) -> None:
         self.query_one("#search-input", Input).focus()
+        self._show_empty_state()
 
     def on_input_changed(self, event) -> None:
         """Debounced re-run on every keystroke."""
@@ -1828,34 +2117,92 @@ class SearchScreen(ModalScreen):
         )
 
     def _execute_search(self, raw_query: str) -> None:
+        self._run_search(raw_query, reset=True)
+
+    def _show_empty_state(self) -> None:
         results_list = self.query_one("#search-results", ListView)
         status = self.query_one("#search-status", Static)
+        self._active_query = ""
+        self._loaded_count = 0
+        self._total_count = 0
+        self._last_elapsed_ms = 0.0
 
-        raw = raw_query.strip()
-        if not raw:
-            results_list.clear()
+        results_list.clear()
+        recent = get_recent_searches(self.config)
+        if not recent:
             status.update("Type to search…")
             return
 
-        try:
-            rows = search_messages(self.conn, raw, limit=50)
-        except Exception as e:  # noqa: BLE001
-            results_list.clear()
-            status.update(f"Search error: {e}")
+        for query in recent:
+            results_list.append(RecentSearchItem(query))
+        status.update(f"Recent searches ({len(recent)})")
+
+    def _update_status(self, page: SearchResultPage, *, raw_query: str) -> None:
+        status = self.query_one("#search-status", Static)
+        if not raw_query.strip():
+            self._show_empty_state()
             return
 
-        results_list.clear()
-        for row in rows:
+        if page.total_count == 0:
+            status.update(f"No results  •  {page.elapsed_ms:.1f} ms")
+            return
+
+        noun = "result" if page.total_count == 1 else "results"
+        loaded = min(self._loaded_count, self._total_count)
+        parts = [f"{loaded} of {page.total_count} {noun}", f"{page.elapsed_ms:.1f} ms"]
+        if loaded < page.total_count:
+            parts.append("more load as you scroll")
+        status.update("  •  ".join(parts))
+
+    def _run_search(self, raw_query: str, *, reset: bool) -> None:
+        results_list = self.query_one("#search-results", ListView)
+
+        raw = raw_query.strip()
+        if not raw:
+            self._show_empty_state()
+            return
+
+        try:
+            offset = 0 if reset or raw != self._active_query else self._loaded_count
+            page = search_messages(
+                self.conn,
+                raw,
+                limit=SEARCH_PAGE_SIZE,
+                offset=offset,
+                current_session_id=self.current_session_id,
+            )
+        except Exception as e:  # noqa: BLE001
+            self._loading_more = False
+            results_list.clear()
+            self.query_one("#search-status", Static).update(f"Search error: {e}")
+            return
+
+        if reset or raw != self._active_query:
+            results_list.clear()
+            self._active_query = raw
+            self._loaded_count = 0
+
+        for row in page.rows:
             results_list.append(SearchResultItem(row))
 
-        count = len(rows)
-        if count == 0:
-            status.update("No results")
-        else:
-            noun = "result" if count == 1 else "results"
-            status.update(
-                f"{count} {noun}" + (" (showing first 50)" if count >= 50 else "")
-            )
+        if reset and page.rows:
+            results_list.index = 0
+
+        self._loaded_count = offset + len(page.rows)
+        self._total_count = page.total_count
+        self._last_elapsed_ms = page.elapsed_ms
+        self._update_status(page, raw_query=raw)
+        self._loading_more = False
+
+    def _load_more_results(self) -> None:
+        if self._loading_more:
+            return
+        if not self._active_query:
+            return
+        if self._loaded_count >= self._total_count:
+            return
+        self._loading_more = True
+        self._run_search(self._active_query, reset=False)
 
     def on_key(self, event) -> None:
         """Intercept nav / Escape keys while the Input holds focus.
@@ -1878,6 +2225,26 @@ class SearchScreen(ModalScreen):
             event.stop()
             event.prevent_default()
             self._move_selection(-1)
+        elif key == "pagedown":
+            event.stop()
+            event.prevent_default()
+            self._move_selection(10)
+        elif key == "pageup":
+            event.stop()
+            event.prevent_default()
+            self._move_selection(-10)
+        elif key == "ctrl+x":
+            event.stop()
+            event.prevent_default()
+            self.action_clear_search_history()
+
+    def action_clear_search_history(self) -> None:
+        input_widget = self.query_one("#search-input", Input)
+        if (input_widget.value or "").strip():
+            input_widget.value = ""
+            return
+        clear_recent_searches(self.config)
+        self._show_empty_state()
 
     def action_open_result(self) -> None:
         """Enter → open the highlighted result.
@@ -1911,6 +2278,8 @@ class SearchScreen(ModalScreen):
             return
         new_idx = max(0, min(count - 1, lv.index + delta))
         lv.index = new_idx
+        if count and new_idx >= count - 3:
+            self._load_more_results()
 
     def _open_selected(self) -> None:
         """Dismiss with (session_id, uuid, search_terms).
@@ -1932,6 +2301,11 @@ class SearchScreen(ModalScreen):
         if idx < 0 or idx >= len(lv.children):
             idx = 0
         item = lv.children[idx]
+        if isinstance(item, RecentSearchItem):
+            input_widget = self.query_one("#search-input", Input)
+            input_widget.value = item.query
+            input_widget.focus()
+            return
         if not isinstance(item, SearchResultItem):
             return
 
@@ -1940,8 +2314,12 @@ class SearchScreen(ModalScreen):
             raw_query = self.query_one("#search-input", Input).value or ""
         except Exception:
             pass
-        fts_expr, _role, _project = _build_fts_query(raw_query)
-        terms = [t.rstrip("*") for t in fts_expr.split() if t]
+        spec = _build_fts_query(
+            raw_query,
+            current_session_id=self.current_session_id,
+        )
+        terms = list(spec.terms)
+        save_recent_search(self.config, raw_query)
 
         row = item.result
         self.dismiss((row["session_id"], row["uuid"], terms))
@@ -3539,7 +3917,14 @@ class ClaudeSessions(App):
         """
         if self._input_has_focus():
             return
-        self.push_screen(SearchScreen(self.conn), self._on_search_dismissed)
+        self.push_screen(
+            SearchScreen(
+                self.conn,
+                config=self.config,
+                current_session_id=self._selected_session_id,
+            ),
+            self._on_search_dismissed,
+        )
 
     def action_open_bookmarks(self) -> None:
         """Open the bookmark browser modal (task #18).
