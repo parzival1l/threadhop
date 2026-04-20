@@ -126,6 +126,73 @@ Prefer a slash-style trigger? A Claude Code `UserPromptSubmit` hook can intercep
 
 The hook reads the prompt from stdin as JSON, matches `/tag <status>`, invokes `threadhop tag`, and exits `2` — which tells Claude Code to block the submission and show the stderr output to the user.
 
+## Bookmarking from inside Claude Code
+
+Use the same `!` bash passthrough pattern to bookmark the current conversation without opening the TUI first.
+
+General keep-for-later bookmark against the latest message in the current session:
+
+```bash
+!threadhop bookmark
+```
+
+Research follow-up bookmark with a short note:
+
+```bash
+!threadhop bookmark research --note "compare retry strategies later"
+```
+
+Output:
+
+```text
+✓ bookmarked kind=research session=8f3b2a1c-... message=6d2e... role=assistant text="We should compare retry strategies later." note="compare retry strategies later"
+```
+
+Targeting rules:
+
+- Session auto-detect works the same way as `threadhop tag`: inside a live Claude Code terminal it walks the parent process tree for the current `claude` session.
+- Without `--message`, ThreadHop bookmarks the latest indexed message in that session.
+- If you need a specific message, pass `--session <id> --message <uuid>`.
+- Built-in classes are intentionally narrow for now: `bookmark` and `research`.
+
+The ingest path is shared and deterministic: chat commands use the same bookmark primitive that future TUI actions can call later.
+
+### Optional: `/bookmark` and `/research` via a UserPromptSubmit hook
+
+Prefer slash-style triggers? This hook blocks the prompt before it reaches the model and shells out to `threadhop bookmark`.
+
+1. Drop this script at `~/.claude/hooks/threadhop-bookmark.sh` and `chmod +x` it:
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+    INPUT=$(cat)
+    PROMPT=$(printf '%s' "$INPUT" | jq -r '.prompt')
+    if [[ "$PROMPT" =~ ^/bookmark([[:space:]]+(.*))?$ ]]; then
+      NOTE="${BASH_REMATCH[2]-}"
+      if [[ -n "$NOTE" ]]; then
+        threadhop bookmark --note "$NOTE" >&2
+      else
+        threadhop bookmark >&2
+      fi
+      exit 2
+    fi
+    if [[ "$PROMPT" =~ ^/research([[:space:]]+(.*))?$ ]]; then
+      NOTE="${BASH_REMATCH[2]-}"
+      if [[ -n "$NOTE" ]]; then
+        threadhop bookmark research --note "$NOTE" >&2
+      else
+        threadhop bookmark research >&2
+      fi
+      exit 2
+    fi
+    exit 0
+    ```
+
+2. Register it in `~/.claude/settings.json` the same way as the `/tag` example above.
+
+This gives you two low-friction chat-side buckets now, while keeping the app-side bookmark model ready for later generalized categories.
+
 ## Observer Lifecycle
 
 Start the background observer for the current Claude Code session from inside

@@ -583,7 +583,7 @@ COMMAND_REGISTRY: list[Command] = [
     Command(("y",), "Copy selection", SCOPE_SELECTION, footer=True),
     Command(("e",), "Export to /tmp", SCOPE_SELECTION, footer=True),
     Command(("space",), "Toggle bookmark", SCOPE_SELECTION, footer=True),
-    Command(("L",), "Label bookmark", SCOPE_SELECTION),
+    Command(("L",), "Edit bookmark note", SCOPE_SELECTION),
     Command(("m", "escape"), "Exit selection", SCOPE_SELECTION, footer=True),
 
     # --- Reply input ---
@@ -613,7 +613,7 @@ COMMAND_REGISTRY: list[Command] = [
     # --- Bookmark browser modal (widget-local; BookmarkBrowserScreen.on_key) ---
     Command(("up", "down", "ctrl+n", "ctrl+p"), "Navigate bookmarks", SCOPE_BOOKMARKS, footer=True),
     Command(("enter",), "Jump to message", SCOPE_BOOKMARKS, footer=True),
-    Command(("L",), "Edit label", SCOPE_BOOKMARKS, footer=True),
+    Command(("L",), "Edit note", SCOPE_BOOKMARKS, footer=True),
     Command(("d",), "Delete bookmark", SCOPE_BOOKMARKS, footer=True),
     Command(("escape",), "Close", SCOPE_BOOKMARKS, footer=True),
 ]
@@ -1024,7 +1024,7 @@ class TranscriptView(VerticalScroll):
         self._update_selection(messages)
         self.app.notify(
             "Selection mode: j/k move, v range, y copy, e export, "
-            "space bookmark, L label, m/Esc exit"
+            "space bookmark, L note, m/Esc exit"
         )
         # Nudge the contextual footer — selection mode has its own scope.
         try:
@@ -1120,7 +1120,7 @@ class TranscriptView(VerticalScroll):
                 f"({pos}/{total}) (j/k extend, v/Esc cancel)"
             )
         else:
-            self.border_title = f"Transcript ── SELECT {pos}/{total} (j/k move, v range, y/e copy/export, space bookmark, L label, m/Esc exit)"
+            self.border_title = f"Transcript ── SELECT {pos}/{total} (j/k move, v range, y/e copy/export, space bookmark, L note, m/Esc exit)"
 
     def _clear_selection(self):
         for widget in self._get_message_widgets():
@@ -2862,8 +2862,8 @@ class BookmarkItem(ListItem):
     """One row in the bookmark browser.
 
     Layout mirrors SearchResultItem so the two modals feel like siblings:
-    label / role marker + snippet, then session · project · timestamp.
-    Bookmarks without a label fall back to the message role marker alone.
+    note / kind / role marker + snippet, then session · project · timestamp.
+    Bookmarks without a note fall back to the kind + role marker alone.
     """
 
     def __init__(self, row: dict):
@@ -2874,12 +2874,15 @@ class BookmarkItem(ListItem):
         role = self.row.get("role", "")
         role_icon = "▶" if role == "user" else "●"
         role_style = "bold cyan" if role == "user" else "bold green"
-        label = (self.row.get("label") or "").strip()
+        note = (self.row.get("note") or "").strip()
+        kind = self.row.get("kind") or "bookmark"
+        kind_style = "bold magenta" if kind == "research" else "bold yellow"
 
         first_line = Text()
         first_line.append("★ ", style="bold yellow")
-        if label:
-            first_line.append(label, style="bold")
+        first_line.append(f"[{kind}] ", style=kind_style)
+        if note:
+            first_line.append(note, style="bold")
             first_line.append("  ", style="dim")
         first_line.append(f"{role_icon} ", style=role_style)
         # Trim the stored text to a single-line snippet — the full body
@@ -2920,7 +2923,7 @@ class BookmarkBrowserScreen(ModalScreen):
     Shares the SearchScreen layout — filter Input on top, ListView of
     results, status + hint lines at the bottom — so keyboard muscle
     memory carries over. Filter runs case-insensitive substring matches
-    over label / message body / project / custom name via
+    over note / kind / message body / project / custom name via
     ``db.list_bookmarks``.
 
     Dismiss payload:
@@ -3003,13 +3006,13 @@ class BookmarkBrowserScreen(ModalScreen):
         with Vertical(id="bookmark-container") as container:
             container.border_title = "Bookmarks"
             yield Input(
-                placeholder="Filter bookmarks by label, text, or session…",
+                placeholder="Filter bookmarks by note, kind, text, or session…",
                 id="bookmark-input",
             )
             yield Static("", id="bookmark-status")
             yield ListView(id="bookmark-results")
             yield Static(
-                "↑/↓ navigate • Enter jump • L label • d delete • Esc close",
+                "↑/↓ navigate • Enter jump • L note • d delete • Esc close",
                 id="bookmark-help",
             )
 
@@ -3035,7 +3038,7 @@ class BookmarkBrowserScreen(ModalScreen):
 
     def _refresh_results(self, raw_query: str) -> None:
         """Reload the results list from the DB. Preserves cursor position
-        when possible so in-place edits (label / delete) don't jump the
+        when possible so in-place edits (note / delete) don't jump the
         user back to the top."""
         results_list = self.query_one("#bookmark-results", ListView)
         status = self.query_one("#bookmark-status", Static)
@@ -3086,7 +3089,7 @@ class BookmarkBrowserScreen(ModalScreen):
         elif key == "L":
             event.stop()
             event.prevent_default()
-            self._edit_label_selected()
+            self._edit_note_selected()
         elif key == "d":
             event.stop()
             event.prevent_default()
@@ -3132,26 +3135,26 @@ class BookmarkBrowserScreen(ModalScreen):
             return
         self.dismiss((row["session_id"], row["message_uuid"]))
 
-    def _edit_label_selected(self) -> None:
+    def _edit_note_selected(self) -> None:
         row = self._current_row()
         if row is None:
             return
         bookmark_id = row["id"]
-        current = row.get("label") or ""
+        current = row.get("note") or ""
 
-        def _apply(new_label: str | None) -> None:
-            if new_label is None:
+        def _apply(new_note: str | None) -> None:
+            if new_note is None:
                 return
             try:
-                db.set_bookmark_label(self.conn, bookmark_id, new_label)
+                db.set_bookmark_note(self.conn, bookmark_id, new_note)
             except Exception as e:  # noqa: BLE001
-                self.app.notify(f"Label update failed: {e}", severity="error")
+                self.app.notify(f"Note update failed: {e}", severity="error")
                 return
-            # Refresh in place so the edited label renders immediately.
+            # Refresh in place so the edited note renders immediately.
             raw = self.query_one("#bookmark-input", Input).value or ""
             self._refresh_results(raw)
-            shown = new_label.strip() or "(no label)"
-            self.app.notify(f"Label: {shown}")
+            shown = new_note.strip() or "(no note)"
+            self.app.notify(f"Bookmark note: {shown}")
 
         self.app.push_screen(LabelPromptScreen(current), _apply)
 
@@ -3172,11 +3175,11 @@ class BookmarkBrowserScreen(ModalScreen):
 class LabelPromptScreen(ModalScreen):
     """Tiny modal that captures a single line of text.
 
-    Used both when setting a label from selection mode and when editing
-    one from the browser. Returns the submitted string on Enter, or
-    ``None`` on Escape — caller decides whether an empty submission
-    means "clear" (bookmark browser does that via set_bookmark_label's
-    blank-collapses-to-NULL behaviour).
+    Used both when setting a note from selection mode and when editing one from
+    the browser. Returns the submitted string on Enter, or ``None`` on Escape.
+    The caller decides whether an empty submission means "clear" (bookmark
+    browser does that via ``set_bookmark_note``'s blank-collapses-to-NULL
+    behaviour).
     """
 
     BINDINGS = [
@@ -3225,10 +3228,10 @@ class LabelPromptScreen(ModalScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="label-container"):
-            yield Static("Bookmark label", id="label-title")
+            yield Static("Bookmark note", id="label-title")
             yield Input(
                 value=self._initial,
-                placeholder="Label (blank = clear)",
+                placeholder="Note (blank = clear)",
                 id="label-input",
             )
             yield Static("Enter to save • Esc to cancel", id="label-hint")
@@ -4665,6 +4668,10 @@ class ClaudeSessions(App):
         same turn uuid — e.g. tool widgets pinned to the turn's
         canonical id) are collapsed so one press produces one toggle
         per underlying row."""
+        # TODO: when the TUI grows a bookmark/research picker, route that flow
+        # through ``db.upsert_bookmark`` so chat commands and the TUI share one
+        # deterministic ingest path. Selection-mode space intentionally keeps
+        # the legacy toggle semantics for the plain built-in bookmark kind.
         transcript = self.query_one("#transcript-scroll", TranscriptView)
         selected = transcript.get_selected_messages()
         if not selected:
@@ -4708,9 +4715,9 @@ class ClaudeSessions(App):
         self.notify(", ".join(parts) if parts else "No bookmarks changed")
 
     def bookmark_prompt_label(self) -> None:
-        """Selection-mode `L`: prompt for a label on the (single) focused
-        message. For range selections we label the cursor message only —
-        bulk labeling is an anti-pattern for a short free-text field."""
+        """Selection-mode `L`: prompt for a note on the (single) focused
+        message. For range selections we note the cursor message only —
+        bulk note editing is an anti-pattern for a short free-text field."""
         transcript = self.query_one("#transcript-scroll", TranscriptView)
         messages = transcript._get_message_widgets()
         if not transcript._selection_mode or not messages:
@@ -4725,14 +4732,14 @@ class ClaudeSessions(App):
             return
 
         existing = db.get_bookmark(self.conn, uuid)
-        current = existing["label"] if existing and existing.get("label") else ""
+        current = existing["note"] if existing and existing.get("note") else ""
 
-        def _apply(new_label: str | None) -> None:
-            if new_label is None:
+        def _apply(new_note: str | None) -> None:
+            if new_note is None:
                 return
-            # If the message isn't bookmarked yet, create one first so
-            # we have an id to label. This makes `L` on an unbookmarked
-            # message behave like "bookmark + label in one step".
+            # If the message isn't bookmarked yet, create one first so we have
+            # an id to annotate. This makes `L` on an unbookmarked message
+            # behave like "bookmark + note in one step".
             row = db.get_bookmark(self.conn, uuid)
             if row is None:
                 row = db.toggle_bookmark(self.conn, uuid)
@@ -4740,9 +4747,9 @@ class ClaudeSessions(App):
                     # Extremely unlikely — the toggle raced a delete.
                     self.notify("Could not create bookmark", severity="error")
                     return
-            db.set_bookmark_label(self.conn, row["id"], new_label)
-            shown = (new_label or "").strip() or "(no label)"
-            self.notify(f"Bookmark label: {shown}")
+            db.set_bookmark_note(self.conn, row["id"], new_note)
+            shown = (new_note or "").strip() or "(no note)"
+            self.notify(f"Bookmark note: {shown}")
 
         self.push_screen(LabelPromptScreen(current), _apply)
 
@@ -5781,7 +5788,7 @@ def build_parser():
         description=(
             "ThreadHop — Claude Code session browser.\n"
             "  No subcommand  → launch the TUI.\n"
-            "  Subcommand     → CLI mode (tag, todos, decisions, observations, conflicts)."
+            "  Subcommand     → CLI mode (tag, bookmark, todos, decisions, observations, conflicts)."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -5836,6 +5843,38 @@ def build_parser():
         "status",
         choices=db.SESSION_STATUS_ORDER,
         help="Status value to set",
+    )
+
+    bookmark_p = subparsers.add_parser(
+        "bookmark",
+        parents=[shared],
+        help="Bookmark the latest message in a session, or a specific message",
+        description=(
+            "Create or update a bookmark against a session/message target. "
+            "Without --message, the target is the latest indexed message in "
+            "the current Claude Code session. `kind` stays intentionally "
+            "narrow for now: bookmark (general keep-for-later) or research "
+            "(deferred research follow-up)."
+        ),
+    )
+    bookmark_p.add_argument(
+        "kind",
+        nargs="?",
+        default="bookmark",
+        choices=db.BOOKMARK_KIND_ORDER,
+        help="Built-in bookmark class (default: bookmark)",
+    )
+    bookmark_p.add_argument(
+        "--message",
+        type=str,
+        default=None,
+        help="Explicit message uuid inside the target session (defaults to the latest message)",
+    )
+    bookmark_p.add_argument(
+        "--note",
+        type=str,
+        default=None,
+        help="Optional short note to store alongside the bookmark",
     )
 
     subparsers.add_parser(
@@ -6460,6 +6499,101 @@ def cmd_handoff(args) -> int:
     return 0
 
 
+def _ensure_cli_messages_indexed(
+    conn: sqlite3.Connection,
+    session_id: str,
+) -> dict | None:
+    """Seed the session row from disk and incrementally index its transcript."""
+    session_path = find_session_path(session_id)
+    if session_path is not None:
+        db.upsert_session(
+            conn,
+            session_id,
+            str(session_path),
+            project=session_path.parent.name,
+        )
+    row = db.get_session(conn, session_id) or _ensure_cli_session_row(conn, session_id)
+    if row is None:
+        return None
+    try:
+        indexer.index_session_incremental(conn, session_id, row["session_path"])
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"failed to index session {session_id}: {e}") from e
+    return db.get_session(conn, session_id)
+
+
+def _format_bookmark_confirmation(
+    target: dict,
+    bookmark: dict,
+) -> str:
+    """Return one deterministic success line for bookmark ingest."""
+    text = " ".join((target.get("text") or "").split())
+    if len(text) > 100:
+        text = text[:99] + "…"
+    note = bookmark.get("note")
+    note_part = f" note={json.dumps(note)}" if note is not None else ""
+    return (
+        "✓ bookmarked "
+        f"kind={bookmark['kind']} "
+        f"session={target['session_id']} "
+        f"message={target['uuid']} "
+        f"role={target.get('role') or 'unknown'} "
+        f"text={json.dumps(text)}"
+        f"{note_part}"
+    )
+
+
+def cmd_bookmark(args) -> int:
+    """Create or update a bookmark against a session/message target.
+
+    Chat ergonomics default to the newest indexed message in the current Claude
+    session. Callers may override the target with ``--session`` and
+    ``--message`` when bookmarking from outside that live terminal.
+    """
+    rc = _resolve_cli_session(args)
+    if rc != 0:
+        return rc
+
+    conn = db.init_db()
+    try:
+        session = _ensure_cli_messages_indexed(conn, args.session)
+        if session is None:
+            print(
+                f"threadhop bookmark: no transcript found for session {args.session} "
+                f"under {CLAUDE_PROJECTS}.",
+                file=sys.stderr,
+            )
+            return 1
+        target = db.resolve_bookmark_target(
+            conn,
+            session_id=args.session,
+            message_uuid=args.message,
+        )
+        if target is None:
+            detail = (
+                f"message {args.message!r} in session {args.session}"
+                if args.message
+                else f"latest message in session {args.session}"
+            )
+            print(
+                f"threadhop bookmark: could not resolve {detail}.",
+                file=sys.stderr,
+            )
+            return 1
+        kwargs = {"kind": args.kind}
+        if args.note is not None:
+            kwargs["note"] = args.note
+        bookmark = db.upsert_bookmark(conn, target["uuid"], **kwargs)
+    except RuntimeError as e:
+        print(f"threadhop bookmark: {e}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+
+    print(_format_bookmark_confirmation(target, bookmark))
+    return 0
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -6491,6 +6625,8 @@ def main():
         return cmd_todos(args)
     if args.command == "decisions":
         return cmd_decisions(args)
+    if args.command == "bookmark":
+        return cmd_bookmark(args)
     if args.command == "config":
         return cmd_config(args)
     if args.command == "observe":

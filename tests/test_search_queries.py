@@ -135,7 +135,7 @@ def test_migration_rebuilds_trigram_index_for_existing_messages(tmp_path):
             conn, "connnect", limit=10
         )
 
-        assert db.get_schema_version(conn) == 8
+        assert db.get_schema_version(conn) == 9
         assert used_fallback is True
         assert [row["uuid"] for row in rows] == ["m1"]
     finally:

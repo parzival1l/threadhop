@@ -179,7 +179,7 @@ and transcript header (ADR-021)._
 _Cross-session knowledge persistence (beyond the raw observations log)._
 
 - [ ] **27. Build bookmark system** *(blocked by: #1, #10)*
-  Add `bookmarks` table to schema. Toggle bookmark from message selection mode with `space`. Support labels and tags (JSON array). Build bookmark browser panel in TUI.
+  Add `bookmarks` table to schema and a shared bookmark-ingest primitive. Keep the initial built-in classes intentionally narrow: `bookmark` and `research`. Support an optional short note and retain tags (JSON array) as forward-compatible storage. TUI `space` keeps the lightweight toggle path for plain bookmarks, while chat/skill/plugin integrations call the same shared primitive through a scriptable CLI entrypoint. Build bookmark browser panel in TUI.
 
 - [ ] **28. Build project memory ledger** *(blocked by: #1)*
   Add `memory` table to schema. Support typed entries: `decision | todo | done | adr | observation`. Append-only, filterable by project/type/date. Manual entry from TUI (type + text). Distinct from per-session observation files: this is for curated/explicit entries with `source: 'explicit'`. _(ADR-005)_
