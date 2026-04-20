@@ -1252,7 +1252,7 @@ def get_observed_sessions(
     """
     return query_all(
         conn,
-        "SELECT session_id, entry_count, status, observer_pid "
+        "SELECT session_id, entry_count, status, observer_pid, obs_path "
         "FROM observation_state WHERE entry_count > 0",
     )
 
