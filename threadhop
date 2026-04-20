@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import db  # noqa: E402
 import indexer  # noqa: E402
 import cli_queries  # noqa: E402
+import handoff as handoff_mod  # noqa: E402
 import observation_queries  # noqa: E402
 import observer  # noqa: E402
 import reflector  # noqa: E402
@@ -4863,6 +4864,48 @@ def build_parser():
         ),
     )
 
+    handoff_p = subparsers.add_parser(
+        "handoff",
+        help="Produce a handoff brief for a session",
+        description=(
+            "Run the observer (first-time or catch-up) followed by the "
+            "reflector, then print a markdown handoff brief composed "
+            "from the per-session observation JSONL. Short observation "
+            "sets format directly; larger sets (or --full) go through "
+            "a Haiku sub-agent for polish. The `/threadhop:handoff` "
+            "skill shells out to this subcommand. Unlike `tag`/`observe`, "
+            "handoff is always about a *different* session than the "
+            "caller's — pass the session id explicitly."
+        ),
+    )
+    handoff_p.add_argument(
+        "session_id",
+        type=str,
+        help="Session id to hand off (required, positional)",
+    )
+    handoff_p.add_argument(
+        "--full",
+        action="store_true",
+        default=False,
+        help=(
+            "Produce a comprehensive handoff with rationale and "
+            "verbatim transcript excerpts. Always uses the Haiku "
+            "sub-agent regardless of observation count."
+        ),
+    )
+    handoff_p.add_argument(
+        "--no-reflect",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip the reflector pass between observer and brief. "
+            "Defaults off — ADR-022 mandates the reflector runs as a "
+            "follow-up step for on-demand observer invocations. Flag "
+            "is primarily for debugging; production runs should leave "
+            "it disabled."
+        ),
+    )
+
     return parser
 
 
@@ -5161,6 +5204,81 @@ def cmd_decisions(args) -> int:
     return 0
 
 
+def cmd_handoff(args) -> int:
+    """Produce a handoff brief for ``args.session_id`` and print it.
+
+    The ``/threadhop:handoff`` skill shells out to this subcommand. It
+    parses ``session_id`` positionally and ``--full`` / ``--no-reflect``
+    as optional flags. Unlike ``cmd_observe``, this handler does NOT
+    auto-detect the current terminal's session — handoff is always
+    about a *different* session than the one the skill is invoked
+    from, so the caller must name it explicitly.
+
+    Seeds the sessions row when the transcript is discoverable under
+    ``~/.claude/projects`` but the TUI hasn't indexed it yet. If the
+    session is unknown to both the filesystem scan AND the DB,
+    ``build_handoff`` still falls back to reading any existing
+    observation file via the ``observation_state`` row.
+
+    Brief goes to stdout (so the skill can inject it as markdown).
+    Status / fallback lines go to stderr so stdout stays pure markdown.
+    """
+    session_path = find_session_path(args.session_id)
+    conn = db.init_db()
+    try:
+        if session_path is not None:
+            db.upsert_session(
+                conn, args.session_id, str(session_path),
+                project=session_path.parent.name,
+            )
+        reflect_fn = None if args.no_reflect else reflector.reflect_session
+        result = handoff_mod.build_handoff(
+            conn, args.session_id,
+            full=args.full,
+            reflect_fn=reflect_fn,
+        )
+    finally:
+        conn.close()
+
+    status = result.get("status")
+    brief = result.get("brief", "")
+
+    if status == "no_source":
+        print(
+            f"threadhop handoff: {result.get('message', 'no source JSONL')}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if status == "no_observations":
+        # Expected outcome for short/routine sessions. Exit 0 so the
+        # skill doesn't treat this as an error; message goes to stderr
+        # so stdout stays empty and the skill can cleanly surface
+        # "nothing to hand off".
+        print(
+            f"threadhop handoff: {result.get('message', 'no observations')}",
+            file=sys.stderr,
+        )
+        return 0
+
+    # ok path — brief is markdown, emit to stdout for the skill to inject.
+    if brief:
+        sys.stdout.write(brief if brief.endswith("\n") else brief + "\n")
+
+    msg = result.get("message")
+    if msg:
+        print(f"threadhop handoff: {msg}", file=sys.stderr)
+    if result.get("reflector_error"):
+        print(
+            f"  reflector:     {result['reflector_error']} (ignored)",
+            file=sys.stderr,
+        )
+    stderr = result.get("polish_stderr")
+    if stderr:
+        print(f"  polish stderr: {stderr}", file=sys.stderr)
+    return 0
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -5198,6 +5316,8 @@ def main():
         return cmd_conflicts(args)
     if args.command == "observations":
         return cmd_observations(args)
+    if args.command == "handoff":
+        return cmd_handoff(args)
     return _cli_stub(args.command)
 
 
