@@ -519,6 +519,12 @@ class ToolMessage(_SelectableMessage):
     pass
 
 
+class ObservationInfoHeader(Static):
+    """Passive observation metadata shown above the transcript."""
+
+    can_focus = False
+
+
 class TranscriptView(VerticalScroll):
     """Shows full conversation from selected session"""
 
@@ -567,6 +573,37 @@ class TranscriptView(VerticalScroll):
         self._find_query: str = ""
         self._find_matches: list[int] = []
         self._find_current: int = -1
+
+    def _format_observation_header(self, entry_count: int, obs_path: str) -> str:
+        """Return the passive transcript header for observed sessions."""
+        noun = "observation" if entry_count == 1 else "observations"
+        try:
+            display_path = str(Path(obs_path).expanduser())
+            home = str(Path.home())
+            if display_path == home:
+                display_path = "~"
+            elif display_path.startswith(home + os.sep):
+                display_path = "~" + display_path[len(home):]
+        except Exception:
+            display_path = obs_path
+        return f"─── 🗒 {entry_count} {noun} · {display_path} ───"
+
+    def _get_observation_header_text(self, session_id: str) -> str | None:
+        """Look up observation metadata for the current transcript."""
+        try:
+            state = db.get_observation_state(self.app.conn, session_id)
+        except Exception:
+            return None
+
+        if not state:
+            return None
+
+        entry_count = int(state.get("entry_count") or 0)
+        obs_path = str(state.get("obs_path") or "").strip()
+        if entry_count <= 0 or not obs_path:
+            return None
+
+        return self._format_observation_header(entry_count, obs_path)
 
     def _get_message_widgets(self):
         """Return all message widgets in order."""
@@ -944,6 +981,7 @@ class TranscriptView(VerticalScroll):
         self.current_path = session_path
 
         messages = self._parse_messages(session_path)
+        observation_header = self._get_observation_header_text(session_path.stem)
 
         # Remove all existing message widgets (await ensures completion)
         await self._remove_all_messages()
@@ -954,6 +992,13 @@ class TranscriptView(VerticalScroll):
 
         # Build widgets with visual boundaries
         widgets = []
+        if observation_header:
+            widgets.append(
+                ObservationInfoHeader(
+                    observation_header,
+                    classes="observation-info-header",
+                )
+            )
         tool_batch = []
 
         def flush_tools():
@@ -2606,6 +2651,13 @@ class ClaudeSessions(App):
         height: 1fr;
         border: solid $secondary;
         border-title-color: $text;
+    }
+
+    ObservationInfoHeader {
+        padding: 0 1;
+        margin: 0;
+        color: $text-muted;
+        background: $panel;
     }
 
     FindBar {
