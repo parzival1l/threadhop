@@ -1527,17 +1527,26 @@ set) and ADR-016 (observe + insights).
 
 ### Plugin: `threadhop`
 
-```
-threadhop/
-  skills/
-    context.md          # /threadhop:context
-    handoff.md          # /threadhop:handoff <session_id>
-    observe.md          # /threadhop:observe
-    insights.md         # /threadhop:insights
+Final Phase 4 surface — one plugin with a hybrid of one skill and two
+commands, all under the `/threadhop:` namespace. `context` and
+`insights` from the original ADR-016 plan were dropped (see
+`skill-packaging.md` for rationale). The plugin calls bare `threadhop`
+from `$PATH` — the app is installed separately (Model B).
 
-# Tagging: !threadhop tag <status> (bash passthrough, no skill needed)
-# Optional: ~/.claude/hooks/threadhop-tag.sh for /tag <status> ergonomics — see README
 ```
+plugin/
+├── .claude-plugin/plugin.json           # manifest: name=threadhop, version=0.1.0
+├── skills/
+│   └── handoff/
+│       └── SKILL.md                     # /threadhop:handoff — model-framed brief
+└── commands/
+    ├── observe.md                       # /threadhop:observe — !`threadhop observe`
+    └── tag.md                           # /threadhop:tag — !`threadhop tag` + argument-hint
+```
+
+Tagging also stays available as `!threadhop tag <status>` (bash
+passthrough, zero LLM turn). The slash form's advantage is
+discoverability — the argument-hint enumerates valid statuses.
 
 ### What lives where
 
@@ -1547,12 +1556,11 @@ threadhop/
 | Message select + copy | TUI | Visual selection, clipboard transport |
 | Message export to .md | TUI | Visual selection, writes to /tmp |
 | Bookmark | TUI | Visual selection, one-key action |
-| Tag session | TUI + CLI + `!` bash passthrough | Three entry points, one DB (ADR-013) |
-| Observation queries | CLI | `threadhop todos`, `threadhop decisions` |
-| Start observation | Skill + TUI | Per-session opt-in, spawns background process |
-| Pull observations/conflicts | Skill | Read per-session observation file, format for injection |
-| Context injection | Skill | Formats clipboard content with source labels |
-| Handoff | Skill | Runs observer first if needed, formats from observations |
+| Tag session | TUI + CLI + `!` bash passthrough + `/threadhop:tag` | Four entry points, one DB (ADR-013) |
+| Observation queries | CLI | `threadhop todos`, `threadhop decisions`, etc. |
+| Start observation | `/threadhop:observe` + TUI | Per-session opt-in; observer lifetime bound to the Claude Code session that started it |
+| View captured observations | TUI + CLI (not in-session) | Observations are for *other* sessions — surfacing them in the generating session defeats the observer's purpose |
+| Handoff (brief for another session) | `/threadhop:handoff` skill | Runs observer catch-up first, formats via Haiku for `--full`, model frames the output |
 | Observation indicator | TUI | 🗒 icon + transcript header for observed sessions |
 
 ### Tag entry point 3: `!threadhop tag <status>` (bash passthrough, zero LLM turn)
@@ -1810,10 +1818,17 @@ is essentially a tag that groups sessions and memory entries across projects.
   does NOT pause — the observer is a background process, not a daemon.
 Both modes coexist. Background mode is additive — on-demand still works.
 
-### Q4: Skill plugin packaging
-How are Claude Code skill plugins distributed? As a directory of .md files in
-`~/.claude/skills/`? As an npm/pip package? Need to verify the plugin contract.
-**Action:** Research Claude Code skill plugin packaging before Phase 3.
+### Q4: Skill plugin packaging — **RESOLVED (2026-04-19)**
+See [`skill-packaging.md`](skill-packaging.md) for the full writeup.
+Summary: ThreadHop ships as a **plugin** — a directory with
+`.claude-plugin/plugin.json` — containing **slash commands** under
+`commands/<name>.md`, not "skills". Each command body is a single
+`` !`${CLAUDE_PLUGIN_ROOT}/bin/threadhop <subcommand> $ARGUMENTS` `` line
+that the harness pre-executes before Claude sees the prompt, so the CLI
+does the work and the model just relays stdout. Distribution is via
+`/plugin marketplace add <git-url>` + `/plugin install threadhop`, or
+`--plugin-dir <path>` during development. Boilerplate lives under
+[`plugin/`](../plugin) in this repo.
 
 ### Q5: FTS indexing — index tool results or not?
 Current design: index only user + assistant text. Tool results are huge (file

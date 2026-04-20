@@ -97,5 +97,6 @@ Every message line has native fields useful for indexing:
 
 ## In Progress
 
-- Skill plugin `/threadhop:handoff <session_id>` sits on top of the observer/reflector pipeline and is still being assembled
-- See `docs/DESIGN-DECISIONS.md` for ADRs and the phase roadmap, and `docs/TASKS.md` for open tasks
+- Claude Code plugin scaffolded at `plugin/` — one skill (`/threadhop:handoff`, task #26 merged) plus two commands (`/threadhop:observe`, `/threadhop:tag`), all under the `/threadhop:` namespace. Plugin is PATH-dependent on a separately-installed `threadhop` CLI (see `docs/skill-packaging.md`).
+- Phase 5 release work (marketplace.json, CLI-side discoverability for `threadhop tag` no-args, interactive install verification) still open.
+- See `docs/DESIGN-DECISIONS.md` for ADRs and the phase roadmap, and `docs/TASKS.md` for open tasks.
