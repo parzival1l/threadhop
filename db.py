@@ -911,6 +911,35 @@ def get_session_statuses(conn: sqlite3.Connection) -> dict[str, str]:
     return {r["session_id"]: r["status"] for r in rows}
 
 
+def get_session_sidebar_metadata(
+    conn: sqlite3.Connection,
+) -> dict[str, dict[str, object]]:
+    """Return bulk sidebar state for every known session.
+
+    The TUI refresh loop uses this to stamp persisted session status and
+    the ADR-021 observation indicator bit in one query, instead of
+    issuing row-by-row lookups during the 5-second refresh cycle.
+    """
+    rows = conn.execute(
+        """
+        SELECT
+            s.session_id,
+            s.status,
+            CASE WHEN COALESCE(os.entry_count, 0) > 0 THEN 1 ELSE 0 END
+                AS has_observations
+        FROM sessions s
+        LEFT JOIN observation_state os ON os.session_id = s.session_id
+        """
+    ).fetchall()
+    return {
+        row["session_id"]: {
+            "status": row["status"],
+            "has_observations": bool(row["has_observations"]),
+        }
+        for row in rows
+    }
+
+
 def set_session_status(
     conn: sqlite3.Connection,
     session_id: str,
@@ -1333,7 +1362,7 @@ def get_observed_sessions(
     """
     return query_all(
         conn,
-        "SELECT session_id, entry_count, status, observer_pid "
+        "SELECT session_id, entry_count, status, observer_pid, obs_path "
         "FROM observation_state WHERE entry_count > 0",
     )
 

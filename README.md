@@ -193,6 +193,74 @@ Prefer slash-style triggers? This hook blocks the prompt before it reaches the m
 
 This gives you two low-friction chat-side buckets now, while keeping the app-side bookmark model ready for later generalized categories.
 
+## Observer Lifecycle
+
+Start the background observer for the current Claude Code session from inside
+the chat:
+
+```bash
+!threadhop observe
+```
+
+Or target a specific session from another terminal:
+
+```bash
+threadhop observe --session <id> &
+```
+
+Stop and resume use the persisted `observation_state` row. The observer handles
+`SIGTERM` gracefully: it flushes any pending tail, advances
+`source_byte_offset`, marks the row `stopped`, and exits cleanly. A later
+`threadhop observe` resumes from the recorded byte offset instead of re-reading
+the full transcript.
+
+```bash
+threadhop observe --stop
+threadhop observe --stop --session <id>
+threadhop observe --stop-all
+```
+
+### Optional: hook-driven auto-start
+
+If you want observer auto-start on every prompt for sessions where it is
+enabled, first persist the flag:
+
+```bash
+threadhop config set observe.enabled true
+```
+
+Then register a lightweight `UserPromptSubmit` hook that launches
+`threadhop observe` in the background. The command is safe to run repeatedly:
+it auto-detects the current session and exits immediately when an observer is
+already running for that session.
+
+1. Drop this script at `~/.claude/hooks/threadhop-observe.sh` and `chmod +x` it:
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    if [[ "$(threadhop config get observe.enabled 2>/dev/null)" == "true" ]]; then
+      threadhop observe >/dev/null 2>&1 &
+    fi
+    ```
+
+2. Register it in `~/.claude/settings.json`:
+
+    ```json
+    {
+      "hooks": {
+        "UserPromptSubmit": [
+          {
+            "hooks": [
+              { "type": "command", "command": "~/.claude/hooks/threadhop-observe.sh" }
+            ]
+          }
+        ]
+      }
+    }
+    ```
+
 ## Roadmap
 
 - Cross-session search (SQLite FTS5, per-keystroke)

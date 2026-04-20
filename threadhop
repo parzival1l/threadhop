@@ -17,8 +17,9 @@ import sqlite3
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from time import perf_counter
 
 from rich.console import Group
 from rich.markdown import Markdown
@@ -55,14 +56,176 @@ def get_available_themes():
 # App-level keys that live in config.json post-migration. Session-level
 # state (session_names, session_order, last_viewed) lives in SQLite per
 # ADR-001. Anything unknown is preserved on save so future settings
-# (sidebar_width, user-added keys) don't get silently dropped.
-APP_CONFIG_KEYS = {"theme", "sidebar_width"}
+# (sidebar_width, export_retention_days, observe.enabled, user-added keys)
+# don't get silently dropped.
+APP_CONFIG_KEYS = {
+    "theme", "sidebar_width", "export_retention_days", "observe.enabled"
+}
+
+EXPORT_DIR = Path("/tmp/threadhop")
+EXPORT_RETENTION_DAYS_DEFAULT = 7
+EXPORT_RECENT_GRACE_PERIOD = timedelta(hours=1)
+
+
+@dataclass(frozen=True)
+class ExportCleanupResult:
+    """Summary of a startup cleanup pass for exported markdown files."""
+
+    scanned: int = 0
+    deleted: int = 0
+    skipped_recent: int = 0
+    skipped_open: int = 0
+    errors: int = 0
+    directory_missing: bool = False
+    retention_days: int = EXPORT_RETENTION_DAYS_DEFAULT
+    recent_grace_seconds: int = int(EXPORT_RECENT_GRACE_PERIOD.total_seconds())
+
+    def debug_message(self) -> str:
+        grace_hours = max(1, int(self.recent_grace_seconds / 3600))
+        if self.directory_missing:
+            return (
+                "Export cleanup: skipped "
+                f"({EXPORT_DIR} missing, retention={self.retention_days}d, "
+                f"grace={grace_hours}h)"
+            )
+        return (
+            "Export cleanup: "
+            f"removed {self.deleted}, scanned {self.scanned}, "
+            f"skipped_recent {self.skipped_recent}, "
+            f"skipped_open {self.skipped_open}, errors {self.errors} "
+            f"(retention={self.retention_days}d)"
+        )
+
+    def footer_message(self) -> str | None:
+        if self.errors:
+            noun = "error" if self.errors == 1 else "errors"
+            return f"Export cleanup: {self.errors} {noun}"
+        if self.deleted:
+            noun = "stale export" if self.deleted == 1 else "stale exports"
+            return f"Cleaned {self.deleted} {noun}"
+        return None
+
+
+def _coerce_retention_days(value) -> int:
+    """Return a non-negative retention window in days."""
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return EXPORT_RETENTION_DAYS_DEFAULT
+
+
+def _open_export_paths(export_dir: Path) -> set[Path]:
+    """Best-effort detection of open export files under ``export_dir``.
+
+    Uses ``lsof +D`` on macOS. Failures degrade to an empty set so
+    cleanup stays non-blocking.
+    """
+    try:
+        proc = subprocess.run(
+            ["lsof", "+D", str(export_dir), "-Fn"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return set()
+
+    open_paths: set[Path] = set()
+    for line in proc.stdout.splitlines():
+        if not line.startswith("n"):
+            continue
+        try:
+            path = Path(line[1:]).resolve()
+        except Exception:
+            continue
+        if path.parent == export_dir.resolve() and path.suffix == ".md":
+            open_paths.add(path)
+    return open_paths
+
+
+def cleanup_export_markdown_files(
+    export_dir: Path = EXPORT_DIR,
+    *,
+    retention_days: int = EXPORT_RETENTION_DAYS_DEFAULT,
+    recent_grace_period: timedelta = EXPORT_RECENT_GRACE_PERIOD,
+    now: datetime | None = None,
+    open_paths: set[Path] | None = None,
+) -> ExportCleanupResult:
+    """Delete stale exported markdown files from ``export_dir``.
+
+    Files modified within ``recent_grace_period`` are always preserved,
+    even when they exceed the configured retention window. Open-file
+    detection is best-effort and non-fatal.
+    """
+    retention_days = _coerce_retention_days(retention_days)
+    now = now or datetime.now()
+    recent_cutoff = (now - recent_grace_period).timestamp()
+    retention_cutoff = (now - timedelta(days=retention_days)).timestamp()
+
+    if not export_dir.exists() or not export_dir.is_dir():
+        return ExportCleanupResult(
+            directory_missing=True,
+            retention_days=retention_days,
+            recent_grace_seconds=int(recent_grace_period.total_seconds()),
+        )
+
+    resolved_dir = export_dir.resolve()
+    resolved_open_paths = (
+        {p.resolve() for p in open_paths}
+        if open_paths is not None else _open_export_paths(export_dir)
+    )
+
+    scanned = 0
+    deleted = 0
+    skipped_recent = 0
+    skipped_open = 0
+    errors = 0
+
+    for path in export_dir.glob("*.md"):
+        scanned += 1
+        try:
+            stat = path.stat()
+            resolved_path = path.resolve()
+        except OSError:
+            errors += 1
+            continue
+
+        if resolved_path.parent != resolved_dir:
+            continue
+        if stat.st_mtime >= recent_cutoff:
+            skipped_recent += 1
+            continue
+        if resolved_path in resolved_open_paths:
+            skipped_open += 1
+            continue
+        if stat.st_mtime >= retention_cutoff:
+            continue
+
+        try:
+            path.unlink()
+            deleted += 1
+        except FileNotFoundError:
+            continue
+        except OSError:
+            errors += 1
+
+    return ExportCleanupResult(
+        scanned=scanned,
+        deleted=deleted,
+        skipped_recent=skipped_recent,
+        skipped_open=skipped_open,
+        errors=errors,
+        retention_days=retention_days,
+        recent_grace_seconds=int(recent_grace_period.total_seconds()),
+    )
+CLI_CONFIG_KEYS = {"observe.enabled"}
 
 
 def load_config(conn):
     """Return the combined in-memory config.
 
-    App-level keys (`theme`, `sidebar_width`) come from config.json.
+    App-level keys (`theme`, `sidebar_width`, `export_retention_days`,
+    `observe.enabled`) come from config.json.
     Session-level keys (`session_names`, `session_order`, `last_viewed`)
     come from the SQLite `sessions` table — this is the ADR-001 split.
 
@@ -86,6 +249,10 @@ def load_config(conn):
         config.pop(key, None)
 
     config.setdefault("theme", "textual-dark")
+    config["export_retention_days"] = _coerce_retention_days(
+        config.get("export_retention_days", EXPORT_RETENTION_DAYS_DEFAULT)
+    )
+    config.setdefault("observe.enabled", False)
 
     # 2. Session-level from SQLite.
     try:
@@ -103,12 +270,16 @@ def load_config(conn):
 
 
 def save_app_config(config):
-    """Persist only app-level keys (theme, sidebar_width, unknown extras)
-    to config.json.
+    """Persist only app-level keys (theme, sidebar_width,
+    export_retention_days, observe.enabled, unknown extras) to config.json.
 
     Session-level keys are deliberately excluded — they live in SQLite
     now and are written through at each mutation site (rename, reorder,
     view) rather than dumped wholesale here.
+    
+    Returns ``True`` when the write succeeded, ``False`` on ``OSError``.
+    Existing call sites that do not check the return value keep their
+    legacy best-effort behaviour.
     """
     try:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -117,15 +288,109 @@ def save_app_config(config):
             if k not in ("session_names", "session_order", "last_viewed")
         }
         CONFIG_FILE.write_text(json.dumps(app_only, indent=2))
+        return True
     except OSError:
+        return False
+
+
+def _load_app_config_file() -> dict:
+    """Return the raw config.json object, or {} if unreadable/missing."""
+    try:
+        if CONFIG_FILE.exists():
+            raw = json.loads(CONFIG_FILE.read_text())
+            if isinstance(raw, dict):
+                return raw
+    except (OSError, json.JSONDecodeError):
         pass
+    return {}
+
+
+def _parse_boolish(value: str) -> bool | None:
+    """Parse common CLI spellings for a boolean config value."""
+    lowered = value.strip().lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _config_value_to_text(value) -> str:
+    """Render a config value back to simple CLI output."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    if isinstance(value, (int, float, str)):
+        return str(value)
+    return json.dumps(value)
+
+
+def _coerce_config_value(key: str, raw_value: str):
+    """Validate and normalize supported config values."""
+    if key == "observe.enabled":
+        parsed = _parse_boolish(raw_value)
+        if parsed is None:
+            raise ValueError(
+                "observe.enabled expects true/false (also accepts 1/0, on/off, yes/no)."
+            )
+        return parsed
+    raise ValueError(f"Unsupported config key: {key}")
+
+
+def get_recent_searches(config: dict | None) -> list[str]:
+    """Return deduped recent searches from app config."""
+    if not isinstance(config, dict):
+        return []
+    raw = config.get("recent_searches", [])
+    if not isinstance(raw, list):
+        return []
+
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        query = item.strip()
+        if not query or query in seen:
+            continue
+        seen.add(query)
+        cleaned.append(query)
+    return cleaned
+
+
+def save_recent_search(config: dict | None, raw_query: str) -> list[str]:
+    """Persist one recent search at the front of config.json."""
+    if not isinstance(config, dict):
+        return []
+    query = raw_query.strip()
+    if not query:
+        return get_recent_searches(config)
+
+    recent = [q for q in get_recent_searches(config) if q != query]
+    recent.insert(0, query)
+    config["recent_searches"] = recent[:MAX_RECENT_SEARCHES]
+    save_app_config(config)
+    return list(config["recent_searches"])
+
+
+def clear_recent_searches(config: dict | None) -> None:
+    """Remove persisted recent searches from config.json."""
+    if not isinstance(config, dict):
+        return
+    config["recent_searches"] = []
+    save_app_config(config)
 
 
 # --- Configuration ---
 DISPLAY_NAME_WIDTH = 22
+OBSERVATION_MARKER = "🗒"
+OBSERVATION_MARKER_FALLBACK = "≡"
 MAX_SESSIONS = 50
 REFRESH_INTERVAL = 5
 SPINNER_INTERVAL = 0.25
+SEARCH_PAGE_SIZE = 50
+MAX_RECENT_SEARCHES = 8
 
 # --- Paths ---
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
@@ -275,6 +540,8 @@ COMMAND_REGISTRY: list[Command] = [
     ),
     Command(("n",), "Rename session", SCOPE_SESSION_LIST, "rename_session", footer=True),
     Command(("g",), "Copy resume command", SCOPE_SESSION_LIST, "copy_session_id"),
+    Command(("o",), "Copy observation path / start observing", SCOPE_SESSION_LIST, "observe_session"),
+    Command(("O",), "Resume observation", SCOPE_SESSION_LIST, "resume_observation"),
     Command(("s",), "Cycle status forward", SCOPE_SESSION_LIST, "cycle_status_forward"),
     Command(("S",), "Cycle status backward", SCOPE_SESSION_LIST, "cycle_status_backward"),
     Command(("a",), "Archive session", SCOPE_SESSION_LIST, "archive_session"),
@@ -337,7 +604,9 @@ COMMAND_REGISTRY: list[Command] = [
 
     # --- Search modal (widget-local; SearchScreen.on_key) ---
     Command(("up", "down", "ctrl+n", "ctrl+p"), "Navigate results", SCOPE_SEARCH, footer=True),
+    Command(("pageup", "pagedown"), "Jump through results", SCOPE_SEARCH),
     Command(("enter",), "Open result", SCOPE_SEARCH, footer=True),
+    Command(("ctrl+x",), "Clear query/history", SCOPE_SEARCH),
     Command(("escape",), "Close search", SCOPE_SEARCH, footer=True),
 
     # --- Bookmark browser modal (widget-local; BookmarkBrowserScreen.on_key) ---
@@ -402,6 +671,95 @@ def format_age(timestamp: float) -> str:
         return f"{int(age / 86400)}d"
 
 
+def _supports_observation_emoji() -> bool:
+    """Return whether the current terminal can safely encode the emoji marker."""
+    if os.environ.get("THREADHOP_ASCII_OBSERVATION_MARKER") == "1":
+        return False
+    encoding = sys.stdout.encoding or "utf-8"
+    try:
+        OBSERVATION_MARKER.encode(encoding)
+    except (LookupError, UnicodeEncodeError):
+        return False
+    return True
+
+
+def _observation_marker_text() -> Text:
+    """Return the ADR-021 observed-session marker."""
+    if _supports_observation_emoji():
+        return Text(OBSERVATION_MARKER, style="dim")
+    return Text(OBSERVATION_MARKER_FALLBACK, style="dim cyan")
+
+
+def _session_display_name(session_data: dict, custom_name: str | None) -> str:
+    """Resolve the user-facing session label before sidebar truncation."""
+    title = session_data.get("title", "")
+    if custom_name:
+        return custom_name
+    if title:
+        return title
+    return session_data["project"]
+
+def copy_to_clipboard(text: str) -> bool:
+    """Copy text to the system clipboard."""
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["pbcopy"], input=text.encode(), check=True)
+        else:
+            subprocess.run(
+                ["xclip", "-selection", "clipboard"],
+                input=text.encode(),
+                check=True,
+            )
+        return True
+    except Exception:
+        return False
+
+
+def build_observe_command(session_id: str) -> list[str]:
+    """Spawn the CLI sidecar through the current executable script."""
+    return [str(Path(__file__).resolve()), "observe", "--session", session_id]
+def render_session_label_text(
+    session_data: dict,
+    *,
+    custom_name: str | None = None,
+    spinner_frame: int = 0,
+) -> Text:
+    """Build the Rich label for one sidebar session row."""
+    is_working = session_data.get("is_working", False)
+    is_active = session_data.get("is_active", False)
+    if is_working:
+        status = SPINNER_FRAMES[spinner_frame % len(SPINNER_FRAMES)]
+    elif is_active:
+        status = "●"
+    else:
+        status = "○"
+
+    display = _session_display_name(session_data, custom_name)
+    indicator = (
+        _observation_marker_text()
+        if session_data.get("has_observations")
+        else None
+    )
+    reserved_width = 0
+    if indicator is not None:
+        reserved_width = 1 + indicator.cell_len
+    name_width = max(DISPLAY_NAME_WIDTH - reserved_width, 0)
+
+    middle = Text(display[:name_width])
+    if indicator is not None:
+        middle.append(" ")
+        middle.append_text(indicator)
+    if middle.cell_len < DISPLAY_NAME_WIDTH:
+        middle.append(" " * (DISPLAY_NAME_WIDTH - middle.cell_len))
+
+    age_str = format_age(session_data["modified"])
+    text = Text()
+    text.append(f"{status} ")
+    text.append_text(middle)
+    text.append(f" {age_str:>4}")
+    return text
+
+
 class SessionItem(ListItem):
     """A session in the list"""
 
@@ -419,61 +777,55 @@ class SessionItem(ListItem):
         super().__init__()
 
     def compose(self) -> ComposeResult:
-        age_str = format_age(self.session_data["modified"])
-        project = self.session_data["project"]
-        is_working = self.session_data.get("is_working", False)
-        is_active = self.session_data.get("is_active", False)
+        label = Static(self._render_label(), classes="session-label")
+        self._sync_label_classes(label)
+        yield label
 
-        if is_working:
-            status = SPINNER_FRAMES[self.spinner_frame % len(SPINNER_FRAMES)]
-        elif is_active:
-            status = "●"
-        else:
-            status = "○"
+    def _render_label(self) -> Text:
+        return render_session_label_text(
+            self.session_data,
+            custom_name=self.custom_name,
+            spinner_frame=self.spinner_frame,
+        )
 
-        # Priority: custom name (from our config) > session title (from JSONL) > project path
-        title = self.session_data.get("title", "")
-        if self.custom_name:
-            display = self.custom_name
-        elif title:
-            display = title
-        else:
-            display = project
-        display = f"{display[:DISPLAY_NAME_WIDTH]:<{DISPLAY_NAME_WIDTH}}"
-
-        label = Static(f"{status} {display} {age_str:>4}", classes="session-label")
+    def _sync_label_classes(self, label: Static) -> None:
         if self.is_unread:
             label.add_class("unread")
-        if is_working:
+        else:
+            label.remove_class("unread")
+
+        if self.session_data.get("is_working", False):
             label.add_class("working")
-        elif is_active:
+        else:
+            label.remove_class("working")
+
+        if (
+            self.session_data.get("is_active", False)
+            and not self.session_data.get("is_working", False)
+        ):
             label.add_class("active")
+        else:
+            label.remove_class("active")
+
         if self.session_data.get("status") == "archived":
             label.add_class("archived")
-        yield label
+        else:
+            label.remove_class("archived")
+
+    def refresh_label(self) -> None:
+        try:
+            label = self.query_one(".session-label", Static)
+            label.update(self._render_label())
+            self._sync_label_classes(label)
+        except Exception:
+            pass
 
     def update_spinner(self, frame: int) -> None:
         """Update spinner animation frame"""
         if not self.session_data.get("is_working"):
             return
         self.spinner_frame = frame
-        status = SPINNER_FRAMES[frame % len(SPINNER_FRAMES)]
-        age_str = format_age(self.session_data["modified"])
-
-        title = self.session_data.get("title", "")
-        if self.custom_name:
-            display = self.custom_name
-        elif title:
-            display = title
-        else:
-            display = self.session_data["project"]
-        display = f"{display[:DISPLAY_NAME_WIDTH]:<{DISPLAY_NAME_WIDTH}}"
-
-        try:
-            label = self.query_one(".session-label", Static)
-            label.update(f"{status} {display} {age_str:>4}")
-        except:
-            pass
+        self.refresh_label()
 
 
 
@@ -517,6 +869,12 @@ class AssistantMessage(_SelectableMessage):
 class ToolMessage(_SelectableMessage):
     """A tool call/result in the transcript"""
     pass
+
+
+class ObservationInfoHeader(Static):
+    """Passive observation metadata shown above the transcript."""
+
+    can_focus = False
 
 
 class TranscriptView(VerticalScroll):
@@ -567,6 +925,37 @@ class TranscriptView(VerticalScroll):
         self._find_query: str = ""
         self._find_matches: list[int] = []
         self._find_current: int = -1
+
+    def _format_observation_header(self, entry_count: int, obs_path: str) -> str:
+        """Return the passive transcript header for observed sessions."""
+        noun = "observation" if entry_count == 1 else "observations"
+        try:
+            display_path = str(Path(obs_path).expanduser())
+            home = str(Path.home())
+            if display_path == home:
+                display_path = "~"
+            elif display_path.startswith(home + os.sep):
+                display_path = "~" + display_path[len(home):]
+        except Exception:
+            display_path = obs_path
+        return f"─── 🗒 {entry_count} {noun} · {display_path} ───"
+
+    def _get_observation_header_text(self, session_id: str) -> str | None:
+        """Look up observation metadata for the current transcript."""
+        try:
+            state = db.get_observation_state(self.app.conn, session_id)
+        except Exception:
+            return None
+
+        if not state:
+            return None
+
+        entry_count = int(state.get("entry_count") or 0)
+        obs_path = str(state.get("obs_path") or "").strip()
+        if entry_count <= 0 or not obs_path:
+            return None
+
+        return self._format_observation_header(entry_count, obs_path)
 
     def _get_message_widgets(self):
         """Return all message widgets in order."""
@@ -811,9 +1200,9 @@ class TranscriptView(VerticalScroll):
     def _export_selection(self):
         """Export selected messages to a temp markdown file (ADR-008).
 
-        Writes to /tmp/threadhop/<session_id>-<timestamp>.md.
-        The /tmp directory is auto-cleaned by macOS on reboot — these are
-        ephemeral reference files, not permanent exports. Users reference
+        Writes to /tmp/threadhop/<session_id>-<timestamp>.md. ThreadHop
+        prunes stale exports on TUI startup, but these remain ephemeral
+        reference files rather than permanent exports. Users reference
         them from other sessions via: Read /tmp/threadhop/<file>.md
         """
         selected = self.get_selected_messages()
@@ -888,10 +1277,7 @@ class TranscriptView(VerticalScroll):
 
         content = "\n".join(lines)
 
-        # /tmp/threadhop/ is auto-cleaned by macOS on reboot — no manual
-        # cleanup needed. This is intentional: exports are ephemeral
-        # reference files for cross-session context sharing.
-        export_dir = Path("/tmp/threadhop")
+        export_dir = EXPORT_DIR
         try:
             os.makedirs(export_dir, exist_ok=True)
             export_path = export_dir / f"{session_id}-{ts_now}.md"
@@ -944,6 +1330,7 @@ class TranscriptView(VerticalScroll):
         self.current_path = session_path
 
         messages = self._parse_messages(session_path)
+        observation_header = self._get_observation_header_text(session_path.stem)
 
         # Remove all existing message widgets (await ensures completion)
         await self._remove_all_messages()
@@ -954,6 +1341,13 @@ class TranscriptView(VerticalScroll):
 
         # Build widgets with visual boundaries
         widgets = []
+        if observation_header:
+            widgets.append(
+                ObservationInfoHeader(
+                    observation_header,
+                    classes="observation-info-header",
+                )
+            )
         tool_batch = []
 
         def flush_tools():
@@ -1363,11 +1757,53 @@ class TranscriptView(VerticalScroll):
     ) -> list[tuple[str, str, str | None, str | None]]:
         """Parse JSONL file and extract displayable messages.
 
-        Returns list of (role, content, timestamp, uuid) tuples. The uuid
-        is the JSONL line's own uuid — used by the search jump-to-source
-        flow to scroll the correct widget into view.
+        Returns list of (role, content, timestamp, uuid) tuples.
+
+        Assistant rows: consecutive lines sharing the same
+        ``message.id`` (streaming chunks of one logical reply) are
+        merged into a single tuple tagged with the first chunk's uuid —
+        matching the indexer's rule (ADR-003) so the bookmarks FK into
+        ``messages.uuid`` can never see an id the indexer never stored.
+
+        Tool and tool_result rows: inherit the enclosing turn's
+        canonical uuid (the same first-chunk uuid). The indexer folds
+        tool-use abbreviations into the turn's single row and never
+        indexes tool_result user lines at all, so only the turn's uuid
+        is guaranteed present in ``messages``. Pinning tool widgets to
+        that id means bookmarking any of them toggles the turn's
+        bookmark — the same semantics the deferred turn-as-unit
+        rendering will make visually explicit (see UI-IMPROVEMENTS.md).
+
+        Genuine user rows: keep the line's own uuid; a real human
+        message ends the preceding assistant turn and flushes the
+        pending group. ``toolUseResult`` user lines do NOT flush —
+        they belong to the turn in progress.
         """
         messages = []
+        # Pending assistant group accumulates text across streaming
+        # chunks sharing a message.id, and anchors the turn's canonical
+        # uuid / timestamp for any tool or tool_result widgets emitted
+        # while the group is open. Flushed on a genuine user message,
+        # a differing message.id, or EOF.
+        pending_mid: str | None = None
+        pending_uuid: str | None = None
+        pending_ts: str | None = None
+        pending_text_parts: list[str] = []
+
+        def flush_assistant() -> None:
+            nonlocal pending_mid, pending_uuid, pending_ts, pending_text_parts
+            if pending_text_parts and pending_uuid is not None:
+                messages.append((
+                    "assistant",
+                    " ".join(pending_text_parts),
+                    pending_ts,
+                    pending_uuid,
+                ))
+            pending_mid = None
+            pending_uuid = None
+            pending_ts = None
+            pending_text_parts = []
+
         try:
             with open(session_path) as f:
                 for line in f:
@@ -1382,12 +1818,24 @@ class TranscriptView(VerticalScroll):
                             continue
 
                         if msg_type == "user":
-                            tool_result = msg.get("toolUseResult")
-                            if tool_result and isinstance(tool_result, dict):
-                                result_info = self._format_tool_result(tool_result)
-                                if result_info:
-                                    messages.append(("tool_result", result_info, timestamp, uuid))
-                            elif "toolUseResult" not in msg:
+                            if "toolUseResult" in msg:
+                                # Mid-turn event — attach to the
+                                # pending assistant turn, don't flush.
+                                tool_result = msg.get("toolUseResult")
+                                if isinstance(tool_result, dict):
+                                    result_info = self._format_tool_result(tool_result)
+                                    if result_info:
+                                        anchor_uuid = pending_uuid or uuid
+                                        anchor_ts = pending_ts or timestamp
+                                        messages.append((
+                                            "tool_result",
+                                            result_info,
+                                            anchor_ts,
+                                            anchor_uuid,
+                                        ))
+                            else:
+                                # Genuine human message — ends the turn.
+                                flush_assistant()
                                 content = msg.get("message", {}).get("content", "")
                                 if isinstance(content, list):
                                     text_parts = [
@@ -1403,29 +1851,43 @@ class TranscriptView(VerticalScroll):
                                         messages.append(("user", content, timestamp, uuid))
 
                         elif msg_type == "assistant":
+                            mid = msg.get("message", {}).get("id")
+                            # New logical message → flush the previous
+                            # group and anchor on this line's uuid.
+                            if mid is None or mid != pending_mid:
+                                flush_assistant()
+                                pending_mid = mid
+                                pending_uuid = uuid
+                                pending_ts = timestamp
+
                             content = msg.get("message", {}).get("content", [])
                             if isinstance(content, list):
-                                text_parts = []
                                 for block in content:
                                     if block.get("type") == "text":
                                         text = block.get("text", "")
                                         # Strip system-reminder tags
                                         text = SYSTEM_REMINDER_RE.sub("", text).strip()
                                         if text:
-                                            text_parts.append(text)
+                                            pending_text_parts.append(text)
                                     elif block.get("type") == "tool_use":
                                         tool_name = block.get("name", "Unknown")
                                         tool_input = block.get("input", {})
                                         tool_desc = self._format_tool_use(
                                             tool_name, tool_input
                                         )
-                                        messages.append(("tool", tool_desc, timestamp, uuid))
-                                if text_parts:
-                                    messages.append(
-                                        ("assistant", " ".join(text_parts), timestamp, uuid)
-                                    )
+                                        # Pin tool widget to the turn's
+                                        # canonical uuid so it resolves
+                                        # to the same messages row the
+                                        # indexer stores for this turn.
+                                        messages.append((
+                                            "tool",
+                                            tool_desc,
+                                            pending_ts or timestamp,
+                                            pending_uuid or uuid,
+                                        ))
                     except (json.JSONDecodeError, KeyError):
                         pass
+            flush_assistant()
         except Exception:
             pass
         return messages
@@ -1505,9 +1967,11 @@ class TranscriptView(VerticalScroll):
 # source message.
 #
 # Filter syntax parsed from the raw query string:
-#   project:<name>  — substring match against sessions.project
-#   user:           — only role = 'user'
-#   assistant:      — only role = 'assistant'
+#   project:<name>    — substring match against sessions.project
+#   session:current   — restrict to the active transcript session
+#   since:/until:     — YYYY-MM-DD or full ISO timestamp range filters
+#   user:             — only role = 'user'
+#   assistant:        — only role = 'assistant'
 # Remaining whitespace-separated tokens become FTS5 prefix terms.
 
 # Sentinel characters bracketing matched spans in the SQL `snippet()`
@@ -1517,19 +1981,86 @@ _FTS_MATCH_START = "\x01"
 _FTS_MATCH_END = "\x02"
 
 
-def _build_fts_query(raw: str) -> tuple[str, str | None, str | None]:
-    """Parse raw input into (fts_match_expr, role_filter, project_filter).
+@dataclass(frozen=True)
+class SearchQuerySpec:
+    """Parsed search input plus derived filter metadata."""
 
-    The FTS5 expression uses AND semantics across prefix terms
-    (e.g. ``rate* lim*``). Non-filter tokens are sanitized to word chars
-    only so stray punctuation can't produce an invalid MATCH expression.
-    An empty expression means no searchable terms were supplied —
-    callers may still return filter-only results (see `search_messages`).
+    raw: str
+    fts_expr: str
+    terms: tuple[str, ...]
+    plain_query: str
+    role: str | None = None
+    project: str | None = None
+    session_id: str | None = None
+    since_ts: str | None = None
+    until_ts: str | None = None
+    until_is_exclusive: bool = False
+
+
+@dataclass(frozen=True)
+class SearchResultPage:
+    """One page of results plus metadata for the search modal."""
+
+    rows: list[dict]
+    total_count: int
+    limit: int
+    offset: int
+    elapsed_ms: float
+
+    @property
+    def loaded_count(self) -> int:
+        return self.offset + len(self.rows)
+
+    @property
+    def has_more(self) -> bool:
+        return self.loaded_count < self.total_count
+
+
+def _parse_search_date(value: str, *, upper_bound: bool) -> tuple[str | None, bool]:
+    """Parse a date/date-time filter into an ISO UTC bound.
+
+    Returns ``(iso_utc, is_exclusive)``. Date-only ``until:YYYY-MM-DD``
+    becomes the next day's midnight and is treated as exclusive so the
+    whole day is included.
     """
+    raw = (value or "").strip()
+    if not raw:
+        return None, False
+
+    try:
+        if len(raw) == 10:
+            dt = datetime.fromisoformat(raw).replace(tzinfo=timezone.utc)
+            if upper_bound:
+                dt += timedelta(days=1)
+                return dt.strftime("%Y-%m-%dT%H:%M:%SZ"), True
+            return dt.strftime("%Y-%m-%dT%H:%M:%SZ"), False
+
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None, False
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ"), False
+
+
+def _build_fts_query(
+    raw: str,
+    *,
+    current_session_id: str | None = None,
+) -> SearchQuerySpec:
+    """Parse raw input into a structured search query spec."""
     tokens = raw.strip().split()
     role: str | None = None
     project: str | None = None
+    session_id: str | None = None
+    since_ts: str | None = None
+    until_ts: str | None = None
+    until_is_exclusive = False
     terms: list[str] = []
+
     for tok in tokens:
         low = tok.lower()
         if low == "user:":
@@ -1537,42 +2068,116 @@ def _build_fts_query(raw: str) -> tuple[str, str | None, str | None]:
         elif low == "assistant:":
             role = "assistant"
         elif low.startswith("project:"):
-            val = tok[len("project:"):]
+            val = tok[len("project:"):].strip()
             if val:
                 project = val
+        elif low.startswith("session:"):
+            val = tok[len("session:"):].strip()
+            if val:
+                if val.lower() == "current":
+                    session_id = current_session_id
+                else:
+                    session_id = val
+        elif low.startswith("since:"):
+            parsed, _ = _parse_search_date(tok[len("since:"):], upper_bound=False)
+            if parsed:
+                since_ts = parsed
+        elif low.startswith("until:"):
+            parsed, exclusive = _parse_search_date(
+                tok[len("until:"):],
+                upper_bound=True,
+            )
+            if parsed:
+                until_ts = parsed
+                until_is_exclusive = exclusive
         else:
             # Keep only word chars (letters/digits/underscore). FTS5's
             # unicode61 tokenizer is fine with these, and stripping
             # punctuation prevents syntax errors at MATCH time.
             clean = re.sub(r"[^\w]", "", tok)
             if clean:
-                terms.append(clean + "*")
-    return " ".join(terms), role, project
+                terms.append(clean)
+
+    return SearchQuerySpec(
+        raw=raw.strip(),
+        fts_expr=" ".join(f"{term}*" for term in terms),
+        terms=tuple(terms),
+        plain_query=" ".join(terms).lower(),
+        role=role,
+        project=project,
+        session_id=session_id,
+        since_ts=since_ts,
+        until_ts=until_ts,
+        until_is_exclusive=until_is_exclusive,
+    )
+
+
+def _build_search_filters(spec: SearchQuerySpec) -> tuple[list[str], dict]:
+    """Return shared SQL filter clauses for FTS and filter-only search."""
+    clauses: list[str] = []
+    params: dict[str, str] = {}
+
+    if spec.role:
+        clauses.append("m.role = :role")
+        params["role"] = spec.role
+    if spec.project:
+        clauses.append("s.project LIKE :project")
+        params["project"] = f"%{spec.project}%"
+    if spec.session_id:
+        clauses.append("m.session_id = :session_id")
+        params["session_id"] = spec.session_id
+    if spec.since_ts:
+        clauses.append("m.timestamp >= :since_ts")
+        params["since_ts"] = spec.since_ts
+    if spec.until_ts:
+        op = "<" if spec.until_is_exclusive else "<="
+        clauses.append(f"m.timestamp {op} :until_ts")
+        params["until_ts"] = spec.until_ts
+
+    return clauses, params
 
 
 def search_messages(
     conn: sqlite3.Connection,
     raw_query: str,
-    limit: int = 50,
-) -> list[dict]:
+    limit: int = SEARCH_PAGE_SIZE,
+    offset: int = 0,
+    *,
+    current_session_id: str | None = None,
+) -> SearchResultPage:
     """Run the FTS5 search for the search panel.
 
-    Returns rows with keys: uuid, session_id, role, timestamp, snippet,
-    custom_name, project, session_path. ``snippet`` contains
+    Returns paged rows with keys: uuid, session_id, role, timestamp,
+    snippet, custom_name, project, session_path. ``snippet`` contains
     _FTS_MATCH_START / _FTS_MATCH_END sentinels around each match span.
-
-    A malformed FTS5 expression (shouldn't happen after sanitization, but
-    defensive) returns an empty list rather than propagating the
-    exception up into the TUI event loop.
     """
-    fts_expr, role, project = _build_fts_query(raw_query)
+    spec = _build_fts_query(raw_query, current_session_id=current_session_id)
+    where_clauses, base_params = _build_search_filters(spec)
+    where_sql = ""
+    if where_clauses:
+        where_sql = " AND " + " AND ".join(where_clauses)
+
+    timer_start = perf_counter()
 
     # No search terms: allow a filter-only query so typing just
-    # `project:foo` lists recent messages in that project.
-    if not fts_expr:
-        if not role and not project:
-            return []
-        sql = (
+    # `project:foo` or `session:current` lists recent matching messages.
+    if not spec.fts_expr:
+        if not where_clauses:
+            return SearchResultPage(
+                rows=[],
+                total_count=0,
+                limit=limit,
+                offset=offset,
+                elapsed_ms=0.0,
+            )
+
+        count_sql = (
+            "SELECT COUNT(*) AS total_count "
+            "FROM messages m "
+            "LEFT JOIN sessions s ON s.session_id = m.session_id "
+            f"WHERE 1=1{where_sql}"
+        )
+        page_sql = (
             "SELECT m.uuid AS uuid, m.session_id AS session_id, "
             "m.role AS role, m.timestamp AS timestamp, "
             "substr(m.text, 1, 160) AS snippet, "
@@ -1580,53 +2185,123 @@ def search_messages(
             "s.session_path AS session_path "
             "FROM messages m "
             "LEFT JOIN sessions s ON s.session_id = m.session_id "
-            "WHERE 1=1"
+            f"WHERE 1=1{where_sql} "
+            "ORDER BY m.timestamp DESC "
+            "LIMIT :lim OFFSET :off"
         )
-        params: dict = {}
-        if role:
-            sql += " AND m.role = :role"
-            params["role"] = role
-        if project:
-            sql += " AND s.project LIKE :project"
-            params["project"] = f"%{project}%"
-        sql += " ORDER BY m.timestamp DESC LIMIT :lim"
+        params = dict(base_params)
         params["lim"] = limit
+        params["off"] = offset
         try:
-            return db.query_all(conn, sql, params)
+            total_row = db.query_one(conn, count_sql, base_params) or {}
+            rows = db.query_all(conn, page_sql, params)
         except sqlite3.OperationalError:
-            return []
+            return SearchResultPage(
+                rows=[],
+                total_count=0,
+                limit=limit,
+                offset=offset,
+                elapsed_ms=0.0,
+            )
 
-    sql = (
+        return SearchResultPage(
+            rows=rows,
+            total_count=int(total_row.get("total_count") or 0),
+            limit=limit,
+            offset=offset,
+            elapsed_ms=(perf_counter() - timer_start) * 1000,
+        )
+
+    recent_cutoff = (
+        datetime.now(timezone.utc) - timedelta(days=30)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    normalized_text_sql = " ".join(
+        """
+        lower(
+            replace(
+                replace(
+                    replace(
+                        replace(
+                            replace(
+                                replace(
+                                    replace(' ' || m.text || ' ', char(10), ' '),
+                                    '.', ' '
+                                ),
+                                ',', ' '
+                            ),
+                            ';', ' '
+                        ),
+                        ':', ' '
+                    ),
+                    '!', ' '
+                ),
+                '?', ' '
+            )
+        )
+        """.split()
+    )
+    base_from_sql = (
+        "FROM messages_fts "
+        "JOIN messages m ON m.rowid = messages_fts.rowid "
+        "LEFT JOIN sessions s ON s.session_id = m.session_id "
+        "WHERE messages_fts MATCH :q"
+        f"{where_sql}"
+    )
+    count_sql = "SELECT COUNT(*) AS total_count " + base_from_sql
+    page_sql = (
         "SELECT m.uuid AS uuid, m.session_id AS session_id, "
         "m.role AS role, m.timestamp AS timestamp, "
         "snippet(messages_fts, 0, :mstart, :mend, '…', 16) AS snippet, "
         "s.custom_name AS custom_name, s.project AS project, "
         "s.session_path AS session_path "
-        "FROM messages_fts "
-        "JOIN messages m ON m.rowid = messages_fts.rowid "
-        "LEFT JOIN sessions s ON s.session_id = m.session_id "
-        "WHERE messages_fts MATCH :q"
+        + base_from_sql
+        + " ORDER BY "
+        "CASE "
+        "WHEN :plain_query = '' THEN 0 "
+        f"WHEN instr({normalized_text_sql}, ' ' || :plain_query || ' ') > 0 THEN 0 "
+        "ELSE 1 "
+        "END ASC, "
+        "CASE WHEN m.timestamp >= :recent_cutoff THEN 0 ELSE 1 END ASC, "
+        "bm25(messages_fts) ASC, "
+        "m.timestamp DESC "
+        "LIMIT :lim OFFSET :off"
     )
-    params = {
-        "q": fts_expr,
+    params = dict(base_params)
+    params.update({
+        "q": spec.fts_expr,
         "mstart": _FTS_MATCH_START,
         "mend": _FTS_MATCH_END,
-    }
-    if role:
-        sql += " AND m.role = :role"
-        params["role"] = role
-    if project:
-        sql += " AND s.project LIKE :project"
-        params["project"] = f"%{project}%"
-    sql += " ORDER BY rank LIMIT :lim"
+        "plain_query": spec.plain_query,
+        "recent_cutoff": recent_cutoff,
+    })
     params["lim"] = limit
+    params["off"] = offset
 
     try:
-        return db.query_all(conn, sql, params)
+        total_row = db.query_one(
+            conn,
+            count_sql,
+            {k: v for k, v in params.items() if k not in {"lim", "off", "mstart", "mend", "plain_query", "recent_cutoff"}},
+        ) or {}
+        rows = db.query_all(conn, page_sql, params)
     except sqlite3.OperationalError:
         # Malformed expressions still slip through on edge cases
         # (e.g. a bare `*`). Surface as "no results" rather than crash.
-        return []
+        return SearchResultPage(
+            rows=[],
+            total_count=0,
+            limit=limit,
+            offset=offset,
+            elapsed_ms=0.0,
+        )
+
+    return SearchResultPage(
+        rows=rows,
+        total_count=int(total_row.get("total_count") or 0),
+        limit=limit,
+        offset=offset,
+        elapsed_ms=(perf_counter() - timer_start) * 1000,
+    )
 
 
 def _render_snippet(snippet: str) -> Text:
@@ -1700,6 +2375,20 @@ class SearchResultItem(ListItem):
         yield Static(Group(snippet_line, meta), classes="search-result")
 
 
+class RecentSearchItem(ListItem):
+    """One row in the recent-search list shown for an empty query."""
+
+    def __init__(self, query: str):
+        self.query = query
+        super().__init__()
+
+    def compose(self) -> ComposeResult:
+        label = Text()
+        label.append("Recent  ", style="dim")
+        label.append(self.query, style="bold")
+        yield Static(label, classes="search-result")
+
+
 class SearchScreen(ModalScreen):
     """Modal full-text search over indexed messages (task #14).
 
@@ -1709,10 +2398,10 @@ class SearchScreen(ModalScreen):
     to the dismiss callback; Escape dismisses with ``None``.
     """
 
-    # Debounce delay between keystroke and the FTS query. 80 ms keeps
-    # typing responsive while avoiding a query per character on fast
-    # typists — plenty of headroom over FTS5's sub-ms query time.
-    DEBOUNCE_SECONDS = 0.08
+    # Debounce delay between keystroke and the FTS query. 120 ms leaves
+    # enough slack for the extra COUNT() query and lazy-paging status
+    # updates without making fast typing feel sticky.
+    DEBOUNCE_SECONDS = 0.12
 
     # The app binds `enter` with priority=True to start_reply_or_send, and
     # app priority bindings fire even while a modal is up. Re-bind enter
@@ -1782,33 +2471,46 @@ class SearchScreen(ModalScreen):
     }
     """
 
-    def __init__(self, conn: sqlite3.Connection):
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        config: dict | None = None,
+        current_session_id: str | None = None,
+    ):
         super().__init__()
         self.conn = conn
+        self.config = config
+        self.current_session_id = current_session_id
         # Single outstanding debounce timer. Each new keystroke stops
         # the previous timer before scheduling the next one, so only
         # the final keystroke in a typing burst triggers a query.
         self._search_timer = None
+        self._active_query = ""
+        self._loaded_count = 0
+        self._total_count = 0
+        self._last_elapsed_ms = 0.0
+        self._loading_more = False
 
     def compose(self) -> ComposeResult:
         with Vertical(id="search-container") as container:
             container.border_title = "Search"
             yield Input(
                 placeholder=(
-                    "Search (prefix match) — "
-                    "filters: project:<name> user: assistant:"
+                    "Search — filters: project: session:current since: until:"
                 ),
                 id="search-input",
             )
             yield Static("Type to search…", id="search-status")
             yield ListView(id="search-results")
             yield Static(
-                "↑/↓ or ctrl+n/ctrl+p navigate • Enter jump • Esc close",
+                "↑/↓ or PgUp/PgDn navigate • Enter jump • Ctrl+X clear history • Esc close",
                 id="search-help",
             )
 
     def on_mount(self) -> None:
         self.query_one("#search-input", Input).focus()
+        self._show_empty_state()
 
     def on_input_changed(self, event) -> None:
         """Debounced re-run on every keystroke."""
@@ -1828,34 +2530,100 @@ class SearchScreen(ModalScreen):
         )
 
     def _execute_search(self, raw_query: str) -> None:
+        self._run_search(raw_query, reset=True)
+
+    def _show_empty_state(self) -> None:
         results_list = self.query_one("#search-results", ListView)
         status = self.query_one("#search-status", Static)
+        self._active_query = ""
+        self._loaded_count = 0
+        self._total_count = 0
+        self._last_elapsed_ms = 0.0
 
-        raw = raw_query.strip()
-        if not raw:
-            results_list.clear()
+        results_list.clear()
+        recent = get_recent_searches(self.config)
+        if not recent:
             status.update("Type to search…")
             return
 
-        try:
-            rows = search_messages(self.conn, raw, limit=50)
-        except Exception as e:  # noqa: BLE001
-            results_list.clear()
-            status.update(f"Search error: {e}")
+        for query in recent:
+            results_list.append(RecentSearchItem(query))
+        status.update(f"Recent searches ({len(recent)})")
+
+    def _update_status(self, page: SearchResultPage, *, raw_query: str) -> None:
+        status = self.query_one("#search-status", Static)
+        if not raw_query.strip():
+            self._show_empty_state()
             return
 
-        results_list.clear()
-        for row in rows:
+        # Pad dynamic numbers so the status row doesn't jitter as you type:
+        # elapsed_ms grows 4.2 → 10.7 → 100.3 chars, and `loaded` grows
+        # 1 → 10 → 100 as you scroll. Terminal fonts are monospace, so the
+        # only thing moving the layout is the format-spec width itself.
+        if page.total_count == 0:
+            status.update(f"No results  •  {page.elapsed_ms:>6.1f} ms")
+            return
+
+        noun = "result" if page.total_count == 1 else "results"
+        loaded = min(self._loaded_count, self._total_count)
+        count_width = len(str(page.total_count))
+        parts = [
+            f"{loaded:>{count_width}} of {page.total_count} {noun}",
+            f"{page.elapsed_ms:>6.1f} ms",
+        ]
+        if loaded < page.total_count:
+            parts.append("more load as you scroll")
+        status.update("  •  ".join(parts))
+
+    def _run_search(self, raw_query: str, *, reset: bool) -> None:
+        results_list = self.query_one("#search-results", ListView)
+
+        raw = raw_query.strip()
+        if not raw:
+            self._show_empty_state()
+            return
+
+        try:
+            offset = 0 if reset or raw != self._active_query else self._loaded_count
+            page = search_messages(
+                self.conn,
+                raw,
+                limit=SEARCH_PAGE_SIZE,
+                offset=offset,
+                current_session_id=self.current_session_id,
+            )
+        except Exception as e:  # noqa: BLE001
+            self._loading_more = False
+            results_list.clear()
+            self.query_one("#search-status", Static).update(f"Search error: {e}")
+            return
+
+        if reset or raw != self._active_query:
+            results_list.clear()
+            self._active_query = raw
+            self._loaded_count = 0
+
+        for row in page.rows:
             results_list.append(SearchResultItem(row))
 
-        count = len(rows)
-        if count == 0:
-            status.update("No results")
-        else:
-            noun = "result" if count == 1 else "results"
-            status.update(
-                f"{count} {noun}" + (" (showing first 50)" if count >= 50 else "")
-            )
+        if reset and page.rows:
+            results_list.index = 0
+
+        self._loaded_count = offset + len(page.rows)
+        self._total_count = page.total_count
+        self._last_elapsed_ms = page.elapsed_ms
+        self._update_status(page, raw_query=raw)
+        self._loading_more = False
+
+    def _load_more_results(self) -> None:
+        if self._loading_more:
+            return
+        if not self._active_query:
+            return
+        if self._loaded_count >= self._total_count:
+            return
+        self._loading_more = True
+        self._run_search(self._active_query, reset=False)
 
     def on_key(self, event) -> None:
         """Intercept nav / Escape keys while the Input holds focus.
@@ -1878,6 +2646,26 @@ class SearchScreen(ModalScreen):
             event.stop()
             event.prevent_default()
             self._move_selection(-1)
+        elif key == "pagedown":
+            event.stop()
+            event.prevent_default()
+            self._move_selection(10)
+        elif key == "pageup":
+            event.stop()
+            event.prevent_default()
+            self._move_selection(-10)
+        elif key == "ctrl+x":
+            event.stop()
+            event.prevent_default()
+            self.action_clear_search_history()
+
+    def action_clear_search_history(self) -> None:
+        input_widget = self.query_one("#search-input", Input)
+        if (input_widget.value or "").strip():
+            input_widget.value = ""
+            return
+        clear_recent_searches(self.config)
+        self._show_empty_state()
 
     def action_open_result(self) -> None:
         """Enter → open the highlighted result.
@@ -1911,6 +2699,8 @@ class SearchScreen(ModalScreen):
             return
         new_idx = max(0, min(count - 1, lv.index + delta))
         lv.index = new_idx
+        if count and new_idx >= count - 3:
+            self._load_more_results()
 
     def _open_selected(self) -> None:
         """Dismiss with (session_id, uuid, search_terms).
@@ -1932,6 +2722,11 @@ class SearchScreen(ModalScreen):
         if idx < 0 or idx >= len(lv.children):
             idx = 0
         item = lv.children[idx]
+        if isinstance(item, RecentSearchItem):
+            input_widget = self.query_one("#search-input", Input)
+            input_widget.value = item.query
+            input_widget.focus()
+            return
         if not isinstance(item, SearchResultItem):
             return
 
@@ -1940,8 +2735,12 @@ class SearchScreen(ModalScreen):
             raw_query = self.query_one("#search-input", Input).value or ""
         except Exception:
             pass
-        fts_expr, _role, _project = _build_fts_query(raw_query)
-        terms = [t.rstrip("*") for t in fts_expr.split() if t]
+        spec = _build_fts_query(
+            raw_query,
+            current_session_id=self.current_session_id,
+        )
+        terms = list(spec.terms)
+        save_recent_search(self.config, raw_query)
 
         row = item.result
         self.dismiss((row["session_id"], row["uuid"], terms))
@@ -2345,6 +3144,62 @@ class LabelPromptScreen(ModalScreen):
         self.action_submit()
 
 
+class ConfirmScreen(ModalScreen):
+    """Minimal yes/no confirmation modal for TUI actions."""
+
+    BINDINGS = [
+        Binding("y", "confirm", "Yes", priority=True, show=False),
+        Binding("n", "cancel", "No", priority=True, show=False),
+        Binding("enter", "confirm", "Yes", priority=True, show=False),
+        Binding("escape", "cancel", "No", priority=True, show=False),
+    ]
+
+    CSS = """
+    ConfirmScreen {
+        layout: vertical;
+        align: center middle;
+        background: $background 70%;
+    }
+
+    #confirm-container {
+        width: 72;
+        max-width: 90%;
+        height: auto;
+        background: $surface;
+        border: thick $accent;
+        padding: 1 2;
+        layout: vertical;
+    }
+
+    #confirm-title {
+        color: $text;
+        text-style: bold;
+    }
+
+    #confirm-hint {
+        height: 1;
+        margin-top: 1;
+        color: $text-muted;
+        text-style: italic;
+    }
+    """
+
+    def __init__(self, title: str):
+        super().__init__()
+        self._title = title
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm-container"):
+            yield Static(self._title, id="confirm-title")
+            yield Static("y/Enter = yes • n/Esc = no", id="confirm-hint")
+
+    def action_confirm(self) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
 class HelpScreen(ModalScreen):
     """Full-app help overlay grouped by scope (ADR-017, task #42).
 
@@ -2462,9 +3317,9 @@ class ContextualFooter(Static):
 
     def __init__(self, *args, **kwargs):
         super().__init__("", *args, **kwargs)
-        self._last_scopes: tuple[str, ...] = ()
+        self._last_render: tuple[tuple[str, ...], str | None] = ((), None)
 
-    def render_for(self, scopes: list[str]) -> None:
+    def render_for(self, scopes: list[str], note: str | None = None) -> None:
         """Rebuild the footer content for the given list of active scopes.
 
         Scopes are evaluated in the order passed — the registry entries
@@ -2472,10 +3327,11 @@ class ContextualFooter(Static):
         is Reply/Send globally but Send in the reply scope).
         """
         scope_tuple = tuple(scopes)
-        if scope_tuple == self._last_scopes:
+        signature = (scope_tuple, note)
+        if signature == self._last_render:
             # Footer already reflects the right context — skip the rebuild.
             return
-        self._last_scopes = scope_tuple
+        self._last_render = signature
 
         # Keep the help shortcut pinned on the far left so it stays
         # discoverable regardless of current focus.
@@ -2498,6 +3354,9 @@ class ContextualFooter(Static):
             for cmd in commands_for_scope(scope):
                 if cmd.footer and cmd.keys != ("?",):
                     add(cmd)
+
+        if note:
+            parts.append(f"[dim]{escape(note)}[/dim]")
 
         if not parts:
             self.update("")
@@ -2609,6 +3468,13 @@ class ClaudeSessions(App):
         height: 1fr;
         border: solid $secondary;
         border-title-color: $text;
+    }
+
+    ObservationInfoHeader {
+        padding: 0 1;
+        margin: 0;
+        color: $text-muted;
+        background: $panel;
     }
 
     FindBar {
@@ -2785,6 +3651,8 @@ class ClaudeSessions(App):
         # Debounce timer for the in-transcript find bar so fast typing
         # collapses into a single highlight pass.
         self._find_timer = None
+        self._footer_note: str | None = None
+        self._footer_note_timer = None
 
         # Open the SQLite store and run the one-time config.json → SQLite
         # migration (ADR-001). Both calls are idempotent — init_db applies
@@ -2845,6 +3713,7 @@ class ClaudeSessions(App):
         self.set_interval(REFRESH_INTERVAL, self.auto_refresh_background)
         self._spinner_frame = 0
         self.set_interval(SPINNER_INTERVAL, self.animate_spinners)
+        self._run_export_cleanup()
         # Prime the contextual footer now that all widgets are mounted
         # and the sidebar has focus. on_descendant_focus also covers
         # this, but calling refresh_footer directly makes startup
@@ -3062,16 +3931,22 @@ class ClaudeSessions(App):
             # in-memory self.sessions for display.
             pass
 
-        # Stamp each session dict with its persisted status so the UI can
-        # group by it. Read in bulk after the upsert so new sessions get
-        # the DEFAULT 'active' from the column definition.
+        # Stamp each session dict with its persisted sidebar metadata in
+        # one bulk read after the upsert so new sessions get the DEFAULT
+        # 'active' status and the ADR-021 observation bit without
+        # per-session queries during the 5-second refresh cycle.
         try:
-            statuses = db.get_session_statuses(self.conn)
+            sidebar_state = db.get_session_sidebar_metadata(self.conn)
             for s in self.sessions:
-                s["status"] = statuses.get(s["session_id"], "active")
+                state = sidebar_state.get(s["session_id"], {})
+                s["status"] = state.get("status", "active")
+                s["has_observations"] = bool(
+                    state.get("has_observations", False)
+                )
         except Exception:
             for s in self.sessions:
                 s.setdefault("status", "active")
+                s.setdefault("has_observations", False)
 
         self._apply_stable_ordering()
         self._update_session_list(force_rebuild)
@@ -3225,33 +4100,8 @@ class ClaudeSessions(App):
                 if isinstance(item, SessionItem):
                     sid = item.session_data.get("session_id")
                     if sid in session_map:
-                        new_is_working = session_map[sid].get("is_working", False)
-                        old_is_working = item.session_data.get("is_working", False)
-                        if new_is_working != old_is_working:
-                            item.session_data["is_working"] = new_is_working
-                            try:
-                                label = item.query_one(".session-label", Static)
-                                if new_is_working:
-                                    label.add_class("working")
-                                    item.update_spinner(self._spinner_frame)
-                                else:
-                                    label.remove_class("working")
-                                    session = item.session_data
-                                    status = "●" if session.get("is_active") else "○"
-                                    age_str = format_age(session["modified"])
-                                    title = session.get("title", "")
-                                    if item.custom_name:
-                                        display = item.custom_name
-                                    elif title:
-                                        display = title
-                                    else:
-                                        display = session["project"]
-                                    display = f"{display[:DISPLAY_NAME_WIDTH]:<{DISPLAY_NAME_WIDTH}}"
-                                    label.update(
-                                        f"{status} {display} {age_str:>4}"
-                                    )
-                            except:
-                                pass
+                        item.session_data.update(session_map[sid])
+                        item.refresh_label()
 
     def refresh_transcript(self) -> None:
         transcript = self.query_one("#transcript-scroll", TranscriptView)
@@ -3405,18 +4255,107 @@ class ClaudeSessions(App):
         session_id = list_view.highlighted_child.session_data.get("session_id", "")
         cmd = f"claude -r {session_id}"
         try:
-            if sys.platform == "darwin":
-                subprocess.run(["pbcopy"], input=cmd.encode(), check=True)
-            else:
-                subprocess.run(
-                    ["xclip", "-selection", "clipboard"],
-                    input=cmd.encode(),
-                    check=True,
-                )
+            if not copy_to_clipboard(cmd):
+                raise RuntimeError("clipboard unavailable")
             self.notify(f"Copied: {cmd}")
         except Exception:
             # Fallback: just show the command
             self.notify(f"Resume: {cmd}", timeout=10)
+
+    def _highlighted_session_item(self) -> SessionItem | None:
+        list_view = self.query_one("#session-list", ListView)
+        item = list_view.highlighted_child
+        if isinstance(item, SessionItem):
+            return item
+        return None
+
+    def _spawn_observer(self, session_id: str) -> bool:
+        try:
+            subprocess.Popen(
+                build_observe_command(session_id),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return True
+        except Exception as e:
+            self.notify(f"Failed to start observer: {e}", severity="error")
+            return False
+
+    def _refresh_session_observation(self, session_id: str) -> dict | None:
+        try:
+            return _refresh_observer_state(self.conn, session_id)
+        except Exception:
+            return None
+
+    def _confirm_observer_start(self, session_id: str, prompt: str, success_message: str) -> None:
+        def _after(confirm: bool | None) -> None:
+            if not confirm:
+                return
+            state = self._refresh_session_observation(session_id)
+            if state is not None and state.get("observer_pid") is not None:
+                self.notify("Observer already running")
+                return
+            if self._spawn_observer(session_id):
+                self.notify(success_message)
+
+        self.push_screen(ConfirmScreen(prompt), _after)
+
+    def action_observe_session(self) -> None:
+        if self._input_has_focus():
+            return
+        item = self._highlighted_session_item()
+        if item is None:
+            return
+        session = item.session_data
+        session_id = session.get("session_id", "")
+        state = self._refresh_session_observation(session_id)
+        is_observed = bool(session.get("has_observations"))
+        if state is not None and int(state.get("entry_count") or 0) > 0:
+            is_observed = True
+        if is_observed:
+            obs_path = state.get("obs_path") if state else None
+            if obs_path and copy_to_clipboard(str(obs_path)):
+                self.notify("Observation path copied")
+            elif obs_path:
+                self.notify(str(obs_path), timeout=10)
+            else:
+                self.notify("Observation path unavailable", severity="warning")
+            return
+
+        if state is not None and state.get("observer_pid") is not None:
+            self.notify("Observer already running")
+            return
+        self._confirm_observer_start(
+            session_id,
+            "No observations yet. Start observing? (y/n)",
+            "Observer starting in background",
+        )
+
+    def action_resume_observation(self) -> None:
+        if self._input_has_focus():
+            return
+        item = self._highlighted_session_item()
+        if item is None:
+            return
+        session = item.session_data
+        session_id = session.get("session_id", "")
+        state = self._refresh_session_observation(session_id)
+        entry_count = 0
+        if state is not None:
+            entry_count = int(state.get("entry_count") or 0)
+        if entry_count <= 0:
+            self.notify("No observations to resume", severity="warning")
+            return
+        if state is not None and state.get("observer_pid") is not None:
+            self.notify("Observer already running")
+            return
+        self._confirm_observer_start(
+            session_id,
+            "Resume observation from last offset? (y/n)",
+            "Observation resumed in background",
+        )
 
     def _input_has_focus(self) -> bool:
         if self.query_one("#reply-input", TextArea).has_focus:
@@ -3492,7 +4431,38 @@ class ClaudeSessions(App):
             footer = self.query_one("#contextual-footer", ContextualFooter)
         except Exception:
             return
-        footer.render_for(self._current_scopes())
+        footer.render_for(self._current_scopes(), note=self._footer_note)
+
+    def _set_footer_note(self, message: str | None, *, timeout: float = 8.0) -> None:
+        """Show a transient note in the footer without using a toast."""
+        self._footer_note = message
+        if self._footer_note_timer is not None:
+            try:
+                self._footer_note_timer.stop()
+            except Exception:
+                pass
+            self._footer_note_timer = None
+        if message and timeout > 0:
+            self._footer_note_timer = self.set_timer(
+                timeout, lambda: self._set_footer_note(None, timeout=0)
+            )
+        self.refresh_footer()
+
+    def _run_export_cleanup(self) -> None:
+        """Best-effort cleanup of stale markdown exports at TUI startup."""
+        result = cleanup_export_markdown_files(
+            retention_days=self.config.get(
+                "export_retention_days",
+                EXPORT_RETENTION_DAYS_DEFAULT,
+            ),
+        )
+        try:
+            self.log(result.debug_message())
+        except Exception:
+            pass
+        message = result.footer_message()
+        if message:
+            self._set_footer_note(message)
 
     def on_descendant_focus(self, event) -> None:
         self.refresh_footer()
@@ -3542,7 +4512,14 @@ class ClaudeSessions(App):
         """
         if self._input_has_focus():
             return
-        self.push_screen(SearchScreen(self.conn), self._on_search_dismissed)
+        self.push_screen(
+            SearchScreen(
+                self.conn,
+                config=self.config,
+                current_session_id=self._selected_session_id,
+            ),
+            self._on_search_dismissed,
+        )
 
     def action_open_bookmarks(self) -> None:
         """Open the bookmark browser modal (task #18).
@@ -3572,10 +4549,13 @@ class ClaudeSessions(App):
 
     def bookmark_toggle_selection(self) -> None:
         """Selection-mode `space`: toggle a bookmark on each selected
-        message. Messages without a stored uuid (rare — synthetic or
-        pre-index) are silently skipped; the rest flip independently so
-        a range with mixed state ends up consistent with the user's
-        intent per message."""
+        message. Widgets whose uuid isn't in the indexed ``messages``
+        table yet (synthetic, pre-index, or a race with the 5 s index
+        cycle) are skipped rather than crashing the FK. Duplicates
+        within the same selection (multiple widgets resolving to the
+        same turn uuid — e.g. tool widgets pinned to the turn's
+        canonical id) are collapsed so one press produces one toggle
+        per underlying row."""
         # TODO: when the TUI grows a bookmark/research picker, route that flow
         # through ``db.upsert_bookmark`` so chat commands and the TUI share one
         # deterministic ingest path. Selection-mode space intentionally keeps
@@ -3587,10 +4567,25 @@ class ClaudeSessions(App):
         created = 0
         removed = 0
         skipped = 0
+        seen: set[str] = set()
         with db.transaction(self.conn):
             for widget in selected:
                 uuid = getattr(widget, "_uuid", None)
                 if not uuid:
+                    skipped += 1
+                    continue
+                if uuid in seen:
+                    continue
+                seen.add(uuid)
+                # Pre-check the FK target. A missing row means the
+                # indexer hasn't caught up or the widget was emitted
+                # with an id the indexer doesn't store — skip rather
+                # than let IntegrityError bubble up through on_key.
+                row = self.conn.execute(
+                    "SELECT 1 FROM messages WHERE uuid = ? LIMIT 1",
+                    (uuid,),
+                ).fetchone()
+                if row is None:
                     skipped += 1
                     continue
                 result = db.toggle_bookmark(self.conn, uuid)
@@ -3604,7 +4599,7 @@ class ClaudeSessions(App):
         if removed:
             parts.append(f"{removed} removed")
         if skipped and not parts:
-            parts.append(f"{skipped} skipped (no uuid)")
+            parts.append(f"{skipped} skipped (not indexed yet)")
         self.notify(", ".join(parts) if parts else "No bookmarks changed")
 
     def bookmark_prompt_label(self) -> None:
@@ -4902,6 +5897,41 @@ def build_parser():
         ),
     )
 
+    config_p = subparsers.add_parser(
+        "config",
+        help="Read or update app-level config values",
+        description=(
+            "Read or update settings stored in "
+            "~/.config/threadhop/config.json. Currently the supported "
+            "CLI-managed key is `observe.enabled`, a durable flag for "
+            "hook-driven observer auto-start."
+        ),
+    )
+    config_subparsers = config_p.add_subparsers(
+        dest="config_command",
+        required=True,
+    )
+    config_get_p = config_subparsers.add_parser(
+        "get",
+        help="Print a config value",
+    )
+    config_get_p.add_argument(
+        "key",
+        choices=sorted(CLI_CONFIG_KEYS),
+    )
+    config_set_p = config_subparsers.add_parser(
+        "set",
+        help="Persist a config value",
+    )
+    config_set_p.add_argument(
+        "key",
+        choices=sorted(CLI_CONFIG_KEYS),
+    )
+    config_set_p.add_argument(
+        "value",
+        help="Value to persist (for observe.enabled: true/false).",
+    )
+
     handoff_p = subparsers.add_parser(
         "handoff",
         help="Produce a handoff brief for a session",
@@ -5140,6 +6170,47 @@ def cmd_observe(args) -> int:
     if status == "failed":
         return 1
     return 0
+
+
+def cmd_config(args) -> int:
+    """Read or update app-level config.json values."""
+    if args.config_command == "get":
+        config = _load_app_config_file()
+        if args.key == "observe.enabled":
+            value = config.get(args.key, False)
+        else:
+            if args.key not in config:
+                print(
+                    f"threadhop config: {args.key} is not set.",
+                    file=sys.stderr,
+                )
+                return 1
+            value = config[args.key]
+        print(_config_value_to_text(value))
+        return 0
+
+    if args.config_command == "set":
+        try:
+            value = _coerce_config_value(args.key, args.value)
+        except ValueError as e:
+            print(f"threadhop config: {e}", file=sys.stderr)
+            return 2
+        config = _load_app_config_file()
+        config[args.key] = value
+        if not save_app_config(config):
+            print(
+                f"threadhop config: could not write {CONFIG_FILE}.",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"{args.key} = {_config_value_to_text(value)}")
+        return 0
+
+    print(
+        f"threadhop config: unsupported action {args.config_command}",
+        file=sys.stderr,
+    )
+    return 2
 
 
 def cmd_conflicts(args) -> int:
@@ -5444,6 +6515,8 @@ def main():
         return cmd_decisions(args)
     if args.command == "bookmark":
         return cmd_bookmark(args)
+    if args.command == "config":
+        return cmd_config(args)
     if args.command == "observe":
         return cmd_observe(args)
     if args.command == "conflicts":
