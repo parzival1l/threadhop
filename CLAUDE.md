@@ -98,6 +98,7 @@ Every message line has native fields useful for indexing:
 
 ## In Progress
 
-- Chat-side bookmark ingest uses `threadhop bookmark [bookmark|research]` and defaults to the latest message in the current detected session
-- Skill plugin `/threadhop:handoff <session_id>` sits on top of the observer/reflector pipeline and is still being assembled
-- See `docs/DESIGN-DECISIONS.md` for ADRs and the phase roadmap, and `docs/TASKS.md` for open tasks
+- Claude Code plugin scaffolded at `plugin/` — one skill (`/threadhop:handoff`, task #26 merged) plus three commands (`/threadhop:observe`, `/threadhop:tag`, `/threadhop:bookmark`), all under the `/threadhop:` namespace. Plugin is PATH-dependent on a separately-installed `threadhop` CLI (see `docs/skill-packaging.md`).
+- Chat-side bookmark ingest: `!threadhop bookmark [--note "..."]` (bash passthrough) and `/threadhop:bookmark` (plugin) both target the latest indexed message in the auto-detected session. Shared primitive with the TUI — same `bookmarks` table, same normalization.
+- Phase 5 release work (marketplace.json, CLI-side discoverability for `threadhop tag` no-args, interactive install verification) still open.
+- See `docs/DESIGN-DECISIONS.md` for ADRs and the phase roadmap, and `docs/TASKS.md` for open tasks.
