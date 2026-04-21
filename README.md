@@ -46,23 +46,22 @@ Verify with `threadhop --version`.
 
 ### Claude Code integration
 
-Two install paths depending on what you want:
+Once the CLI is installed, add the plugin to get the `/threadhop:*` slash commands and the handoff skill. From inside any `claude` session:
 
-**Just the handoff skill** — install via [Vercel's `skills` CLI](https://github.com/vercel-labs/skills):
+```
+/plugin marketplace add parzival1l/threadhop
+/plugin install threadhop@threadhop
+```
+
+That registers the four primitives — `/threadhop:handoff`, `/threadhop:tag`, `/threadhop:observe`, `/threadhop:bookmark` — persistently across all future sessions. The plugin is a thin wrapper over the CLI, so the `threadhop` command must already be on your `$PATH` (see above) for the slash commands to do anything.
+
+**Skill-only alternative**: if you *only* want `/threadhop:handoff` and not the three commands, you can install just the skill via [Vercel's `skills` CLI](https://github.com/vercel-labs/skills):
 
 ```bash
 npx skills add parzival1l/threadhop
 ```
 
-That drops `SKILL.md` into `~/.claude/skills/handoff/`, making `/threadhop:handoff <session_id>` available globally in Claude Code.
-
-**The full plugin** (handoff + `/threadhop:observe`, `/threadhop:tag`, `/threadhop:bookmark` commands):
-
-```bash
-claude --plugin-dir ~/.local/share/threadhop/plugin
-```
-
-Or, once a `marketplace.json` ships at the repo root, via Claude Code's native `/plugin install`.
+**Dev / local-testing path**: if you've cloned the repo and want to load the plugin against a working-tree copy for one session, `claude --plugin-dir ~/.local/share/threadhop/plugin` loads it for that invocation only (no persistence).
 
 ## Usage
 
