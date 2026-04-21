@@ -4910,7 +4910,6 @@ class ClaudeSessions(App):
                     self.notify("Could not create bookmark", severity="error")
                     return
             db.set_bookmark_note(self.conn, row["id"], new_note)
-            db.set_bookmark_note(self.conn, row["id"], new_note)
             shown = (new_note or "").strip() or "(no note)"
             self.notify(f"Bookmark note: {shown}")
 

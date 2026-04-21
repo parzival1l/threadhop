@@ -63,19 +63,30 @@ def threadhop_ns() -> dict:
     textual_worker = types.ModuleType("textual.worker")
     textual_worker.Worker = _Dummy
 
-    sys.modules.setdefault("rich", rich_mod)
-    sys.modules["rich.console"] = rich_console
-    sys.modules["rich.markdown"] = rich_markdown
-    sys.modules["rich.markup"] = rich_markup
-    sys.modules["rich.text"] = rich_text
-    sys.modules.setdefault("textual", textual_mod)
-    sys.modules["textual.app"] = textual_app
-    sys.modules["textual.binding"] = textual_binding
-    sys.modules["textual.containers"] = textual_containers
-    sys.modules["textual.screen"] = textual_screen
-    sys.modules["textual.widgets"] = textual_widgets
-    sys.modules["textual.worker"] = textual_worker
-    return runpy.run_path(str(THREADHOP))
+    patched = {
+        "rich": rich_mod,
+        "rich.console": rich_console,
+        "rich.markdown": rich_markdown,
+        "rich.markup": rich_markup,
+        "rich.text": rich_text,
+        "textual": textual_mod,
+        "textual.app": textual_app,
+        "textual.binding": textual_binding,
+        "textual.containers": textual_containers,
+        "textual.screen": textual_screen,
+        "textual.widgets": textual_widgets,
+        "textual.worker": textual_worker,
+    }
+    original = {name: sys.modules.get(name) for name in patched}
+    try:
+        sys.modules.update(patched)
+        yield runpy.run_path(str(THREADHOP))
+    finally:
+        for name, module in original.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
 
 
 def _point_config_at_tmp(threadhop_ns: dict, tmp_path: Path) -> Path:
