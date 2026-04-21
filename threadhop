@@ -3565,10 +3565,18 @@ class ClaudeSessions(App):
         grid-gutter: 0;
     }
 
+    /* Idle panels all carry the same muted border so section boundaries
+       stay visible without competing. The focused panel is promoted to
+       $accent, giving the eye a single clear target — this is the TUI
+       analogue of focus-elevation via shadow on the web. */
     #session-list {
         height: 100%;
-        border: solid $primary;
+        border: solid $panel;
         border-title-color: $text;
+    }
+
+    #session-list:focus-within {
+        border: solid $accent;
     }
 
     #transcript-column {
@@ -3578,8 +3586,12 @@ class ClaudeSessions(App):
 
     #transcript-scroll {
         height: 1fr;
-        border: solid $secondary;
+        border: solid $panel;
         border-title-color: $text;
+    }
+
+    #transcript-scroll:focus-within {
+        border: solid $accent;
     }
 
     ObservationInfoHeader {
@@ -3614,8 +3626,10 @@ class ClaudeSessions(App):
         color: $text-muted;
     }
 
+    /* 5 cells wide (was 3) so the mouse target is comfortable without
+       pushing the status counter. Visible glyph stays centered. */
     #find-close {
-        width: 3;
+        width: 5;
         height: 1;
         content-align: center middle;
         color: $error;
@@ -3628,10 +3642,15 @@ class ClaudeSessions(App):
 
     #input-container {
         column-span: 2;
-        border: solid $accent;
+        border: solid $panel;
+        border-title-color: $text;
         height: auto;
         min-height: 3;
         max-height: 10;
+    }
+
+    #input-container:focus-within {
+        border: solid $accent;
     }
 
     #reply-input {
