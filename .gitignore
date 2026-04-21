@@ -17,3 +17,8 @@ Thumbs.db
 
 # Claude local config
 .claude/
+
+# Local-only docs/scripts
+AGENTS.md
+INSTALL-MACOS.md
+migration.py
