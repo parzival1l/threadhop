@@ -23,6 +23,10 @@ The project is expanding from a transcript viewer into a cross-session context m
 ./threadhop observations            # raw observation JSONL, newest first
 ./threadhop conflicts [--resolved]  # cross-session decision conflicts (reflector)
 ./threadhop observe [--once|--stop|--stop-all] [--watch-backend auto|poll|fsevents]
+./threadhop bookmark add --message <uuid> --category <name> [--note <text>]
+./threadhop bookmark categories
+./threadhop bookmark category set-prompt <name> --prompt <text>
+./threadhop bookmark research --category <name> [--force] [--model <name>]
 ```
 
 No build step. The script uses `uv run --script` with PEP 723 inline metadata. Runtime deps: `textual`, `pydantic`. Tests use `pytest`.
@@ -31,6 +35,7 @@ No build step. The script uses `uv run --script` with PEP 723 inline metadata. R
 
 Core modules:
 - `threadhop` — executable entry point, TUI, argparse routing, CLI handlers, command registry + help overlay
+- `bookmarks.py` — shared bookmark-ingest primitive plus per-category research runner; used by CLI today and the TUI category-picker stub tomorrow
 - `db.py` — SQLite schema, migrations, session / bookmark / observation-state / memory helpers, CHECK constraints (ADR-004)
 - `models.py` — Pydantic validation boundary for JSONL parsing and DB-row shapes; `Literal` enums mirrored by SQL CHECKs (task #24)
 - `indexer.py` — transcript normalization + FTS ingestion; merges assistant streaming chunks by `message.id` (ADR-003)
@@ -49,7 +54,8 @@ Core modules:
 | `TranscriptView(VerticalScroll)` | Parses JSONL, renders conversation as `UserMessage`/`AssistantMessage`/`ToolMessage` widgets; select-mode + bookmark toggle |
 | `SessionItem(ListItem)` | Renders one session row: status icon (◐ working / ● active / ○ inactive) + name + age |
 | `SearchScreen(ModalScreen)` | FTS5 search across indexed messages |
-| `BookmarkBrowserScreen(ModalScreen)` | Pinned-message browser; list → enter jumps to message in transcript (task #18) |
+| `BookmarkBrowserScreen(ModalScreen)` | Category-aware bookmark browser; list → enter jumps to message in transcript |
+| `BookmarkCategoryPickerScreen(ModalScreen)` | Minimal typed category picker stub for transcript selection mode; TODO to replace with a searchable picker + note field |
 
 ### Data Flow
 
@@ -57,9 +63,11 @@ Core modules:
 2. **Active detection**: `_get_active_claude_sessions()` runs `ps -eo pid,args`, finds `claude` processes, resolves CWD via `lsof -a -d cwd -p <pid>`, matches to session IDs
 3. **Display**: `_update_session_list()` diffs old/new session lists — full rebuild on change, in-place spinner updates otherwise
 4. **Transcript**: `load_transcript()` parses full JSONL via `models.parse_transcript_line`, strips `<system-reminder>` tags, abbreviates tool calls, mounts message widgets
-5. **Observer pipeline**: `observer.observe_session()` reads `observation_state.source_byte_offset`, re-uses the cleaned transcript from `indexer.parse_byte_range` (same view the TUI shows), gates on `BATCH_THRESHOLD` new turns, invokes `claude -p --model haiku --permission-mode acceptEdits` with `prompts/observer.md` — the child process appends JSONL into `~/.config/threadhop/observations/<session_id>.jsonl`. Watch-mode loops this with fsevents/poll until `--stop`.
-6. **Reflector pipeline**: after enough new observations accumulate, `reflector.reflect_session()` compares the session's decisions against sibling sessions in the same project and appends `type: "conflict"` rows to the same observation JSONL.
-7. **Observation CLI**: `todos` / `decisions` / `observations` / `conflicts` run observer catch-up for tracked sessions via `cli_queries`, then read the per-session JSONL. `conflicts --resolved` writes review state into the `conflict_reviews` table instead of mutating append-only JSONL.
+5. **Bookmark ingest**: `bookmarks.add_bookmark()` is the shared primitive behind `threadhop bookmark add` and the TUI category-picker stub. It seeds the `sessions` row if needed, incrementally indexes the transcript so the target message exists in SQLite, auto-creates unknown categories with `research_prompt = NULL`, and inserts a `(session_id, message_uuid, category_id)` bookmark row.
+6. **Bookmark research**: `threadhop bookmark research --category <name>` gathers unresearched rows in that category, pulls a small transcript window around each bookmarked message via `indexer.parse_messages()`, invokes `claude -p --model haiku --permission-mode acceptEdits`, writes one markdown file per run under `~/.config/threadhop/research/<category>/`, and stamps `researched_at` so future runs skip the same rows unless `--force` is passed.
+7. **Observer pipeline**: `observer.observe_session()` reads `observation_state.source_byte_offset`, re-uses the cleaned transcript from `indexer.parse_byte_range` (same view the TUI shows), gates on `BATCH_THRESHOLD` new turns, invokes `claude -p --model haiku --permission-mode acceptEdits` with `prompts/observer.md` — the child process appends JSONL into `~/.config/threadhop/observations/<session_id>.jsonl`. Watch-mode loops this with fsevents/poll until `--stop`.
+8. **Reflector pipeline**: after enough new observations accumulate, `reflector.reflect_session()` compares the session's decisions against sibling sessions in the same project and appends `type: "conflict"` rows to the same observation JSONL.
+9. **Observation CLI**: `todos` / `decisions` / `observations` / `conflicts` run observer catch-up for tracked sessions via `cli_queries`, then read the per-session JSONL. `conflicts --resolved` writes review state into the `conflict_reviews` table instead of mutating append-only JSONL.
 
 ### Session State
 
@@ -69,8 +77,9 @@ Core modules:
 ### Persistent Config
 
 - `~/.config/threadhop/config.json` — app-level settings only (theme, sidebar width). Unknown keys are preserved by `migration.py`.
-- `~/.config/threadhop/sessions.db` — SQLite: sessions, messages + FTS5, bookmarks, memory, observation_state, conflict_reviews. Migrations live in `db.py` and run on every `init_db()`.
+- `~/.config/threadhop/sessions.db` — SQLite: sessions, messages + FTS5, bookmark_categories, bookmarks, memory, observation_state, conflict_reviews. Migrations live in `db.py` and run on every `init_db()`.
 - `~/.config/threadhop/observations/<session_id>.jsonl` — per-session observation file, shared by observer and reflector (ADR-019, ADR-020).
+- `~/.config/threadhop/research/<category>/<timestamp>.md` — one markdown research memo per bookmark-category run; future indexers should treat this as derived knowledge, not transcript source.
 
 ## Styling
 
@@ -95,6 +104,7 @@ Every message line has native fields useful for indexing:
 - **Don't feed the observer raw JSONL.** It must see the same cleaned transcript the TUI shows (via `indexer.parse_byte_range`) — otherwise tool output, system-reminders, and thinking blocks dominate and Haiku extracts trivia.
 - **Don't add a DB enum-like column without matching `Literal`+CHECK.** `models.py` and `db.py` enforce the same shape in two places on purpose (task #24). Drift here re-introduces the bugs the hardening was meant to prevent.
 - **Don't run the observer under `--permission-mode default`.** The child appends to the observation file itself; `acceptEdits` is the minimum that works.
+- **Don't bypass `bookmarks.add_bookmark()` for new bookmark entry paths.** It is the compatibility seam that keeps CLI, future skill/TUI flows, session seeding, and message indexing aligned.
 
 ## In Progress
 

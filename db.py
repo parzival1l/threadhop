@@ -36,11 +36,23 @@ from typing import Any, Iterator, Sequence
 # --- Paths ---
 DB_DIR = Path.home() / ".config" / "threadhop"
 DB_PATH = DB_DIR / "sessions.db"
+RESEARCH_DIR = DB_DIR / "research"
+
+DEFAULT_BOOKMARK_CATEGORY = "bookmark"
+DEFAULT_RESEARCH_CATEGORY = "research"
+DEFAULT_RESEARCH_PROMPT = (
+    "You are preparing a ThreadHop research memo from categorized bookmarks.\n"
+    "For each bookmark, identify the core topic, explain the missing context,\n"
+    "and provide concise, actionable background research. Organize the output\n"
+    "with clear headings, cite which bookmark/session each section came from,\n"
+    "and end with a short synthesis of recurring themes or next questions."
+)
+_UNSET = object()
 
 # --- Schema version ---
 # Each migration N in MIGRATIONS moves the DB from version N to N+1.
 # The DB's current version lives in PRAGMA user_version.
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 # --- Migrations -----------------------------------------------------------
@@ -529,6 +541,91 @@ def _migration_008_trigram_search(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_010_categorized_bookmarks(conn: sqlite3.Connection) -> None:
+    """Generalize bookmarks into category-backed rows with research state."""
+    ts = datetime.now().timestamp()
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bookmark_categories (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            name            TEXT NOT NULL UNIQUE,
+            research_prompt TEXT,
+            created_at      REAL NOT NULL,
+            updated_at      REAL NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO bookmark_categories
+            (name, research_prompt, created_at, updated_at)
+        VALUES (?, NULL, ?, ?)
+        """,
+        (DEFAULT_BOOKMARK_CATEGORY, ts, ts),
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO bookmark_categories
+            (name, research_prompt, created_at, updated_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (DEFAULT_RESEARCH_CATEGORY, DEFAULT_RESEARCH_PROMPT, ts, ts),
+    )
+
+    conn.execute("ALTER TABLE bookmarks RENAME TO bookmarks_legacy")
+    conn.execute("DROP INDEX IF EXISTS idx_bookmarks_created_at")
+    conn.execute("DROP INDEX IF EXISTS idx_bookmarks_kind_created_at")
+    conn.execute(
+        """
+        CREATE TABLE bookmarks (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id    TEXT NOT NULL,
+            message_uuid  TEXT NOT NULL,
+            category_id   INTEGER NOT NULL,
+            note          TEXT,
+            created_at    REAL NOT NULL,
+            researched_at REAL,
+            FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+                ON DELETE CASCADE,
+            FOREIGN KEY (message_uuid) REFERENCES messages(uuid)
+                ON DELETE CASCADE,
+            FOREIGN KEY (category_id) REFERENCES bookmark_categories(id)
+                ON DELETE RESTRICT,
+            UNIQUE (session_id, message_uuid, category_id)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_bookmarks_category_researched "
+        "ON bookmarks(category_id, researched_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_bookmarks_created_at "
+        "ON bookmarks(created_at)"
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO bookmarks (
+            session_id, message_uuid, category_id, note, created_at, researched_at
+        )
+        SELECT
+            m.session_id,
+            b.message_uuid,
+            c.id,
+            NULLIF(TRIM(b.note), ''),
+            b.created_at,
+            NULL
+        FROM bookmarks_legacy b
+        JOIN messages m ON m.uuid = b.message_uuid
+        JOIN bookmark_categories c ON c.name = b.kind
+        WHERE b.kind IN (?, ?)
+        """,
+        (DEFAULT_BOOKMARK_CATEGORY, DEFAULT_RESEARCH_CATEGORY),
+    )
+    conn.execute("DROP TABLE bookmarks_legacy")
+
+
 # Ordered list; MIGRATIONS[i] moves schema from version i to i+1.
 MIGRATIONS: list = [
     _migration_001_initial,
@@ -540,6 +637,7 @@ MIGRATIONS: list = [
     _migration_007_bookmarks,
     _migration_008_trigram_search,
     _migration_009_bookmark_kinds_and_notes,
+    _migration_010_categorized_bookmarks,
 ]
 
 assert len(MIGRATIONS) == SCHEMA_VERSION, (
@@ -1510,30 +1608,9 @@ def mark_conflict_reviewed(
 
 
 # --- Bookmarks ------------------------------------------------------------
-# Users pin messages via `space` in selection mode; the browser modal
-# reads back via ``list_bookmarks``. Timestamps are Unix epoch floats to
-# match ``sessions.modified_at`` and the rest of the time columns here.
-#
-# ``tags`` is stored as a JSON-encoded array to match ``models.Bookmark``
-# (task #24's lockstep rule). Helpers decode to ``list[str]`` on read so
-# callers never see the raw JSON.
-
-
-def _decode_bookmark_tags(row: dict | None) -> dict | None:
-    """Decode ``row['tags']`` from JSON to a list. Mutates ``row`` in place
-    and returns it; ``None`` passes through."""
-    if row is None:
-        return None
-    raw = row.get("tags")
-    if isinstance(raw, str):
-        try:
-            decoded = json.loads(raw) if raw else []
-        except json.JSONDecodeError:
-            decoded = []
-        row["tags"] = decoded if isinstance(decoded, list) else []
-    elif raw is None:
-        row["tags"] = []
-    return row
+def _normalize_bookmark_note(note: str | None) -> str | None:
+    clean = note.strip() if note else ""
+    return clean or None
 
 
 def _normalize_bookmark_kind(kind: str) -> str:
@@ -1547,23 +1624,227 @@ def _normalize_bookmark_kind(kind: str) -> str:
     return clean
 
 
-def _normalize_bookmark_note(note: str | None) -> str | None:
-    """Trim a free-text note; blank strings collapse to NULL."""
-    clean = note.strip() if note else ""
-    return clean or None
+def _decorate_bookmark_row(row: dict | None) -> dict | None:
+    """Normalize bookmark joins for old TUI callers and new CLI paths."""
+    if row is None:
+        return None
+    row["note"] = _normalize_bookmark_note(row.get("note"))
+    row["label"] = row["note"]
+    if row.get("category_name") in BOOKMARK_KIND_ORDER:
+        row["kind"] = row["category_name"]
+    elif row.get("kind") in BOOKMARK_KIND_ORDER:
+        row["category_name"] = row["kind"]
+    return row
+
+
+def get_bookmark_category(
+    conn: sqlite3.Connection,
+    name: str,
+) -> dict | None:
+    """Return one bookmark category by name."""
+    return query_one(
+        conn,
+        """
+        SELECT id, name, research_prompt, created_at, updated_at
+        FROM bookmark_categories
+        WHERE name = ?
+        """,
+        (name,),
+    )
+
+
+def ensure_bookmark_category(
+    conn: sqlite3.Connection,
+    name: str,
+    *,
+    research_prompt: str | None | object = _UNSET,
+    now: float | None = None,
+) -> dict:
+    """Fetch or create a bookmark category."""
+    existing = get_bookmark_category(conn, name)
+    if existing is not None:
+        if research_prompt is not _UNSET:
+            prompt = _normalize_bookmark_note(
+                research_prompt if isinstance(research_prompt, str) else None
+            )
+            conn.execute(
+                """
+                UPDATE bookmark_categories
+                SET research_prompt = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    prompt,
+                    now if now is not None else datetime.now().timestamp(),
+                    existing["id"],
+                ),
+            )
+            return get_bookmark_category(conn, name) or existing
+        return existing
+
+    ts = now if now is not None else datetime.now().timestamp()
+    prompt = None
+    if research_prompt is not _UNSET:
+        prompt = _normalize_bookmark_note(
+            research_prompt if isinstance(research_prompt, str) else None
+        )
+    cur = conn.execute(
+        """
+        INSERT INTO bookmark_categories
+            (name, research_prompt, created_at, updated_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (name, prompt, ts, ts),
+    )
+    return {
+        "id": cur.lastrowid,
+        "name": name,
+        "research_prompt": prompt,
+        "created_at": ts,
+        "updated_at": ts,
+    }
+
+
+def set_bookmark_category_prompt(
+    conn: sqlite3.Connection,
+    name: str,
+    prompt: str | None,
+) -> dict:
+    """Set or replace the research prompt for ``name``."""
+    return ensure_bookmark_category(conn, name, research_prompt=prompt)
+
+
+def list_bookmark_categories(conn: sqlite3.Connection) -> list[dict]:
+    """List categories with bookmark counts and prompt presence."""
+    rows = query_all(
+        conn,
+        """
+        SELECT
+            c.id,
+            c.name,
+            c.research_prompt,
+            c.created_at,
+            c.updated_at,
+            COUNT(b.id) AS bookmark_count
+        FROM bookmark_categories c
+        LEFT JOIN bookmarks b ON b.category_id = c.id
+        GROUP BY c.id, c.name, c.research_prompt, c.created_at, c.updated_at
+        ORDER BY c.name COLLATE NOCASE
+        """,
+    )
+    for row in rows:
+        row["bookmark_count"] = int(row.get("bookmark_count") or 0)
+        row["has_prompt"] = bool(_normalize_bookmark_note(row.get("research_prompt")))
+    return rows
+
+
+def _resolve_bookmark_message(
+    conn: sqlite3.Connection,
+    message_uuid: str,
+    session_id: str | None = None,
+) -> dict | None:
+    if session_id is not None:
+        return query_one(
+            conn,
+            """
+            SELECT uuid, session_id
+            FROM messages
+            WHERE uuid = ? AND session_id = ?
+            """,
+            (message_uuid, session_id),
+        )
+    return query_one(
+        conn,
+        "SELECT uuid, session_id FROM messages WHERE uuid = ?",
+        (message_uuid,),
+    )
 
 
 def get_bookmark(
-    conn: sqlite3.Connection, message_uuid: str
+    conn: sqlite3.Connection,
+    message_uuid: str,
+    category_name: str | object = _UNSET,
+    *,
+    session_id: str | None = None,
 ) -> dict | None:
-    """Return the bookmark row for ``message_uuid`` or None."""
-    row = query_one(
-        conn,
-        "SELECT id, message_uuid, note, kind, tags, created_at FROM bookmarks "
-        "WHERE message_uuid = ?",
-        (message_uuid,),
+    """Return the bookmark row for one message/category pair."""
+    sql = (
+        "SELECT "
+        "  b.id, b.session_id, b.message_uuid, b.category_id, "
+        "  c.name AS category_name, b.note, b.created_at, b.researched_at "
+        "FROM bookmarks b "
+        "JOIN bookmark_categories c ON c.id = b.category_id "
+        "WHERE b.message_uuid = ? "
+        "  AND (? IS NULL OR b.session_id = ?) "
     )
-    return _decode_bookmark_tags(row)
+    params: list[Any] = [message_uuid, session_id, session_id]
+    if category_name is _UNSET:
+        sql += (
+            "ORDER BY CASE c.name "
+            "WHEN ? THEN 0 "
+            "WHEN ? THEN 1 "
+            "ELSE 2 END, b.id ASC LIMIT 1"
+        )
+        params.extend([DEFAULT_BOOKMARK_CATEGORY, DEFAULT_RESEARCH_CATEGORY])
+    else:
+        sql += "AND c.name = ?"
+        params.append(category_name)
+    row = query_one(conn, sql, tuple(params))
+    return _decorate_bookmark_row(row)
+
+
+def add_bookmark(
+    conn: sqlite3.Connection,
+    message_uuid: str,
+    *,
+    category_name: str,
+    session_id: str | None = None,
+    note: str | None = None,
+    created_at: float | None = None,
+) -> dict:
+    """Create or update a categorized bookmark."""
+    message = _resolve_bookmark_message(conn, message_uuid, session_id=session_id)
+    if message is None:
+        raise ValueError(f"Unknown message uuid: {message_uuid}")
+    category = ensure_bookmark_category(conn, category_name, research_prompt=None)
+    existing = get_bookmark(
+        conn,
+        message_uuid,
+        category_name=category_name,
+        session_id=message["session_id"],
+    )
+    if existing is not None:
+        if note is not None:
+            set_bookmark_note(conn, existing["id"], note)
+            existing["note"] = _normalize_bookmark_note(note)
+            existing["label"] = existing["note"]
+        return existing
+
+    ts = created_at if created_at is not None else datetime.now().timestamp()
+    cur = conn.execute(
+        """
+        INSERT INTO bookmarks (
+            session_id, message_uuid, category_id, note, created_at, researched_at
+        ) VALUES (?, ?, ?, ?, ?, NULL)
+        """,
+        (
+            message["session_id"],
+            message_uuid,
+            category["id"],
+            _normalize_bookmark_note(note),
+            ts,
+        ),
+    )
+    return _decorate_bookmark_row({
+        "id": cur.lastrowid,
+        "session_id": message["session_id"],
+        "message_uuid": message_uuid,
+        "category_id": category["id"],
+        "category_name": category["name"],
+        "note": _normalize_bookmark_note(note),
+        "created_at": ts,
+        "researched_at": None,
+    })
 
 
 def get_message(
@@ -1589,12 +1870,7 @@ def get_latest_message(
     conn: sqlite3.Connection,
     session_id: str,
 ) -> dict | None:
-    """Return the newest indexed message for ``session_id``.
-
-    Uses ``rowid`` rather than ``timestamp`` as the primary ordering key so the
-    "latest visible message" matches transcript append order even when multiple
-    rows share the same second-level timestamp.
-    """
+    """Return the newest indexed message for ``session_id``."""
     return query_one(
         conn,
         "SELECT uuid, session_id, role, text, timestamp, cwd, parent_uuid, "
@@ -1624,77 +1900,60 @@ def upsert_bookmark(
     kind: str = "bookmark",
     note: str | None | object = _BOOKMARK_NOTE_UNSET,
     created_at: float | None = None,
+    session_id: str | None = None,
 ) -> dict:
-    """Create or update the shared bookmark record for one message.
-
-    This is the forward-compatible ingest primitive used by chat commands today
-    and by richer UIs later. Unlike ``toggle_bookmark``, it is deterministic:
-    the row exists after the call and carries the requested built-in class.
-    """
+    """Compatibility wrapper for the precursor bookmark/research classes."""
     kind = _normalize_bookmark_kind(kind)
-    ts = created_at if created_at is not None else datetime.now().timestamp()
-    existing = get_bookmark(conn, message_uuid)
-    if existing is None:
-        clean_note = None if note is _BOOKMARK_NOTE_UNSET else _normalize_bookmark_note(note)
-        cur = conn.execute(
-            "INSERT INTO bookmarks (message_uuid, note, kind, tags, created_at) "
-            "VALUES (?, ?, ?, '[]', ?)",
-            (message_uuid, clean_note, kind, ts),
-        )
-        return {
-            "id": cur.lastrowid,
-            "message_uuid": message_uuid,
-            "note": clean_note,
-            "kind": kind,
-            "tags": [],
-            "created_at": ts,
-        }
-
-    clean_note = (
-        existing.get("note")
-        if note is _BOOKMARK_NOTE_UNSET
-        else _normalize_bookmark_note(note)
+    message = _resolve_bookmark_message(conn, message_uuid, session_id=session_id)
+    if message is None:
+        raise ValueError(f"Unknown message uuid: {message_uuid}")
+    existing = get_bookmark(
+        conn,
+        message_uuid,
+        category_name=kind,
+        session_id=message["session_id"],
     )
-    conn.execute(
-        "UPDATE bookmarks SET note = ?, kind = ?, created_at = ? WHERE id = ?",
-        (clean_note, kind, ts, existing["id"]),
+    chosen_note = (
+        existing.get("note") if existing is not None and note is _BOOKMARK_NOTE_UNSET
+        else (None if note is _BOOKMARK_NOTE_UNSET else _normalize_bookmark_note(note))
     )
-    existing["note"] = clean_note
-    existing["kind"] = kind
-    existing["created_at"] = ts
-    return existing
+    return add_bookmark(
+        conn,
+        message_uuid,
+        category_name=kind,
+        session_id=message["session_id"],
+        note=chosen_note,
+        created_at=created_at,
+    )
 
 
 def toggle_bookmark(
     conn: sqlite3.Connection,
     message_uuid: str,
     created_at: float | None = None,
+    *,
+    category_name: str = DEFAULT_BOOKMARK_CATEGORY,
+    session_id: str | None = None,
+    note: str | None = None,
 ) -> dict | None:
-    """Toggle a bookmark on ``message_uuid``.
-
-    Returns the new bookmark dict on create, or ``None`` on delete so callers
-    can show the right toast ("Bookmarked" vs "Removed"). New rows start as the
-    built-in ``bookmark`` kind with no note; richer category editing is a
-    follow-up to this ingest path.
-    """
-    existing = get_bookmark(conn, message_uuid)
+    """Toggle a bookmark on ``message_uuid`` within one category."""
+    existing = get_bookmark(
+        conn,
+        message_uuid,
+        category_name=category_name,
+        session_id=session_id,
+    )
     if existing is not None:
         conn.execute("DELETE FROM bookmarks WHERE id = ?", (existing["id"],))
         return None
-    ts = created_at if created_at is not None else datetime.now().timestamp()
-    cur = conn.execute(
-        "INSERT INTO bookmarks (message_uuid, note, kind, tags, created_at) "
-        "VALUES (?, NULL, 'bookmark', '[]', ?)",
-        (message_uuid, ts),
+    return add_bookmark(
+        conn,
+        message_uuid,
+        category_name=category_name,
+        session_id=session_id,
+        note=note,
+        created_at=created_at,
     )
-    return {
-        "id": cur.lastrowid,
-        "message_uuid": message_uuid,
-        "note": None,
-        "kind": "bookmark",
-        "tags": [],
-        "created_at": ts,
-    }
 
 
 def set_bookmark_note(
@@ -1728,51 +1987,112 @@ def list_bookmarks(
     conn: sqlite3.Connection,
     query: str | None = None,
     limit: int = 500,
+    *,
+    category_name: str | None = None,
 ) -> list[dict]:
-    """Return bookmarks joined with message + session metadata, newest first.
-
-    ``query`` is an optional case-insensitive substring filter applied across
-    the note, kind, the message body, and the session's project /
-    custom name — mirrors the single filter input in the browser modal.
-    """
+    """Return bookmarks joined with category, message, and session metadata."""
     sql = (
-        "SELECT b.id, b.message_uuid, b.note, b.kind, b.tags, b.created_at, "
-        "       m.session_id, m.role, m.text, m.timestamp, "
-        "       s.custom_name, s.project "
+        "SELECT "
+        "  b.id, b.session_id, b.message_uuid, b.category_id, "
+        "  c.name AS category_name, b.note, b.created_at, b.researched_at, "
+        "  m.role, m.text, m.timestamp, "
+        "  s.custom_name, s.project "
         "FROM bookmarks b "
+        "JOIN bookmark_categories c ON c.id = b.category_id "
         "JOIN messages m ON m.uuid = b.message_uuid "
-        "LEFT JOIN sessions s ON s.session_id = m.session_id "
+        "LEFT JOIN sessions s ON s.session_id = b.session_id "
     )
-    params: tuple = ()
+    where: list[str] = []
+    params: list[Any] = []
+    if category_name is not None:
+        where.append("c.name = ?")
+        params.append(category_name)
     if query:
-        sql += (
-            "WHERE b.note LIKE ? OR b.kind LIKE ? OR m.text LIKE ? "
-            "OR s.custom_name LIKE ? OR s.project LIKE ? "
-        )
         like = f"%{query}%"
-        params = (like, like, like, like, like)
+        where.append(
+            "("
+            "b.note LIKE ? OR m.text LIKE ? OR s.custom_name LIKE ? "
+            "OR s.project LIKE ? OR c.name LIKE ?"
+            ")"
+        )
+        params.extend([like, like, like, like, like])
+    if where:
+        sql += "WHERE " + " AND ".join(where) + " "
     sql += "ORDER BY b.created_at DESC LIMIT ?"
-    params = params + (limit,)
-    rows = query_all(conn, sql, params)
+    params.append(limit)
+    rows = query_all(conn, sql, tuple(params))
     for row in rows:
-        _decode_bookmark_tags(row)
+        _decorate_bookmark_row(row)
     return rows
+
+
+def list_bookmarks_for_research(
+    conn: sqlite3.Connection,
+    category_name: str,
+    *,
+    force: bool = False,
+) -> list[dict]:
+    """Return bookmarks ready for one research run."""
+    sql = (
+        "SELECT "
+        "  b.id, b.session_id, b.message_uuid, b.category_id, "
+        "  c.name AS category_name, c.research_prompt, "
+        "  b.note, b.created_at, b.researched_at, "
+        "  m.role, m.text, m.timestamp, "
+        "  s.session_path, s.custom_name, s.project "
+        "FROM bookmarks b "
+        "JOIN bookmark_categories c ON c.id = b.category_id "
+        "JOIN messages m ON m.uuid = b.message_uuid "
+        "LEFT JOIN sessions s ON s.session_id = b.session_id "
+        "WHERE c.name = ? "
+    )
+    params: list[Any] = [category_name]
+    if not force:
+        sql += "AND b.researched_at IS NULL "
+    sql += "ORDER BY b.created_at ASC, b.id ASC"
+    rows = query_all(conn, sql, tuple(params))
+    for row in rows:
+        _decorate_bookmark_row(row)
+    return rows
+
+
+def mark_bookmarks_researched(
+    conn: sqlite3.Connection,
+    bookmark_ids: Sequence[int],
+    *,
+    researched_at: float | None = None,
+) -> None:
+    """Stamp ``researched_at`` for the provided bookmark ids."""
+    if not bookmark_ids:
+        return
+    ts = researched_at if researched_at is not None else datetime.now().timestamp()
+    conn.executemany(
+        "UPDATE bookmarks SET researched_at = ? WHERE id = ?",
+        [(ts, bookmark_id) for bookmark_id in bookmark_ids],
+    )
 
 
 def get_bookmarked_uuids(
     conn: sqlite3.Connection,
     session_id: str | None = None,
+    *,
+    category_name: str | None = None,
 ) -> set[str]:
-    """Return the set of bookmarked message UUIDs, optionally scoped
-    to one session. Used by the transcript view to tag pinned widgets
-    when rendering."""
+    """Return bookmarked message UUIDs, optionally scoped by session/category."""
+    sql = (
+        "SELECT DISTINCT b.message_uuid "
+        "FROM bookmarks b "
+        "JOIN bookmark_categories c ON c.id = b.category_id "
+    )
+    where: list[str] = []
+    params: list[Any] = []
     if session_id is not None:
-        rows = conn.execute(
-            "SELECT b.message_uuid FROM bookmarks b "
-            "JOIN messages m ON m.uuid = b.message_uuid "
-            "WHERE m.session_id = ?",
-            (session_id,),
-        ).fetchall()
-    else:
-        rows = conn.execute("SELECT message_uuid FROM bookmarks").fetchall()
+        where.append("b.session_id = ?")
+        params.append(session_id)
+    if category_name is not None:
+        where.append("c.name = ?")
+        params.append(category_name)
+    if where:
+        sql += "WHERE " + " AND ".join(where)
+    rows = conn.execute(sql, tuple(params)).fetchall()
     return {r[0] for r in rows}

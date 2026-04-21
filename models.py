@@ -121,22 +121,29 @@ class Message(BaseModel):
 
 
 class Bookmark(BaseModel):
-    """One row of the ``bookmarks`` table.
-
-    ``kind`` is intentionally narrow for the first chat-ingest pathway:
-    ``bookmark`` for general keep-for-later items and ``research`` for deferred
-    research follow-up. ``tags`` remains as a JSON-encoded string in SQL so the
-    later generalized-category work can layer on without rewriting every caller.
-    """
+    """One row of the categorized ``bookmarks`` table."""
 
     model_config = ConfigDict(extra="forbid")
 
     id: int | None = None  # autoincrement — None when inserting
     message_uuid: str
+    session_id: str
+    category_id: int
     note: str | None = None
-    kind: BookmarkKind = "bookmark"
-    tags: list[str] = Field(default_factory=list)
     created_at: float
+    researched_at: float | None = None
+
+
+class BookmarkCategory(BaseModel):
+    """One row of the ``bookmark_categories`` table."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int | None = None
+    name: str
+    research_prompt: str | None = None
+    created_at: float
+    updated_at: float
 
 
 class MemoryEntry(BaseModel):
@@ -391,10 +398,12 @@ __all__ = [
     "MessageRole",
     "MemoryType",
     "MemorySource",
+    "BookmarkKind",
     # DB row models
     "Session",
     "Message",
     "Bookmark",
+    "BookmarkCategory",
     "MemoryEntry",
     # JSONL block models
     "TextBlock",
