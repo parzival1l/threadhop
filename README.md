@@ -15,13 +15,54 @@ Each Claude Code session ships as an isolated JSONL transcript. ThreadHop indexe
 
 ## Install
 
-Requires macOS and [uv](https://github.com/astral-sh/uv). That's it — `uv run --script` handles Python and the `textual` + `pydantic` runtime deps on first invocation.
+macOS only. The installer handles everything — including installing [uv](https://github.com/astral-sh/uv) if you don't have it.
+
+### Quick install (recommended)
 
 ```bash
-ln -s /path/to/threadhop/threadhop ~/bin/threadhop
+curl -LsSf https://raw.githubusercontent.com/parzival1l/threadhop/main/install.sh | bash
 ```
 
-See [INSTALL-macOS.md](INSTALL-macOS.md) for the step-by-step walkthrough.
+This clones the repo to `~/.local/share/threadhop`, installs `uv` if missing, and symlinks `threadhop` into `~/.local/bin`. Re-run the same command any time to update.
+
+### Manual install
+
+If you'd rather not pipe curl to bash, the same three steps by hand:
+
+```bash
+# 1. Install uv (skip if you already have it)
+brew install uv    # or: curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# 2. Clone and link
+git clone https://github.com/parzival1l/threadhop.git ~/.local/share/threadhop
+mkdir -p ~/.local/bin
+ln -s ~/.local/share/threadhop/threadhop ~/.local/bin/threadhop
+
+# 3. Make sure ~/.local/bin is on your PATH (add to ~/.zshrc if not)
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Verify with `threadhop --version`.
+
+### Claude Code integration
+
+Two install paths depending on what you want:
+
+**Just the handoff skill** — install via [Vercel's `skills` CLI](https://github.com/vercel-labs/skills):
+
+```bash
+npx skills add parzival1l/threadhop
+```
+
+That drops `SKILL.md` into `~/.claude/skills/handoff/`, making `/threadhop:handoff <session_id>` available globally in Claude Code.
+
+**The full plugin** (handoff + `/threadhop:observe`, `/threadhop:tag`, `/threadhop:bookmark` commands):
+
+```bash
+claude --plugin-dir ~/.local/share/threadhop/plugin
+```
+
+Or, once a `marketplace.json` ships at the repo root, via Claude Code's native `/plugin install`.
 
 ## Usage
 
