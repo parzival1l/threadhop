@@ -415,6 +415,10 @@ class TranscriptView(VerticalScroll):
                 self.app.bookmark_prompt_label()
                 event.stop()
                 event.prevent_default()
+            elif event.key == "B":
+                self.app.bookmark_prompt_category()
+                event.stop()
+                event.prevent_default()
             elif event.key == "escape":
                 if self._range_mode:
                     self._exit_range_mode()
@@ -433,7 +437,7 @@ class TranscriptView(VerticalScroll):
         self._update_selection(messages)
         self.app.notify(
             "Selection mode: j/k move, v range, y copy, e export, "
-            "space bookmark, L note, m/Esc exit"
+            "space bookmark, B category, L note, m/Esc exit"
         )
         # Nudge the contextual footer — selection mode has its own scope.
         try:
@@ -529,7 +533,7 @@ class TranscriptView(VerticalScroll):
                 f"({pos}/{total}) (j/k extend, v/Esc cancel)"
             )
         else:
-            self.border_title = f"Transcript ── SELECT {pos}/{total} (j/k move, v range, y/e copy/export, space bookmark, L note, m/Esc exit)"
+            self.border_title = f"Transcript ── SELECT {pos}/{total} (j/k move, v range, y/e copy/export, space bookmark, B category, L note, m/Esc exit)"
 
     def _clear_selection(self):
         for widget in self._get_message_widgets():
@@ -2271,8 +2275,7 @@ class BookmarkItem(ListItem):
     """One row in the bookmark browser.
 
     Layout mirrors SearchResultItem so the two modals feel like siblings:
-    note / kind / role marker + snippet, then session · project · timestamp.
-    Bookmarks without a note fall back to the kind + role marker alone.
+    category / note / role marker + snippet, then session · project · timestamp.
     """
 
     def __init__(self, row: dict):
@@ -2283,13 +2286,14 @@ class BookmarkItem(ListItem):
         role = self.row.get("role", "")
         role_icon = "▶" if role == "user" else "●"
         role_style = "bold cyan" if role == "user" else "bold green"
-        note = (self.row.get("note") or "").strip()
-        kind = self.row.get("kind") or "bookmark"
-        kind_style = "bold magenta" if kind == "research" else "bold yellow"
+        note = (self.row.get("note") or self.row.get("label") or "").strip()
+        category = (self.row.get("category_name") or "").strip()
 
         first_line = Text()
         first_line.append("★ ", style="bold yellow")
-        first_line.append(f"[{kind}] ", style=kind_style)
+        if category:
+            first_line.append(f"[{category}]", style="bold yellow")
+            first_line.append("  ", style="dim")
         if note:
             first_line.append(note, style="bold")
             first_line.append("  ", style="dim")
@@ -2415,7 +2419,7 @@ class BookmarkBrowserScreen(ModalScreen):
         with Vertical(id="bookmark-container") as container:
             container.border_title = "Bookmarks"
             yield Input(
-                placeholder="Filter bookmarks by note, kind, text, or session…",
+                placeholder="Filter bookmarks by category, note, text, or session…",
                 id="bookmark-input",
             )
             yield Static("", id="bookmark-status")
@@ -2719,6 +2723,92 @@ class ConfirmScreen(ModalScreen):
 
     def action_cancel(self) -> None:
         self.dismiss(False)
+
+
+class BookmarkCategoryPickerScreen(ModalScreen):
+    """Minimal category picker stub for future TUI integration.
+
+    This deliberately stays small for now: users can type a category name and
+    ThreadHop will reuse the shared bookmark-ingest primitive. TODO: replace
+    this with a searchable picker + note capture flow.
+    """
+
+    BINDINGS = [
+        Binding("enter", "submit", "Save", priority=True, show=False),
+        Binding("escape", "cancel", "Cancel", priority=True, show=False),
+    ]
+
+    CSS = """
+    BookmarkCategoryPickerScreen {
+        layout: vertical;
+        align: center middle;
+        background: $background 70%;
+    }
+
+    #bookmark-category-container {
+        width: 76;
+        max-width: 90%;
+        height: auto;
+        background: $surface;
+        border: thick $accent;
+        padding: 1 2;
+        layout: vertical;
+    }
+
+    #bookmark-category-title {
+        height: 1;
+        text-style: bold;
+        color: $text;
+    }
+
+    #bookmark-category-input {
+        margin-top: 1;
+    }
+
+    #bookmark-category-hint {
+        height: auto;
+        margin-top: 1;
+        color: $text-muted;
+    }
+    """
+
+    def __init__(self, suggestions: list[str]):
+        super().__init__()
+        self._suggestions = suggestions
+
+    def compose(self) -> ComposeResult:
+        hint = ", ".join(self._suggestions) if self._suggestions else "bookmark, research"
+        with Vertical(id="bookmark-category-container"):
+            yield Static("Bookmark category", id="bookmark-category-title")
+            yield Input(
+                value=db.DEFAULT_BOOKMARK_CATEGORY,
+                placeholder="Category name",
+                id="bookmark-category-input",
+            )
+            yield Static(
+                "Built-ins and known categories: "
+                f"{hint}\nTODO: replace this stub with a searchable picker + note field.",
+                id="bookmark-category-hint",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#bookmark-category-input", Input).focus()
+
+    def action_submit(self) -> None:
+        value = self.query_one("#bookmark-category-input", Input).value or ""
+        self.dismiss(value.strip() or db.DEFAULT_BOOKMARK_CATEGORY)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_input_submitted(self, event) -> None:
+        try:
+            if event.input.id != "bookmark-category-input":
+                return
+        except AttributeError:
+            return
+        event.stop()
+        self.action_submit()
 
 
 class HelpScreen(ModalScreen):
@@ -4144,6 +4234,60 @@ class ClaudeSessions(App):
             parts.append(f"{skipped} skipped (not indexed yet)")
         self.notify(", ".join(parts) if parts else "No bookmarks changed")
 
+    def bookmark_prompt_category(self) -> None:
+        """Selection-mode `B`: minimal category picker stub.
+
+        Reuses the same create primitive as the CLI/skill path. TODO: capture
+        note text and replace the free-text input with a searchable picker.
+        """
+        transcript = self.query_one("#transcript-scroll", TranscriptView)
+        messages = transcript._get_message_widgets()
+        if not transcript._selection_mode or not messages:
+            return
+        idx = transcript._selected_index
+        if idx < 0 or idx >= len(messages):
+            return
+        widget = messages[idx]
+        uuid = getattr(widget, "_uuid", None)
+        if not uuid:
+            self.notify("Message has no uuid — cannot bookmark", severity="warning")
+            return
+
+        session_id = self._selected_session_id
+        if not session_id:
+            self.notify("No session selected — cannot bookmark", severity="warning")
+            return
+        session_path = None
+        if session_id:
+            session = next(
+                (row for row in self.sessions if row.get("session_id") == session_id),
+                None,
+            )
+            if session is not None:
+                session_path = session.get("path")
+
+        categories = [row["name"] for row in db.list_bookmark_categories(self.conn)]
+
+        def _apply(category_name: str | None) -> None:
+            if not category_name:
+                return
+            try:
+                row = bookmark_ops.add_bookmark(
+                    self.conn,
+                    session_id,
+                    uuid,
+                    category_name,
+                    session_path=session_path,
+                )
+            except Exception as e:  # noqa: BLE001
+                self.notify(f"Bookmark failed: {e}", severity="error")
+                return
+            self.notify(
+                f"Bookmarked in category '{row['category_name']}'"
+            )
+
+        self.push_screen(BookmarkCategoryPickerScreen(categories), _apply)
+
     def bookmark_prompt_label(self) -> None:
         """Selection-mode `L`: prompt for a note on the (single) focused
         message. For range selections we note the cursor message only —
@@ -4161,7 +4305,11 @@ class ClaudeSessions(App):
             self.notify("Message has no uuid — cannot bookmark", severity="warning")
             return
 
-        existing = db.get_bookmark(self.conn, uuid)
+        existing = db.get_bookmark(
+            self.conn,
+            uuid,
+            category_name=db.DEFAULT_BOOKMARK_CATEGORY,
+        )
         current = existing["note"] if existing and existing.get("note") else ""
 
         def _apply(new_note: str | None) -> None:
@@ -4170,7 +4318,11 @@ class ClaudeSessions(App):
             # If the message isn't bookmarked yet, create one first so we have
             # an id to annotate. This makes `L` on an unbookmarked message
             # behave like "bookmark + note in one step".
-            row = db.get_bookmark(self.conn, uuid)
+            row = db.get_bookmark(
+                self.conn,
+                uuid,
+                category_name=db.DEFAULT_BOOKMARK_CATEGORY,
+            )
             if row is None:
                 row = db.toggle_bookmark(self.conn, uuid)
                 if row is None:
