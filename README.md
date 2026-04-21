@@ -1,25 +1,50 @@
 # ThreadHop
 
-Cross-session context manager for Claude Code.
+Persistent, searchable, cross-session memory for Claude Code — a TUI, a CLI, and a Claude Code plugin that share one SQLite store.
 
 ![ThreadHop](assets/demo.png)
 
-A terminal app that turns isolated Claude Code sessions into a connected workspace — browse transcripts, search across sessions, and carry context between them.
+Each Claude Code session ships as an isolated JSONL transcript. ThreadHop indexes them into SQLite with FTS5, runs a Haiku-powered sidecar that extracts TODOs and decisions per session, a reflector that surfaces decision conflicts across sibling sessions, and a handoff skill that compresses a session into a brief. The TUI is the main browser; most day-to-day capture happens from inside the Claude Code chat via `!threadhop …` bash passthrough or the `/threadhop:*` plugin commands.
+
+### What's in the box
+
+- **TUI** — two-column browser over `~/.claude/projects/**/*.jsonl`, with FTS search, bookmarks, status tags, message-range selection, AI-generated session titles.
+- **CLI** — `threadhop tag / bookmark / todos / decisions / observations / conflicts / observe`, all auto-detecting the current session from the parent process tree so they work inside a live `claude` chat.
+- **Observer + reflector** — background extractors that append structured JSONL per session and cross-compare decisions across sessions in a project (ADR-018 – ADR-020).
+- **Claude Code plugin** (`plugin/`) — `/threadhop:handoff` skill plus `/threadhop:observe`, `/threadhop:tag`, `/threadhop:bookmark` commands under the `/threadhop:` namespace.
 
 ## Install
 
-Requires macOS and [uv](https://github.com/astral-sh/uv). That's it.
+Requires macOS and [uv](https://github.com/astral-sh/uv). That's it — `uv run --script` handles Python and the `textual` + `pydantic` runtime deps on first invocation.
 
 ```bash
 ln -s /path/to/threadhop/threadhop ~/bin/threadhop
 ```
 
+See [INSTALL-macOS.md](INSTALL-macOS.md) for the step-by-step walkthrough.
+
 ## Usage
+
+### TUI
 
 ```bash
 threadhop                              # all sessions
 threadhop --project myproject          # filter by project
 threadhop --days 7                     # last 7 days only
+```
+
+### CLI
+
+All subcommands accept `--project` and `--session`; without them they auto-detect the current session.
+
+```bash
+threadhop tag <status>            # backlog | in_progress | in_review | done | archived
+threadhop bookmark [kind]         # bookmark | research — against the latest indexed message
+threadhop todos                   # open TODOs extracted by the observer
+threadhop decisions               # decisions extracted by the observer
+threadhop observations            # raw observation JSONL, newest first
+threadhop conflicts [--resolved]  # cross-session decision conflicts from the reflector
+threadhop observe [--once|--stop|--stop-all] [--watch-backend auto|poll|fsevents]
 ```
 
 ## Keybindings
@@ -261,19 +286,31 @@ already running for that session.
     }
     ```
 
+## Shipped recently
+
+- SQLite + FTS5 backend with assistant-chunk merging (ADR-003).
+- Observer sidecar with poll / fsevents watch backends and byte-offset resume (ADR-018, ADR-019).
+- Reflector cross-session conflict detection, with `conflict_reviews` for resolution state (ADR-020).
+- `/threadhop:handoff` skill plus `/threadhop:observe`, `/threadhop:tag`, `/threadhop:bookmark` plugin commands.
+- Chat-side `!threadhop bookmark` / `tag` / `observe` with parent-process session auto-detect.
+- Message-range selection (`v`), status cycling, archive toggle, day-scale age display, AI-generated session titles.
+
 ## Roadmap
 
-- Cross-session search (SQLite FTS5, per-keystroke)
-- Range selection (`v`), clipboard copy (`y`), and temp-file export (`e`) with source labels
-- Project memory — append-only ledger of decisions, TODOs, ADRs
-- Handoff generation — compress a session into a brief via `/threadhop:handoff`
-- Codex support
+- Phase 5 release polish — `marketplace.json`, interactive install verification, discoverability for `threadhop tag` no-args.
+- Broader bookmark categories beyond the current `bookmark` / `research` split.
+- Codex session support (currently Claude Code only).
 
-See [docs/DESIGN-DECISIONS.md](docs/DESIGN-DECISIONS.md) for the full architecture.
+See [docs/DESIGN-DECISIONS.md](docs/DESIGN-DECISIONS.md) for the full architecture and [docs/TASKS.md](docs/TASKS.md) for open work.
 
 ## Docs
 
-- [Origin & Attribution](docs/ORIGIN.md)
+- [Origin & Attribution](docs/ORIGIN.md) — what ThreadHop inherited from [thomasrice/claude-sessions](https://github.com/thomasrice/claude-sessions) and what's new
+- [Design Decisions](docs/DESIGN-DECISIONS.md) — ADRs, schema, phase plan
+- [Skill Packaging](docs/skill-packaging.md) — how the Claude Code plugin is wired
+- [Observational Memory](docs/observational-memory.md) — observer + reflector internals
+- [Performance](docs/PERFORMANCE.md)
+- [UI Improvements](docs/UI-IMPROVEMENTS.md)
 
 ## License
 
