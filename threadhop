@@ -9,6 +9,7 @@
 """ThreadHop — cross-session context manager for Claude Code"""
 
 import argparse
+import difflib
 import json
 import os
 import re
@@ -42,6 +43,9 @@ import handoff as handoff_mod  # noqa: E402
 import observation_queries  # noqa: E402
 import observer  # noqa: E402
 import search_queries  # noqa: E402
+
+
+__version__ = "0.1.0"
 
 
 def get_available_themes():
@@ -419,6 +423,19 @@ STATUS_CYCLE: list[str] = [s for s in STATUS_ORDER if s != "archived"]
 
 # Regex to strip <system-reminder>...</system-reminder> blocks from text
 SYSTEM_REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
+
+# Claude Code prepends <local-command-*> blocks to the first user message when
+# a session begins via a slash command or `!` bash passthrough. They are
+# metadata, not user content — strip before using the text as a sidebar title.
+LOCAL_COMMAND_RE = re.compile(
+    r"<local-command-(?:caveat|stdout|stderr)>.*?</local-command-(?:caveat|stdout|stderr)>",
+    re.DOTALL,
+)
+
+# Slash-command invocations surface as <command-name>/foo</command-name> plus
+# <command-message>/<command-args> siblings. Strip the tag markup but keep the
+# inner text so the title stays meaningful (e.g. "/reload-plugins").
+COMMAND_TAG_RE = re.compile(r"</?(?:command-name|command-message|command-args)>")
 
 
 # --- Command metadata registry (ADR-017, task #42) ---
@@ -3950,17 +3967,19 @@ class ClaudeSessions(App):
                                             content = msg.get("message", {}).get(
                                                 "content", ""
                                             )
-                                            if isinstance(content, str) and content.strip():
-                                                first_user_msg = content.strip()[:50]
-                                            elif isinstance(content, list):
+                                            if isinstance(content, list):
                                                 text_parts = [
                                                     b.get("text", "")
                                                     for b in content
                                                     if isinstance(b, dict)
                                                     and b.get("type") == "text"
                                                 ]
-                                                text = " ".join(text_parts).strip()
-                                                text = SYSTEM_REMINDER_RE.sub("", text).strip()
+                                                content = " ".join(text_parts)
+                                            if isinstance(content, str) and content.strip():
+                                                text = SYSTEM_REMINDER_RE.sub("", content)
+                                                text = LOCAL_COMMAND_RE.sub("", text)
+                                                text = COMMAND_TAG_RE.sub(" ", text)
+                                                text = " ".join(text.split())
                                                 if text:
                                                     first_user_msg = text[:50]
                                     if "cwd" in msg and not session_cwd:
@@ -5798,18 +5817,64 @@ def _run_tui(args):
     return 0
 
 
+class _SuggestingParser(argparse.ArgumentParser):
+    """ArgumentParser that offers a did-you-mean hint when the user supplies
+    an unknown subcommand or enum value. Example: `threadhop obsrve` →
+    \"unknown value 'obsrve'. Did you mean 'observe'?\"."""
+
+    _INVALID_CHOICE_RE = re.compile(
+        r"invalid choice: '([^']+)' \(choose from (.+?)\)"
+    )
+
+    def error(self, message):
+        match = self._INVALID_CHOICE_RE.search(message)
+        if match:
+            bad = match.group(1)
+            # argparse varies between "'a', 'b'" and "a, b" across Python
+            # versions — strip quotes after the split to handle both.
+            choices = [
+                c.strip().strip("'\"")
+                for c in match.group(2).split(",")
+                if c.strip()
+            ]
+            suggestion = difflib.get_close_matches(bad, choices, n=1, cutoff=0.6)
+            if suggestion:
+                self.print_usage(sys.stderr)
+                self.exit(
+                    2,
+                    f"{self.prog}: error: unknown value '{bad}'. "
+                    f"Did you mean '{suggestion[0]}'?\n",
+                )
+        super().error(message)
+
+
 def build_parser():
     # No-subcommand path keeps the original TUI flags (--project/--days/--all).
     # Subcommands route to CLI mode and share --project/--session via a parent
     # parser (ADR-011).
-    parser = argparse.ArgumentParser(
+    parser = _SuggestingParser(
         prog="threadhop",
         description=(
             "ThreadHop — Claude Code session browser.\n"
             "  No subcommand  → launch the TUI.\n"
             "  Subcommand     → CLI mode (tag, bookmark, todos, decisions, observations, conflicts)."
         ),
+        epilog=(
+            "Examples:\n"
+            "  threadhop                                  # launch the TUI\n"
+            "  threadhop --project myproject --days 7     # TUI, filtered by project\n"
+            "  threadhop tag in_progress                  # tag the current session\n"
+            "  threadhop observe --session abc123         # start the observer sidecar\n"
+            "  threadhop handoff abc123                   # produce a handoff brief\n"
+            "\n"
+            "Run `threadhop <command> --help` for subcommand-specific examples."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"threadhop {__version__}",
     )
     parser.add_argument(
         "--project",
@@ -5857,6 +5922,13 @@ def build_parser():
         parents=[shared],
         help="Tag a session with a status",
         description="Tag a session with a status (backlog, in_progress, in_review, done, archived).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  threadhop tag in_progress\n"
+            "  threadhop tag in_review --session abc123\n"
+            "  !threadhop tag done          # from inside a Claude Code session"
+        ),
     )
     tag_p.add_argument(
         "status",
@@ -5874,6 +5946,14 @@ def build_parser():
             "the current Claude Code session. `kind` stays intentionally "
             "narrow for now: bookmark (general keep-for-later) or research "
             "(deferred research follow-up)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  threadhop bookmark\n"
+            "  threadhop bookmark --note \"useful retry pattern\"\n"
+            "  threadhop bookmark research --note \"revisit this later\"\n"
+            "  threadhop bookmark --session abc123 --message <uuid>"
         ),
     )
     bookmark_p.add_argument(
@@ -5901,6 +5981,12 @@ def build_parser():
         parents=[shared],
         help="List open TODOs from project memory",
         description="List open TODOs. Use --project to filter.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  threadhop todos\n"
+            "  threadhop todos --project myproject"
+        ),
     )
 
     subparsers.add_parser(
@@ -5908,6 +5994,12 @@ def build_parser():
         parents=[shared],
         help="List decisions from project memory",
         description="List decisions. Use --project to filter.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  threadhop decisions\n"
+            "  threadhop decisions --project myproject"
+        ),
     )
 
     subparsers.add_parser(
@@ -5919,6 +6011,13 @@ def build_parser():
             "Reads per-session files under ~/.config/threadhop/observations/ "
             "and uses SQLite session metadata for --project filtering."
         ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  threadhop observations\n"
+            "  threadhop observations --session abc123\n"
+            "  threadhop observations --project myproject | jq '.topic'"
+        ),
     )
 
     conflicts_p = subparsers.add_parser(
@@ -5929,6 +6028,13 @@ def build_parser():
             "List decision conflicts detected by the reflector. "
             "Uses --project to filter and --resolved to mark the displayed "
             "conflicts as reviewed."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  threadhop conflicts\n"
+            "  threadhop conflicts --project myproject\n"
+            "  threadhop conflicts --resolved       # mark displayed conflicts as reviewed"
         ),
     )
     conflicts_p.add_argument(
@@ -5949,6 +6055,16 @@ def build_parser():
             "~/.config/threadhop/observations/<id>.jsonl, and triggers the "
             "reflector when enough new observations accumulate. Use --once "
             "for the old on-demand single-pass mode."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  threadhop observe --session abc123                 # start resident sidecar\n"
+            "  threadhop observe --session abc123 --once          # single extraction pass\n"
+            "  threadhop observe --session abc123 --stop          # stop this session's observer\n"
+            "  threadhop observe --stop-all                       # stop every running observer\n"
+            "  threadhop observe --session abc123 --model sonnet  # use a stronger extractor\n"
+            "  threadhop observe --session abc123 --reset         # wipe state and restart"
         ),
     )
     mode_group = observe_p.add_mutually_exclusive_group()
@@ -6037,6 +6153,13 @@ def build_parser():
             "CLI-managed key is `observe.enabled`, a durable flag for "
             "hook-driven observer auto-start."
         ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  threadhop config get observe.enabled\n"
+            "  threadhop config set observe.enabled true\n"
+            "  threadhop config set observe.enabled false"
+        ),
     )
     config_subparsers = config_p.add_subparsers(
         dest="config_command",
@@ -6075,6 +6198,14 @@ def build_parser():
             "skill shells out to this subcommand. Unlike `tag`/`observe`, "
             "handoff is always about a *different* session than the "
             "caller's — pass the session id explicitly."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  threadhop handoff abc123\n"
+            "  threadhop handoff abc123 --full         # rationale + transcript excerpts\n"
+            "  threadhop handoff abc123 --no-reflect   # debug: skip reflector pass\n"
+            "  /threadhop:handoff abc123               # from inside a Claude Code session"
         ),
     )
     handoff_p.add_argument(
