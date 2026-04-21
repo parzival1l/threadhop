@@ -61,6 +61,13 @@ MemoryType = Literal["decision", "todo", "done", "adr", "observation"]
 MemorySource = Literal["explicit", "auto"]
 """Whether a memory entry came from a human annotation or the auto-observer."""
 
+BookmarkKind = Literal["bookmark", "research"]
+"""Built-in bookmark classes for the initial chat-ingest pathway.
+
+Task #59 is expected to generalize this into SQL-backed category rows. Until
+then, keep this Literal and the CHECK in ``db.py`` in lockstep.
+"""
+
 
 # --- DB row shapes -------------------------------------------------------
 # One Pydantic model per SQL table. The model is the authoritative Python
@@ -114,18 +121,20 @@ class Message(BaseModel):
 
 
 class Bookmark(BaseModel):
-    """One row of the ``bookmarks`` table (created by the migration for task #18).
+    """One row of the ``bookmarks`` table.
 
-    ``tags`` is stored as a JSON-encoded string in SQL; this model exposes
-    the decoded list so callers don't round-trip JSON twice.
+    ``kind`` is intentionally narrow for the first chat-ingest pathway:
+    ``bookmark`` for general keep-for-later items and ``research`` for deferred
+    research follow-up. ``tags`` remains as a JSON-encoded string in SQL so the
+    later generalized-category work can layer on without rewriting every caller.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     id: int | None = None  # autoincrement — None when inserting
     message_uuid: str
-    session_id: str
-    label: str | None = None
+    note: str | None = None
+    kind: BookmarkKind = "bookmark"
     tags: list[str] = Field(default_factory=list)
     created_at: float
 

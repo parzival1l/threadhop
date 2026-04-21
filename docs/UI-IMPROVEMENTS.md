@@ -171,6 +171,107 @@ in Go — but ~90% of the functional ideas ship in Textual today.
 
 ---
 
+## Turn-as-unit transcript rendering
+
+Captured 2026-04-20 alongside the bookmark-FK crash fix.
+
+### What already landed (interim fix)
+
+The crash was resolved by two small id-layer changes in the renderer
+(`threadhop._parse_messages`) plus a defensive guard in
+`bookmark_toggle_selection`:
+
+- Consecutive assistant JSONL lines sharing a `message.id` now merge
+  into one assistant tuple tagged with the first chunk's uuid —
+  matching the indexer's rule (ADR-003).
+- `tool_use` widgets and `tool_result` widgets now inherit the
+  enclosing turn's canonical uuid instead of their own JSONL line's
+  uuid. `toolUseResult` user lines no longer flush the pending
+  assistant turn — they're mid-turn events.
+- `bookmark_toggle_selection` pre-checks the FK target with a SELECT,
+  dedups duplicate uuids within a selection, and shows a "skipped
+  (not indexed yet)" toast instead of crashing on any remaining
+  mismatch.
+
+Net effect: bookmarks now work on any widget inside an assistant turn
+(prose, tool call, tool result) because they all resolve to the same
+turn id — the one the indexer actually stores. This is
+**turn-as-unit semantics applied only to the identity layer**;
+rendering is still per-widget.
+
+### What's still open (visual refactor)
+
+**The unit of meaning in a Claude conversation is the turn, not the
+JSONL event.** Today the renderer walks the file line by line and
+emits one visible block per event — assistant prose, each tool use,
+each tool result — so a single conversational turn can explode into
+six or seven stacked blocks. In selection mode each fragment is a
+separate navigation stop, which makes long sessions feel bloated and
+makes range-selection for copy / export / bookmark awkward. Search,
+export, and the handoff skill all really want turn-shaped data too.
+
+The proposed structural change: treat everything between two genuine
+human messages as **one selectable block**. Internally the block
+still shows its structure (prose, dim `⚙ Reading …` lines for tool
+calls, notable tool results), but outwardly it is one unit with one
+id — the id of the turn's first assistant event, which is already
+what the indexer stores.
+
+### Open design questions (park until we pick this up)
+
+1. **Turn boundary.** Strictly "next genuine human message," or do
+   we also break on a sidechain spawn, session resume, or long idle
+   gap? Current instinct: only genuine human input ends a turn;
+   everything else stays inside the block. Explicitly call out
+   **sidechain spawns** — they're the only in-file event that marks
+   "main turn paused for something on the side," and their rendering
+   is already called out separately in pattern #10 (subagent split
+   panel). If we keep sidechains inside the parent turn, the split
+   panel still works; if we break turns on sidechain spawn, the
+   parent turn has to be reassembled for export.
+
+2. **Tool result inclusion.** Keep the current filter (show
+   "Found 12 files", "+3/-1 lines", errors; drop bare success) and
+   fold survivors into the turn block. Errors probably always visible.
+
+3. **Visual structure.** Flat flowing section (matches current
+   aesthetic, less code) vs. subtly-bordered card with collapsible
+   tool details (buys "hide tool calls" toggle, adds work). Ties into
+   density-toggle (#6).
+
+4. **Search jump target.** When an FTS hit lands inside a tool-call
+   snippet, jump to the enclosing turn block and highlight within —
+   same mechanism as jumping to a snippet inside a long prose
+   message, just widened.
+
+### Scope implications if/when adopted
+
+- Renderer: replace per-line emission with a turn composer that
+  buffers events until the next genuine user message.
+- Indexer: already merges assistant text + tool-call abbreviations;
+  consider folding surviving tool-result summaries so the row text
+  matches what the user sees inside the turn block. Row identity
+  (first-assistant-event uuid) is unchanged.
+- Selection / bookmarks / copy / export: one widget = one target, so
+  these simplify rather than complicate.
+- Live-turn edge case: when the assistant is mid-turn during a
+  refresh, the block is incomplete and trailing events keep
+  arriving. The renderer must re-compose in-progress turns without
+  flickering or losing scroll position. This is where the 5-second
+  refresh interacts — design for it, don't discover it.
+
+### Payoff
+
+- Selection mode matches the user's mental model ("one reply = one
+  thing"), not the file format's event model.
+- Observer / reflector / handoff skill already think in turns and
+  decisions — aligning the renderer and indexer closes the last
+  semantic seam across the app.
+- The bookmark FK can never drift out of sync again, because only
+  one id per turn is ever exposed.
+
+---
+
 ## Sources
 
 Agentic CLI / TUI:
