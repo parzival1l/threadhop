@@ -1,0 +1,87 @@
+name: Release
+
+# Fires on every push to main. If `__version__` changed vs the previous
+# commit, cut a git tag `vX.Y.Z` and create a matching GitHub Release
+# whose body is auto-extracted from the matching CHANGELOG.md section.
+# No-ops silently when the version is unchanged.
+#
+# Why key off `__version__` (not commit messages or manual tags)?
+# Because the bump is already visible in PR review — reviewers see it
+# in the diff alongside the CHANGELOG entry, so we never accidentally
+# release something unreviewed. See RELEASE.md.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write   # needed to create tags + releases via GITHUB_TOKEN
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need HEAD~1 to diff __version__ against the previous state.
+          fetch-depth: 2
+
+      - name: Detect version change
+        id: ver
+        run: |
+          set -euo pipefail
+          NEW=$(grep -oE '^__version__ = "[^"]+"' threadhop | head -1 | cut -d'"' -f2)
+          OLD=$(git show HEAD~1:threadhop 2>/dev/null \
+                | grep -oE '^__version__ = "[^"]+"' | head -1 | cut -d'"' -f2 \
+                || echo "")
+          echo "new=$NEW" >> "$GITHUB_OUTPUT"
+          echo "old=$OLD" >> "$GITHUB_OUTPUT"
+          if [ -n "$NEW" ] && [ "$NEW" != "$OLD" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Version changed $OLD -> $NEW; proceeding to release."
+          else
+            echo "::notice::No version change (current=$NEW); skipping release."
+          fi
+
+      - name: Refuse if tag already exists
+        if: steps.ver.outputs.changed == 'true'
+        run: |
+          V="${{ steps.ver.outputs.new }}"
+          if git ls-remote --tags origin | grep -qE "refs/tags/v${V}$"; then
+            echo "::error::Tag v${V} already exists. Aborting to avoid overwrite."
+            exit 1
+          fi
+
+      - name: Extract CHANGELOG section for this version
+        if: steps.ver.outputs.changed == 'true'
+        id: notes
+        run: |
+          set -euo pipefail
+          V="${{ steps.ver.outputs.new }}"
+          # Grab the block between `## [V]` and the next `## [` header.
+          NOTES=$(awk -v v="$V" '
+            $0 ~ "^## \\[" v "\\]" { p=1; next }
+            p && $0 ~ "^## \\[" { exit }
+            p { print }
+          ' CHANGELOG.md)
+          if [ -z "$(echo "$NOTES" | tr -d '[:space:]')" ]; then
+            echo "::error::CHANGELOG.md has no '## [${V}]' entry. Add one before bumping __version__."
+            exit 1
+          fi
+          {
+            echo "body<<CHANGELOG_EOF"
+            echo "$NOTES"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create tag and release
+        if: steps.ver.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          V="${{ steps.ver.outputs.new }}"
+          gh release create "v${V}" \
+            --target "${{ github.sha }}" \
+            --title "v${V}" \
+            --notes "${{ steps.notes.outputs.body }}"
+          echo "::notice::Released v${V}"

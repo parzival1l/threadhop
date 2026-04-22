@@ -1,0 +1,63 @@
+name: Validate
+
+# Runs on every PR targeting main or docs/adr. Exposes a `validate`
+# status check that branch protection can require before merge.
+#
+# Checks (fast — no real test runtime yet):
+#   1. Python syntax of threadhop + tui.py
+#   2. Version parity across threadhop / marketplace.json / plugin.json
+#   3. CHANGELOG.md has a matching entry for the current __version__
+#   4. pytest, if tests/ exists
+#
+# These catch exactly the classes of bugs we've hit in practice:
+# version mismatches between the script and plugin manifests, and
+# version bumps without a paired CHANGELOG entry.
+
+on:
+  pull_request:
+    branches: [main, docs/adr]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python syntax (threadhop, tui.py)
+        run: |
+          python3 -c "import ast; ast.parse(open('threadhop').read())"
+          python3 -c "import ast; ast.parse(open('tui.py').read())"
+
+      - name: Version parity (threadhop / marketplace.json / plugin.json)
+        run: |
+          set -euo pipefail
+          TH=$(grep -oE '^__version__ = "[^"]+"' threadhop | head -1 | cut -d'"' -f2)
+          MP=$(python3 -c "import json; print(json.load(open('.claude-plugin/marketplace.json'))['plugins'][0]['version'])")
+          PL=$(python3 -c "import json; print(json.load(open('plugin/.claude-plugin/plugin.json'))['version'])")
+          echo "threadhop=$TH  marketplace.json=$MP  plugin.json=$PL"
+          if [ "$TH" != "$MP" ] || [ "$TH" != "$PL" ]; then
+            echo "::error::Version mismatch — all three must agree (see RELEASE.md)."
+            exit 1
+          fi
+
+      - name: CHANGELOG entry exists for current __version__
+        run: |
+          set -euo pipefail
+          V=$(grep -oE '^__version__ = "[^"]+"' threadhop | head -1 | cut -d'"' -f2)
+          if ! grep -qE "^## \[$V\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md is missing a '## [$V]' entry."
+            exit 1
+          fi
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Run pytest if tests/ exists
+        run: |
+          if [ -d tests ] && [ -n "$(ls -A tests 2>/dev/null)" ]; then
+            uv run --with pytest --with rich --with textual \
+                   --with watchdog --with pydantic \
+                   python -m pytest -q tests/
+          else
+            echo "::notice::No tests/ directory with contents — skipping pytest."
+          fi
