@@ -3779,6 +3779,25 @@ class ClaudeSessions(App):
         # deterministic in tests that don't emit focus events.
         self.refresh_footer()
 
+        # 24h startup update check (ADR-027). Gates (env / TTY / cache /
+        # not-inside-claude) run inside `_check_for_update`; if a newer
+        # release is out, surface it as a transient toast. Wrapped in a
+        # broad try/except because a version check must never break the
+        # TUI — the helper already swallows network errors, this catches
+        # anything else.
+        try:
+            update_info = _check_for_update()
+        except Exception:
+            update_info = None
+        if update_info is not None:
+            self.notify(
+                f"ThreadHop {update_info.latest} available — "
+                "run `threadhop update`.",
+                title="Update available",
+                severity="information",
+                timeout=10,
+            )
+
     def update_titles(self) -> None:
         filter_info = ""
         if self.project_filter:
