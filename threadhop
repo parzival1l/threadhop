@@ -39,7 +39,7 @@ import search_queries  # noqa: E402
 sys.modules.setdefault("threadhop", sys.modules[__name__])
 
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 
 # Update-check surface (ADR-027). Cache only holds mtime — contents are

@@ -4,6 +4,35 @@ All notable changes to ThreadHop are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions
 follow `major.minor.patch`.
 
+## [0.2.1] — 2026-04-22
+
+### Added
+- `threadhop copy [N|all]` — copy the last N rendered turns (default
+  `1`, `all` for the whole session) of the current session to the
+  macOS clipboard as markdown. Sidechains, tool calls, tool results,
+  thinking blocks, `<system-reminder>` tags, and Claude Code harness
+  wrappers (`<bash-input>`, `<bash-stdout>`, `<bash-stderr>`,
+  `<local-command-caveat>`, `<command-name>`, `<command-message>`,
+  `<command-args>`) are stripped so the paste reads as conversation.
+  Uses `indexer.parse_messages(include_tool_calls=False)` — the same
+  cleaning pipeline the TUI renders — so the output is deterministic
+  and byte-reproducible across invocations. Prints only a one-line
+  `✓ copied N turns (≈W words) to clipboard.` confirmation; the
+  payload is never echoed to stdout (defeats the point of reducing
+  context). Falls back to dumping to
+  `/tmp/threadhop/<sid>-copy-<ts>.md` and copying the *path* if
+  `pbcopy` is unavailable.
+- `/threadhop:copy [N|all]` plugin command — one-line bash passthrough
+  into `threadhop copy`, matching the existing `/threadhop:tag` /
+  `/threadhop:bookmark` pattern. Auto-detects the host session via
+  the same parent-process resolver the other plugin commands use.
+
+### Notes
+- Python module is `copier.py`, not `copy.py`, to avoid losing the
+  import race against stdlib `copy` (pytest and anything transitive
+  through `copy.deepcopy` preload `sys.modules['copy']`). The CLI
+  subcommand and plugin command are still spelled `copy`.
+
 ## [0.2.0] — 2026-04-22
 
 ### Added
