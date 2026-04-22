@@ -128,12 +128,22 @@ def _extract_user_text(msg: dict) -> str | None:
     return text or None
 
 
-def _extract_assistant_blocks(msg: dict) -> list[str]:
+def _extract_assistant_blocks(
+    msg: dict,
+    *,
+    include_tool_calls: bool = True,
+) -> list[str]:
     """Return the text + abbreviated-tool-call snippets for one assistant line.
 
     ``thinking`` blocks are intentionally dropped — they aren't rendered
     in the TUI and wouldn't help keyword search. The resulting list is
     joined by the caller into the final indexed text.
+
+    ``include_tool_calls=False`` drops ``tool_use`` blocks entirely
+    rather than abbreviating them — used by the ``copy`` command so
+    pasted transcripts contain only human-visible prose. Default
+    preserves the indexer/TUI/observer behaviour. Config-driven control
+    over this knob is tracked in issue #63.
     """
     content = msg.get("message", {}).get("content", [])
     if not isinstance(content, list):
@@ -147,7 +157,7 @@ def _extract_assistant_blocks(msg: dict) -> list[str]:
             t = strip_system_reminders(block.get("text", ""))
             if t:
                 out.append(t)
-        elif btype == "tool_use":
+        elif btype == "tool_use" and include_tool_calls:
             out.append(
                 abbreviate_tool_use(
                     block.get("name", "Unknown"),
@@ -161,7 +171,11 @@ def _extract_assistant_blocks(msg: dict) -> list[str]:
 # --- Streaming parse -----------------------------------------------------
 
 
-def parse_messages(jsonl_path: Path) -> Iterator[dict]:
+def parse_messages(
+    jsonl_path: Path,
+    *,
+    include_tool_calls: bool = True,
+) -> Iterator[dict]:
     """Yield rows ready for insertion into the ``messages`` table.
 
     Consecutive assistant lines sharing the same ``message.id`` are
@@ -172,6 +186,11 @@ def parse_messages(jsonl_path: Path) -> Iterator[dict]:
 
     Malformed JSON lines are silently skipped — one corrupt line should
     not abort indexing the rest of the file.
+
+    ``include_tool_calls`` is forwarded to ``_extract_assistant_blocks``.
+    Defaults to ``True`` so indexer/TUI/observer callers are unaffected;
+    ``copy.py`` passes ``False`` for clean-prose-only rendering (see
+    issue #63 for config-driven evolution).
     """
     # Buffer state for in-flight assistant message merging.
     buf_mid: str | None = None
@@ -240,7 +259,9 @@ def parse_messages(jsonl_path: Path) -> Iterator[dict]:
 
             # --- assistant line ---
             mid = msg.get("message", {}).get("id")
-            parts = _extract_assistant_blocks(msg)
+            parts = _extract_assistant_blocks(
+                msg, include_tool_calls=include_tool_calls,
+            )
 
             # Streaming chunk of the current logical message → append.
             if mid is not None and buf_mid == mid and buf_row is not None:

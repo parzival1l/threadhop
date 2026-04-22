@@ -9,6 +9,12 @@ import db
 
 
 def _load_threadhop_module():
+    # Load the `threadhop` script so its line-39 `sys.modules.setdefault`
+    # registers it under the plain name "threadhop". That makes `import tui`
+    # (whose first line is `import threadhop as _core`) resolve — tui.py
+    # then re-exports script symbols *and* adds TUI-only functions like
+    # `render_session_label_text`. Returning `tui` gives the tests one
+    # reference that covers both surfaces.
     path = Path(__file__).resolve().parent.parent / "threadhop"
     loader = SourceFileLoader("threadhop_app", str(path))
     spec = importlib.util.spec_from_loader("threadhop_app", loader)
@@ -17,7 +23,8 @@ def _load_threadhop_module():
     sys.modules.setdefault("threadhop_app", module)
     assert spec.loader is not None
     spec.loader.exec_module(module)
-    return module
+    import tui  # noqa: PLC0415 — deferred until the script is registered.
+    return tui
 
 
 def test_get_session_sidebar_metadata_marks_observed_sessions(conn):

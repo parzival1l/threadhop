@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-import runpy
+import importlib.util
+import sys
 import time
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 import db
@@ -14,7 +16,22 @@ THREADHOP = ROOT / "threadhop"
 
 
 def _load_threadhop_ns() -> dict:
-    return runpy.run_path(str(THREADHOP))
+    # Symbols this suite touches (`build_observe_command`,
+    # `render_session_label_text`, `ClaudeSessions`, `OBSERVATION_MARKER`,
+    # `_supports_observation_emoji`, `OBSERVATION_MARKER_FALLBACK`) all
+    # live in tui.py or are re-exported into it. Loading the script
+    # primes `sys.modules["threadhop"]` via its own setdefault, then
+    # `import tui` resolves and returns a namespace that covers every
+    # symbol the tests reach for.
+    module_name = "threadhop_app"
+    if module_name not in sys.modules:
+        loader = SourceFileLoader(module_name, str(THREADHOP))
+        spec = importlib.util.spec_from_loader(module_name, loader)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        loader.exec_module(module)
+    import tui  # noqa: PLC0415 — deferred until the script is registered.
+    return tui.__dict__
 
 
 class _FakeItem:

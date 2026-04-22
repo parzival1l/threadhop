@@ -11,6 +11,11 @@ import db
 
 
 def _load_threadhop_module():
+    # Load the script so its line-39 `sys.modules.setdefault("threadhop", …)`
+    # fires and `import tui` can resolve its `from threadhop import *`.
+    # Keep the script reference (`threadhop`) for monkeypatching CLI-side
+    # helpers like `save_app_config` — their callers' `__globals__` point
+    # at the script's dict, so patching through `tui` would miss.
     root = Path(__file__).resolve().parents[1]
     path = root / "threadhop"
     module_name = "threadhop_script_test"
@@ -24,6 +29,7 @@ def _load_threadhop_module():
 
 
 threadhop = _load_threadhop_module()
+import tui  # noqa: E402  — TUI surface (`_build_fts_query`, `search_messages`).
 
 
 def _seed_message(
@@ -56,7 +62,7 @@ def _seed_message(
 
 
 def test_build_fts_query_supports_scope_and_date_filters():
-    spec = threadhop._build_fts_query(
+    spec = tui._build_fts_query(
         "project:atlas session:current since:2026-04-01 until:2026-04-10 "
         "user: rate-limit retries",
         current_session_id="sess-current",
@@ -102,14 +108,14 @@ def test_search_messages_pages_current_session_results(conn):
         timestamp="2026-04-18T13:00:00Z",
     )
 
-    page1 = threadhop.search_messages(
+    page1 = tui.search_messages(
         conn,
         "session:current alpha",
         limit=2,
         offset=0,
         current_session_id="sess-a",
     )
-    page2 = threadhop.search_messages(
+    page2 = tui.search_messages(
         conn,
         "session:current alpha",
         limit=2,
@@ -143,7 +149,7 @@ def test_search_messages_boosts_exact_phrase_over_recent_prefix_match(conn):
         timestamp="2026-04-19T12:00:00Z",
     )
 
-    page = threadhop.search_messages(conn, "rate limit", limit=10)
+    page = tui.search_messages(conn, "rate limit", limit=10)
 
     assert page.total_count == 2
     assert [row["uuid"] for row in page.rows[:2]] == ["old-exact", "new-prefix"]
