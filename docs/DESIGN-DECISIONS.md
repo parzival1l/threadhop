@@ -1292,6 +1292,250 @@ Press O (shift) → "Resume observing? (y/n)"
 
 ---
 
+### ADR-027: Update lifecycle — `threadhop update`, `changelog`, `future`, and 24h startup check
+
+**Context:** ThreadHop is distributed as a git checkout (via `install.sh`
+curl-bash or manual clone) with no package manager brokering versions.
+Once installed, nothing tells the user that new commits exist on `main`,
+and there is no built-in command to pull them — the only path today is
+re-running the curl-bash installer, which is undiscoverable and relies
+on the user remembering the URL. The Claude Code plugin surface has its
+own update channel (owned by Claude Code's `/plugin` subsystem, out of
+scope here). This ADR defines the CLI-side update story only.
+
+**Decision:** Introduce three CLI subcommands plus a startup version
+check:
+
+1. **`threadhop update [--to <ref>] [--check]`** — pull latest `main` by
+   default, or roll back to a specific git ref with `--to`, or report
+   without pulling with `--check`.
+2. **`threadhop changelog`** — print the repo's `CHANGELOG.md`, falling
+   back to fetching `raw.githubusercontent.com/.../main/CHANGELOG.md` if
+   the local file is missing (e.g. the user is on a version that
+   predates the changelog surface).
+3. **`threadhop future`** — print the top five entries from a new
+   `ROADMAP.md` at repo root. Unconditional top-5; no tagging, filtering,
+   or priority scoring.
+4. **Startup version check** — at `main()` entry (CLI) and `on_mount`
+   (TUI), cheaply compare the installed `__version__` against the latest
+   GitHub release tag. If newer, print a nudge (CLI) or toast (TUI).
+
+The mechanism is entirely explicit: no background auto-update, no daemon.
+Users only get new code by running `threadhop update` (or re-running the
+installer), and they only see version nudges when they're actively
+invoking the tool.
+
+**Subcommand shapes:**
+
+```bash
+threadhop update                   # git fetch && git reset --hard origin/main
+threadhop update --check           # compare versions, print, exit 0
+threadhop update --to v0.1.0       # roll back to a tag, branch, or SHA
+threadhop changelog                # print CHANGELOG.md (paginated via less if TTY)
+threadhop future                   # print top 5 ROADMAP.md entries
+```
+
+No flag-form alias (`threadhop --update`) — the subcommand shape is
+required because `--to <ref>` needs an argument, and flag-with-argument
+grammar is awkward.
+
+**Startup check semantics — four gates before printing anything:**
+
+```
+1. TTY gate       stdout.isatty() AND stderr.isatty() must be True.
+                  Protects pipelines (threadhop observations | jq).
+2. Context gate   Must NOT be running inside a Claude Code session.
+                  Detected via parent-process walk (same helper as
+                  `_resolve_cli_session` from task #17). Protects plugin
+                  invocations and `!threadhop` bash passthrough.
+3. Cache gate     ~/.cache/threadhop/last_check mtime must be older than
+                  24 hours. On pass, touch the file.
+4. Env gate       $THREADHOP_NO_UPDATE_CHECK must not be set (opt-out).
+```
+
+Only when all four pass does the tool perform a 1-second-timeout HTTP
+GET against `api.github.com/repos/parzival1l/threadhop/releases/latest`.
+Any network error, JSON error, or unparseable tag format is swallowed
+silently — a version check must never break the CLI.
+
+**Notification shape — CLI:**
+
+```
+ThreadHop 0.2.0 is available (you have 0.1.0).
+  What's new:  threadhop changelog
+  Update:      threadhop update
+```
+
+Three lines, stderr, printed exactly once per session (first CLI command
+of the day after cache expiry). No plugin-update hint — plugin lifecycle
+is Claude Code's responsibility.
+
+**Notification shape — TUI:**
+
+```python
+# In ClaudeSessions.on_mount():
+if info := _check_for_update():
+    self.notify(
+        f"ThreadHop {info.latest} available — run `threadhop update`.",
+        title="Update available",
+        severity="information",
+        timeout=10,
+    )
+```
+
+Transient toast in the top-right corner (Textual's native `notify`
+pattern). Auto-dismiss after 10 seconds. Does not resize the layout or
+steal focus.
+
+**Where the notification does NOT appear:**
+
+- Inside Claude Code plugin commands (`/threadhop:tag`, etc.) — context
+  gate suppresses it, because a plugin user may fire many commands
+  within a session and the 24h cache only arms once per session.
+- Inside `!threadhop …` bash passthrough in Claude Code — same gate.
+- In non-TTY contexts (CI, `threadhop ... | jq`, etc.) — TTY gate.
+- When `$THREADHOP_NO_UPDATE_CHECK=1` — env gate.
+
+**`threadhop future` — format contract:**
+
+`ROADMAP.md` at repo root, format:
+
+```markdown
+# ThreadHop Roadmap
+
+- #NN — Short description line that renders well in CLI.
+- #NN — Another item.
+...
+```
+
+Parser rules:
+- Lines matching `^- #(\d+) — (.+)$` become roadmap entries.
+- The first five matching lines are printed, in file order.
+- Everything else (headers, prose, blank lines) is ignored.
+
+Output shape:
+
+```
+ThreadHop — what's coming up:
+
+  #NN  Short description line that renders well in CLI.
+  #NN  Another item.
+  ...
+
+Full roadmap:
+  https://github.com/parzival1l/threadhop/blob/main/ROADMAP.md
+```
+
+Implementation: read from the installed repo's `ROADMAP.md`. No network
+call. Users on pinned old versions see that version's roadmap; that's
+acceptable because `threadhop update` brings the roadmap forward.
+
+**`threadhop changelog` — format contract:**
+
+`CHANGELOG.md` at repo root, Keep-a-Changelog style:
+
+```markdown
+# Changelog
+
+## [0.2.0] — 2026-05-01
+### Added
+- `threadhop update` subcommand
+- 24h startup version check
+
+## [0.1.0] — 2026-04-20
+- Initial release.
+```
+
+No parsing — the file is printed verbatim through `less -R` if stdout
+is a TTY, raw otherwise. Users can read per-version sections by
+scrolling.
+
+**Version comparison — simple tuple compare:**
+
+```python
+def _parse_version(v: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in v.lstrip("v").split("."))
+```
+
+Assumes `major.minor.patch` with integer components. Tag names with
+suffixes (`v0.2.0-rc1`) will raise; the caller treats that as "check
+failed" and falls back silently. Acceptable until the project actually
+ships pre-releases.
+
+**Plugin updates — explicitly out of scope:**
+
+Claude Code's `/plugin` subsystem owns plugin lifecycle. Users update
+the plugin via `/plugin update threadhop` (or whatever Claude Code's
+equivalent is). ThreadHop's CLI does not try to push plugin updates,
+does not warn plugin users about CLI updates (they see the notice when
+they next run the CLI directly), and does not synchronize the two
+surfaces' versions. The plugin's own `version` field in
+`.claude-plugin/marketplace.json` is bumped manually on each release as
+part of the CLI release discipline.
+
+**Release discipline — what the maintainer does on each release:**
+
+1. Update `CHANGELOG.md` with a new version header and bullet list.
+2. Bump `__version__` in `threadhop`.
+3. Bump the plugin `version` field in `.claude-plugin/marketplace.json`
+   and `plugin/.claude-plugin/plugin.json`.
+4. Commit everything.
+5. Cut a git tag: `git tag v0.2.0 && git push --tags`.
+6. (Optional later) GitHub Releases auto-populate from tags.
+
+Without step 5, the startup check has nothing to compare against and
+silently degrades to no-op. This is acceptable: missing tags means no
+false-positive "update available" notifications, just no notifications
+at all.
+
+**Rationale:**
+- **Re-running curl-bash works but is undiscoverable** — users install
+  once, never see the URL again. A `threadhop update` surface gives
+  them an ergonomic second update path without replacing the first.
+- **Startup check is the ambient discovery channel** — users don't have
+  to remember to check for updates; the tool reminds them once per day,
+  unobtrusively. 24h cooldown bounds network traffic and prevents
+  notification fatigue.
+- **Suppress inside Claude Code** because plugin users may invoke
+  commands dozens of times per day; a 24h cache still means dozens of
+  plugin messages per year get an unsolicited upgrade nudge. Cleaner to
+  only nudge when they're deliberately at the CLI.
+- **Rollback via `--to`** honors the user's stated "users can go back
+  to older versions if they want" requirement. Covers bug-regression
+  scenarios at zero extra cost.
+- **Top-5 roadmap with simple format** is intentionally dumb — it's a
+  view into an existing file, not a ranking engine. If the format ever
+  needs to get smarter (priorities, categories), it can grow later.
+  Keeping the contract narrow means `ROADMAP.md` stays maintainable by
+  hand.
+- **Plugin updates delegated to Claude Code** because cross-tool
+  lifecycle coordination is a rat-hole. Claude Code has first-party
+  update machinery; ThreadHop should not try to replicate or wrap it.
+
+**Rejected:**
+- **Background auto-update** — reputation-shredding antipattern; users
+  hate when their CLI version silently changes.
+- **Flag form `threadhop --update`** — can't carry `--to <ref>` cleanly.
+- **Notification inside Claude Code plugin invocations** — would pollute
+  hundreds of plugin messages per week for active users.
+- **Preemptive plugin-update hint in the CLI notification** — two
+  surfaces, two update channels; co-mixing them in one message adds
+  noise more than clarity.
+- **Using `docs/TASKS.md` as the roadmap source** — `TASKS.md` is being
+  removed from `main` (maintained out-of-band going forward). A
+  dedicated `ROADMAP.md` with a narrow format contract is more stable.
+- **SHA-based "did main change?" comparison** — loses semantic
+  versioning and gives no changelog anchor. Requires users to trust
+  that any commit is a valid "update."
+- **Notification in a persistent footer badge** — competes with
+  `ContextualFooter` (ADR-017) and stays visible forever. A transient
+  toast is temporally scoped to the session it actually matters for.
+- **Updating CLI and plugin in lockstep via `threadhop update`** —
+  reaches across to Claude Code's plugin cache, which is not ours to
+  touch.
+
+---
+
 ## Implementation Plan
 
 ### Phase 1: SQLite Foundation + Session Tags + Archive

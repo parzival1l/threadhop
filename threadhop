@@ -17,6 +17,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -38,7 +39,28 @@ import search_queries  # noqa: E402
 sys.modules.setdefault("threadhop", sys.modules[__name__])
 
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
+
+
+# Update-check surface (ADR-027). Cache only holds mtime — contents are
+# unused — so a single `touch` per run bounds GitHub API traffic to at
+# most one call per machine per 24h, even on network failure.
+UPDATE_REPO = "parzival1l/threadhop"
+UPDATE_REPO_URL = f"https://github.com/{UPDATE_REPO}"
+UPDATE_RELEASES_API = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
+UPDATE_RAW_CHANGELOG = f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/CHANGELOG.md"
+UPDATE_CACHE_DIR = Path.home() / ".cache" / "threadhop"
+UPDATE_CACHE_FILE = UPDATE_CACHE_DIR / "last_check"
+UPDATE_CHECK_INTERVAL_S = 24 * 60 * 60
+UPDATE_FETCH_TIMEOUT_S = 1.0
+
+
+@dataclass(frozen=True)
+class UpdateInfo:
+    """Result of the version check — only constructed when latest > current."""
+
+    latest: str   # already stripped of a leading `v`
+    current: str
 
 
 def get_available_themes():
@@ -429,6 +451,16 @@ LOCAL_COMMAND_RE = re.compile(
 # <command-message>/<command-args> siblings. Strip the tag markup but keep the
 # inner text so the title stays meaningful (e.g. "/reload-plugins").
 COMMAND_TAG_RE = re.compile(r"</?(?:command-name|command-message|command-args)>")
+
+# Every `claude -p` invocation by the observer/reflector pipelines opens its
+# own Claude Code session — which then shows up as a JSONL file under
+# ~/.claude/projects/. Filter those out of the session list by matching the
+# distinctive first-line header of the prompt templates (prompts/observer.md,
+# prompts/reflector.md). Keep in sync with those prompt templates.
+OBSERVER_SUBPROCESS_SIGNATURES: tuple[str, ...] = (
+    "# ThreadHop Observer Prompt",
+    "# ThreadHop Reflector Prompt",
+)
 
 
 # --- Command metadata registry (ADR-017, task #42) ---
@@ -831,6 +863,134 @@ def detect_project_from_cwd() -> str | None:
         if path == Path.home():
             break
     return None
+
+
+def _invoked_from_claude_code() -> bool:
+    """True if a `claude` CLI process is an ancestor of this one.
+
+    Shares the ``ps``-based parent-chain walk with
+    ``detect_current_session_id`` but only cares about *presence* — we
+    don't need to resolve a session id, just gate the update-check
+    notice so plugin invocations (``/threadhop:tag``) and
+    ``!threadhop …`` bash passthroughs stay quiet (ADR-027).
+    """
+    try:
+        result = subprocess.run(
+            ["ps", "-eo", "pid,ppid,args"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return False
+
+    procs: dict[int, tuple[int, str]] = {}
+    for line in result.stdout.strip().split("\n")[1:]:  # skip header
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        procs[pid] = (ppid, parts[2])
+
+    pid = os.getpid()
+    visited: set[int] = set()
+    while pid and pid > 0 and pid not in visited:
+        visited.add(pid)
+        entry = procs.get(pid)
+        if not entry:
+            break
+        ppid, args = entry
+        is_claude, _ = _parse_claude_process_args(args)
+        if is_claude:
+            return True
+        pid = ppid
+    return False
+
+
+def _parse_version(v: str) -> tuple[int, ...]:
+    """Parse ``v0.2.0`` / ``0.2.0`` into ``(0, 2, 0)``. Raises on bad input."""
+    return tuple(int(x) for x in v.lstrip("v").split("."))
+
+
+def _fetch_latest_release_tag() -> str | None:
+    """GET the latest release tag, or None on any failure. 1s timeout."""
+    import urllib.request  # local import keeps CLI cold-start cheap
+    req = urllib.request.Request(
+        UPDATE_RELEASES_API,
+        headers={"Accept": "application/vnd.github+json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=UPDATE_FETCH_TIMEOUT_S) as resp:
+            data = json.load(resp)
+    except Exception:
+        return None
+    tag = data.get("tag_name")
+    return tag if isinstance(tag, str) and tag else None
+
+
+def _check_for_update(*, force: bool = False) -> "UpdateInfo | None":
+    """Return ``UpdateInfo`` if a newer release is out; ``None`` otherwise.
+
+    Four gates (ADR-027) — env, TTY, context, cache — stop the check
+    early when ``force`` is False. ``force=True`` is reserved for
+    ``threadhop update --check`` where the user explicitly asked for
+    the check and we should ignore all four.
+    Any failure path returns ``None`` silently; a version check must
+    never break the CLI.
+    """
+    if not force:
+        # Env / TTY / context / cache gates apply only to the ambient
+        # startup check. `threadhop update --check` is an explicit user
+        # request and should always hit the network, so it passes
+        # `force=True` and skips all four.
+        if os.environ.get("THREADHOP_NO_UPDATE_CHECK"):
+            return None
+        if not (sys.stdout.isatty() and sys.stderr.isatty()):
+            return None
+        if _invoked_from_claude_code():
+            return None
+        try:
+            last = UPDATE_CACHE_FILE.stat().st_mtime
+            if time.time() - last < UPDATE_CHECK_INTERVAL_S:
+                return None
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return None
+
+    tag = _fetch_latest_release_tag()
+
+    # Touch cache even on fetch failure: we're caching the attempt, not
+    # the result. Prevents a network outage from re-trying GitHub on
+    # every single CLI invocation for the next 24h.
+    try:
+        UPDATE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        UPDATE_CACHE_FILE.touch()
+    except OSError:
+        pass
+
+    if not tag:
+        return None
+    try:
+        latest_v = _parse_version(tag)
+        current_v = _parse_version(__version__)
+    except (ValueError, AttributeError):
+        return None
+    if latest_v <= current_v:
+        return None
+    return UpdateInfo(latest=tag.lstrip("v"), current=__version__)
+
+
+def _print_cli_update_notice(info: UpdateInfo) -> None:
+    """Three-line stderr nudge (ADR-027 notification shape — CLI)."""
+    print(
+        f"\nThreadHop {info.latest} is available (you have {info.current}).\n"
+        f"  What's new:  threadhop changelog\n"
+        f"  Update:      threadhop update\n",
+        file=sys.stderr,
+    )
 
 
 def _cli_stub(command):
@@ -1425,6 +1585,85 @@ def build_parser():
         ),
     )
 
+    update_p = subparsers.add_parser(
+        "update",
+        help="Update the installed ThreadHop checkout",
+        description=(
+            "Refresh the installed ThreadHop checkout in place. With no "
+            "flags, runs `git fetch` + `git reset --hard origin/main` "
+            "inside the repo that contains the running script. "
+            "`--to <ref>` pins to any git ref (tag, branch, SHA) for "
+            "rollback. `--check` reports without pulling. Refuses to "
+            "run against a dirty working tree unless `--force` is "
+            "passed, because `reset --hard` would silently discard "
+            "uncommitted work. The Claude Code plugin is updated "
+            "separately via `/plugin update threadhop` — ADR-027."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  threadhop update                 # pull latest origin/main\n"
+            "  threadhop update --check         # report without pulling\n"
+            "  threadhop update --to v0.1.0     # pin to a tag\n"
+            "  threadhop update --to 1efdcf5    # pin to a specific SHA\n"
+            "  threadhop update --force         # override the dirty-tree guard"
+        ),
+    )
+    update_p.add_argument(
+        "--to",
+        type=str,
+        default=None,
+        metavar="<ref>",
+        help="Git ref to check out (tag, branch, or SHA). Defaults to origin/main.",
+    )
+    update_p.add_argument(
+        "--check",
+        action="store_true",
+        default=False,
+        help="Only report whether an update is available; do not pull.",
+    )
+    update_p.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help=(
+            "Override the dirty-tree / non-main-branch safety guard. "
+            "Only use this if you're sure you want to discard "
+            "uncommitted changes in the installed checkout."
+        ),
+    )
+
+    subparsers.add_parser(
+        "changelog",
+        help="Print the ThreadHop changelog",
+        description=(
+            "Print CHANGELOG.md. Paginated through `less -R` when stdout "
+            "is a TTY; raw otherwise. On installs that predate the file, "
+            "falls back to fetching it from GitHub (1s timeout)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  threadhop changelog\n"
+            "  threadhop changelog | head -40"
+        ),
+    )
+
+    subparsers.add_parser(
+        "future",
+        help="Show the top 5 roadmap entries",
+        description=(
+            "Print the top five entries from ROADMAP.md in file order. "
+            "No network call — the roadmap travels with the checkout, "
+            "so `threadhop update` is what brings it forward."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  threadhop future"
+        ),
+    )
+
     return parser
 
 
@@ -1933,9 +2172,240 @@ def cmd_bookmark(args) -> int:
     return 0
 
 
+ROADMAP_ENTRY_RE = re.compile(r"^- #(\d+) — (.+)$")
+
+
+def _repo_root() -> Path:
+    """Directory the installed `threadhop` script lives in."""
+    return Path(__file__).resolve().parent
+
+
+def _read_version_from_script(path: Path) -> str | None:
+    """Read ``__version__`` from an on-disk copy of the `threadhop` script.
+
+    Used by `threadhop update` after a git reset: the running process
+    still has the pre-update string cached in memory, so we re-parse
+    the file on disk to report the new version back to the user.
+    """
+    try:
+        text = path.read_text()
+    except OSError:
+        return None
+    m = re.search(r'^__version__\s*=\s*"([^"]+)"', text, flags=re.MULTILINE)
+    return m.group(1) if m else None
+
+
+def _run_git(cwd: Path, *args: str) -> tuple[int, str, str]:
+    result = subprocess.run(
+        ["git", *args], cwd=cwd, capture_output=True, text=True,
+    )
+    return result.returncode, result.stdout.strip(), result.stderr.strip()
+
+
+def _dirty_tree_refusal(repo: Path) -> str | None:
+    """Return a formatted refusal message if the working tree isn't safe
+    to ``git reset --hard`` against, else None.
+
+    Guards two scenarios we learned about the hard way:
+      1. Uncommitted changes (tracked modifications, staged blobs) —
+         ``git reset --hard`` silently discards them.
+      2. Current branch differs from `main` — a reset would move the
+         current branch's tip, abandoning commits that weren't on main.
+
+    ``--force`` skips this check entirely; the caller handles that.
+    """
+    rc, porcelain, _ = _run_git(repo, "status", "--porcelain")
+    if rc != 0:
+        # If `git status` itself fails, don't block — `git reset` will
+        # surface its own error and we'd rather that than a spurious
+        # refusal.
+        return None
+    rc, branch, _ = _run_git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    if rc != 0:
+        branch = "(unknown)"
+
+    problems: list[str] = []
+    if porcelain.strip():
+        count = sum(1 for line in porcelain.splitlines() if line.strip())
+        problems.append(
+            f"  {count} uncommitted change(s) in the working tree."
+        )
+    if branch not in ("main", "HEAD"):
+        problems.append(
+            f"  current branch is '{branch}', not 'main'."
+        )
+
+    if not problems:
+        return None
+
+    return (
+        "threadhop update: refusing to run against a non-clean "
+        "checkout:\n"
+        + "\n".join(problems)
+        + "\n\n"
+        "A `git reset --hard` here would discard uncommitted work or "
+        "abandon unmerged commits. Commit/stash first, or pass "
+        "`--force` to override (you'll lose the listed state)."
+    )
+
+
+def cmd_update(args) -> int:
+    """Refresh the installed checkout in place (ADR-027).
+
+    Safety rail: refuses to proceed when the working tree is dirty or
+    the current branch isn't `main`. Override with `--force`. (Learned
+    from task-027's own debut: running the first implementation against
+    the development checkout silently wiped an afternoon of
+    uncommitted work.)
+    """
+    repo = _repo_root()
+    if not (repo / ".git").exists():
+        print(
+            "threadhop update: not a git checkout; re-run the installer instead:\n"
+            f"  curl -LsSf https://raw.githubusercontent.com/{UPDATE_REPO}/main/install.sh | bash",
+            file=sys.stderr,
+        )
+        return 1
+
+    if args.check:
+        info = _check_for_update(force=True)
+        if info is None:
+            print(f"ThreadHop {__version__} is up to date.")
+            return 0
+        _print_cli_update_notice(info)
+        return 0
+
+    if not args.force:
+        refusal = _dirty_tree_refusal(repo)
+        if refusal is not None:
+            print(refusal, file=sys.stderr)
+            return 1
+
+    rc, out, err = _run_git(repo, "fetch", "--tags", "origin")
+    if rc != 0:
+        print(
+            f"threadhop update: git fetch failed:\n{err or out}",
+            file=sys.stderr,
+        )
+        return 1
+
+    ref = args.to or "origin/main"
+    rc, _, _ = _run_git(repo, "rev-parse", "--verify", ref)
+    if rc != 0:
+        print(
+            f"threadhop update: ref '{ref}' not found. "
+            "Try `git -C <repo> fetch --tags` or pick a different --to value.",
+            file=sys.stderr,
+        )
+        return 1
+
+    rc, _, err = _run_git(repo, "reset", "--hard", ref)
+    if rc != 0:
+        print(f"threadhop update: git reset failed:\n{err}", file=sys.stderr)
+        return 1
+
+    # `threadhop` was replaced on disk while we were running. mmap'd
+    # process text is safe on macOS/Linux, but we intentionally do no
+    # further Python work past this point (ADR-027 self-replacement
+    # note) — just report and return.
+    if args.to:
+        print(f"Pinned to {args.to}.")
+    else:
+        new_version = _read_version_from_script(repo / "threadhop") or "unknown"
+        print(f"Updated to {new_version}.")
+    return 0
+
+
+def cmd_changelog(args) -> int:
+    """Print CHANGELOG.md, paging through ``less -R`` on TTY (ADR-027)."""
+    del args  # no flags
+    repo = _repo_root()
+    local = repo / "CHANGELOG.md"
+    content: str | None = None
+
+    if local.exists():
+        try:
+            content = local.read_text()
+        except OSError as e:
+            print(f"threadhop changelog: {e}", file=sys.stderr)
+            return 1
+    else:
+        import urllib.request
+        try:
+            with urllib.request.urlopen(
+                UPDATE_RAW_CHANGELOG, timeout=UPDATE_FETCH_TIMEOUT_S,
+            ) as resp:
+                content = resp.read().decode("utf-8", errors="replace")
+        except Exception:
+            print(
+                "CHANGELOG not available offline. See "
+                f"{UPDATE_REPO_URL}/blob/main/CHANGELOG.md",
+                file=sys.stderr,
+            )
+            return 1
+
+    if sys.stdout.isatty():
+        try:
+            subprocess.run(["less", "-R"], input=content, text=True)
+            return 0
+        except FileNotFoundError:
+            pass  # fall through to raw print
+    print(content)
+    return 0
+
+
+def cmd_future(args) -> int:
+    """Print the top 5 ROADMAP.md entries (ADR-027)."""
+    del args
+    repo = _repo_root()
+    roadmap = repo / "ROADMAP.md"
+    full_url = f"{UPDATE_REPO_URL}/blob/main/ROADMAP.md"
+
+    if not roadmap.exists():
+        print(
+            "Roadmap is not available on this install.\n"
+            f"See {full_url}"
+        )
+        return 0
+
+    entries: list[tuple[str, str]] = []
+    try:
+        for line in roadmap.read_text().splitlines():
+            m = ROADMAP_ENTRY_RE.match(line)
+            if m:
+                entries.append((m.group(1), m.group(2)))
+                if len(entries) >= 5:
+                    break
+    except OSError as e:
+        print(f"threadhop future: {e}", file=sys.stderr)
+        return 1
+
+    if not entries:
+        print(
+            "Roadmap is empty on this install.\n"
+            f"See {full_url}"
+        )
+        return 0
+
+    print("ThreadHop — what's coming up:\n")
+    for num, desc in entries:
+        print(f"  #{num}  {desc}")
+    print(f"\nFull roadmap:\n  {full_url}")
+    return 0
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
+
+    # Startup update-check (ADR-027). CLI mode only — the TUI runs its
+    # own check in `ClaudeSessions.on_mount()` and surfaces the result
+    # as a toast. `update` is skipped because it has its own --check
+    # flag and already talks to GitHub.
+    if args.command not in (None, "update"):
+        info = _check_for_update()
+        if info is not None:
+            _print_cli_update_notice(info)
 
     if args.command is None:
         from tui import run_tui
@@ -1982,6 +2452,12 @@ def main():
         return cmd_observations(args)
     if args.command == "handoff":
         return cmd_handoff(args)
+    if args.command == "update":
+        return cmd_update(args)
+    if args.command == "changelog":
+        return cmd_changelog(args)
+    if args.command == "future":
+        return cmd_future(args)
     return _cli_stub(args.command)
 
 
