@@ -2993,14 +2993,18 @@ def _kanban_card_title(session: dict, custom_name: str | None) -> str:
     return f"Session {sid[:8]}" if sid else "(untitled)"
 
 
-class KanbanCard(Static):
+class KanbanCard(Vertical):
     """A session card on the Kanban board.
 
-    Subclassed from ``Static`` so the content renders like any text
-    block, but carries the ``session_id`` and handles ``on_click`` —
-    single-click opens the session's transcript (same contract as
-    pressing enter on the keyboard cursor). Without this, cards were
-    inert ``Static`` instances and the mouse path was dead.
+    Structured as a ``Vertical`` container with **two** children — a
+    title Static that flexes, and a meta Static pinned to a single row
+    at the bottom — rather than a monolithic Static. The two-widget
+    layout is load-bearing: when the title wraps to multiple lines the
+    meta row stays visible because it has its own guaranteed row in
+    the layout rather than flowing after the title inside a single
+    Rich Group (which was pushing meta off the bottom of the fixed-
+    height card on long titles). Pattern is the same as docking a
+    footer inside a panel.
     """
 
     def __init__(
@@ -3014,16 +3018,13 @@ class KanbanCard(Static):
         turns = session.get("turn_count", 0)
         age = format_age(session["modified"])
 
-        # Cap title length as a safety net against a pathologically
-        # long custom rename pushing the meta line out of the fixed
-        # card height. At typical column widths (~20-30 chars) 80
-        # chars wraps to ~3 lines max, which the card height clips
-        # gracefully without hiding the meta row.
+        # Defensive cap against pathologically long custom renames.
+        # The layout can handle wrap naturally, but a 200-char title
+        # at column width 22 would still wrap to 10 rows and clip
+        # most of itself — truncating keeps the first meaningful
+        # portion visible.
         if len(title_text) > 80:
             title_text = title_text[:79] + "…"
-        # Title is allowed to WRAP (no ``no_wrap``) so the full rename
-        # is visible when it fits in two lines. Sidebar keeps single-
-        # line ellipsis because rows there are 1 cell tall.
         title = Text(title_text, style="bold")
 
         meta = Text()
@@ -3037,19 +3038,25 @@ class KanbanCard(Static):
             meta.append("  ·  ", style="dim")
             meta.append("● active", style="green")
 
-        content = Group(title, meta)
-
         classes = "kanban-card"
         if selected:
             classes += " -selected"
-        super().__init__(content, classes=classes)
+        super().__init__(classes=classes)
+        self._title_text = title
+        self._meta_text = meta
         self.session_id: str = session.get("session_id", "")
+
+    def compose(self) -> ComposeResult:
+        yield Static(self._title_text, classes="kanban-card-title")
+        yield Static(self._meta_text, classes="kanban-card-meta")
 
     def on_click(self) -> None:
         """Single-click selects and opens — matches enter on the keyboard
         cursor. We route through the screen so the cursor lands on this
         card first (keeps the 2D cursor state coherent for any live
-        refresh that happens mid-dismiss) and then dismiss."""
+        refresh that happens mid-dismiss) and then dismiss. Click events
+        from the two child Statics bubble up to us here because Textual
+        propagates events unless a handler calls ``event.stop()``."""
         screen = self.screen
         if isinstance(screen, KanbanScreen) and self.session_id:
             screen._focus_session_id(self.session_id)
@@ -3126,6 +3133,20 @@ class KanbanScreen(ModalScreen):
         padding: 0 1;
         margin-top: 1;
         border: tall $primary-darken-2;
+        layout: vertical;
+    }
+    /* Title fills any rows left over after the meta row; wrapping
+       is allowed but excess rows clip here, so a freakishly long
+       title can't push meta out of the card. */
+    .kanban-card-title {
+        height: 1fr;
+        overflow-y: hidden;
+    }
+    /* Meta is always exactly one row at the bottom — the guarantee
+       that turns / age / activity stay visible regardless of title
+       length. */
+    .kanban-card-meta {
+        height: 1;
     }
     /* Three-layer selection highlight mirrors the transcript
        message-selected rule (tui.py:3470) so the selected state looks
@@ -3183,6 +3204,12 @@ class KanbanScreen(ModalScreen):
         self._row_idx_per_col: dict[int, int] = {
             i: 0 for i in range(len(STATUS_ORDER))
         }
+        # Signature of the last rendered board — structural fields
+        # only, not the modified mtime (which ticks every write on
+        # an active session and would cause a rebuild every refresh).
+        # update_sessions skips rebuild when this hasn't changed,
+        # which is the 5s-refresh flicker fix.
+        self._last_sig: tuple | None = None
 
     def compose(self) -> ComposeResult:
         with Vertical(id="kanban-container"):
@@ -3213,6 +3240,11 @@ class KanbanScreen(ModalScreen):
 
     def on_mount(self) -> None:
         self._bucket()
+        # Seed the signature so the very first 5s tick can early-return
+        # when nothing has actually changed since open.
+        self._last_sig = tuple(
+            self._session_signature(s) for s in self._sessions
+        )
         self._render_board()
 
     # --- data -----------------------------------------------------------
@@ -3232,6 +3264,28 @@ class KanbanScreen(ModalScreen):
                 status = "active"
             self._columns[status].append(s)
 
+    @staticmethod
+    def _session_signature(session: dict) -> tuple:
+        """Structural fingerprint of a single session for rebuild-dedup.
+
+        Deliberately **excludes** ``modified`` (file mtime) — it ticks
+        on every write during an active Claude session, which would
+        flip the signature every refresh and force a rebuild every 5s
+        even when nothing visible to the user changed. Age displays
+        drift between structural changes; that's the tradeoff for not
+        flickering.
+        """
+        return (
+            session.get("session_id") or "",
+            session.get("status") or "active",
+            session.get("turn_count", 0),
+            bool(session.get("is_working")),
+            bool(session.get("is_active")),
+            session.get("custom_title") or "",
+            session.get("ai_title") or "",
+            (session.get("first_user_msg") or "")[:60],
+        )
+
     def update_sessions(
         self,
         sessions: list[dict],
@@ -3239,15 +3293,25 @@ class KanbanScreen(ModalScreen):
     ) -> None:
         """Called by the host app every 5s with fresh session data.
 
-        Preserves the user's current selection by session_id — if the
-        selected session's status changed (e.g. another process updated
-        the DB), the cursor follows the card to its new column rather
-        than resetting to (0, 0) and disorienting the user.
+        Early-returns when the board signature is unchanged so the
+        refresh tick doesn't flicker the cards. Preserves the user's
+        current selection by session_id — if the selected session's
+        status changed (e.g. another process updated the DB), the
+        cursor follows the card to its new column.
         """
+        new_sig = tuple(self._session_signature(s) for s in sessions)
+        new_names = dict(custom_names)
+        if new_sig == self._last_sig and new_names == self._custom_names:
+            # Nothing structurally changed — skip the tear-down /
+            # remount that would otherwise fire every 5 seconds.
+            # Always-visible in-session edits (age ticks, new messages
+            # landing) are not visible on cards anyway.
+            return
         current = self._current_session()
         selected_id = current.get("session_id") if current else None
         self._sessions = list(sessions)
-        self._custom_names = dict(custom_names)
+        self._custom_names = new_names
+        self._last_sig = new_sig
         self._bucket()
         if selected_id is not None:
             self._focus_session_id(selected_id)
@@ -3316,6 +3380,31 @@ class KanbanScreen(ModalScreen):
         if 0 <= row < len(cards):
             scroll.scroll_to_widget(cards[row], animate=False)
 
+    def _update_selection(self) -> None:
+        """Toggle the ``-selected`` CSS class on whichever card the
+        cursor is on — **without** re-mounting any cards. This is the
+        cursor-move flicker fix: arrow keys used to call
+        ``_render_board``, which tears down and re-creates every card
+        in every column on every keystroke. Now cursor nav is a pure
+        class-flip, which Textual repaints in place.
+        """
+        cur_status = STATUS_ORDER[self._col_idx]
+        cur_row = self._row_idx_per_col[self._col_idx]
+        for status in STATUS_ORDER:
+            try:
+                scroll = self.query_one(f"#kscroll-{status}", VerticalScroll)
+            except Exception:
+                continue
+            cards = [c for c in scroll.children if isinstance(c, KanbanCard)]
+            for r, card in enumerate(cards):
+                should = (status == cur_status and r == cur_row)
+                has = card.has_class("-selected")
+                if should and not has:
+                    card.add_class("-selected")
+                elif not should and has:
+                    card.remove_class("-selected")
+        self.call_after_refresh(self._scroll_selected_into_view)
+
     # --- actions --------------------------------------------------------
 
     def action_close(self) -> None:
@@ -3323,7 +3412,8 @@ class KanbanScreen(ModalScreen):
 
     def action_cursor_col(self, delta: int) -> None:
         self._col_idx = (self._col_idx + delta) % len(STATUS_ORDER)
-        self._render_board()
+        # Class-flip only — no tear-down / remount. See _update_selection.
+        self._update_selection()
 
     def action_cursor_row(self, delta: int) -> None:
         col = self._current_column()
@@ -3333,7 +3423,7 @@ class KanbanScreen(ModalScreen):
         self._row_idx_per_col[self._col_idx] = max(
             0, min(cur + delta, len(col) - 1)
         )
-        self._render_board()
+        self._update_selection()
 
     def action_move_card(self, delta: int) -> None:
         """Reassign the selected session's status by ``delta`` columns.
@@ -3367,6 +3457,13 @@ class KanbanScreen(ModalScreen):
                 self._row_idx_per_col[new_col_idx] = r
                 break
         self._render_board()
+        # Refresh the dedup signature so the next 5s refresh tick
+        # (which will see the same post-move state from the DB via
+        # _gather_session_data) early-returns instead of triggering
+        # a second, wasted rebuild.
+        self._last_sig = tuple(
+            self._session_signature(s) for s in self._sessions
+        )
 
     def action_open_card(self) -> None:
         session = self._current_session()
