@@ -63,6 +63,25 @@ npx skills add parzival1l/threadhop
 
 **Dev / local-testing path**: if you've cloned the repo and want to load the plugin against a working-tree copy for one session, `claude --plugin-dir ~/.local/share/threadhop/plugin` loads it for that invocation only (no persistence).
 
+## Updating ThreadHop
+
+Once installed you can refresh the CLI in place, without re-running the curl installer:
+
+```bash
+threadhop update               # pull latest origin/main (git fetch + reset --hard)
+threadhop update --check       # just report, don't pull
+threadhop update --to v0.1.0   # pin to a tag, branch, or SHA (rollback)
+threadhop update --force       # override the dirty-tree safety guard
+threadhop changelog            # what's new
+threadhop future               # top 5 roadmap entries
+```
+
+`threadhop update` refuses to run if the installed checkout has uncommitted changes or is on a branch other than `main`, because `git reset --hard` would silently discard that work. Use `--force` to override once you're sure.
+
+ThreadHop also checks once per 24 hours for a newer release and nudges you on the next CLI invocation (three-line stderr message) or TUI launch (transient toast). The check is suppressed inside Claude Code sessions (`!threadhop …` or `/threadhop:*`), in pipelines (`threadhop observations | jq`), and when `THREADHOP_NO_UPDATE_CHECK=1` is set in your shell environment.
+
+The Claude Code plugin has its own update channel — run `/plugin update threadhop` from inside any `claude` session to refresh the skill prompts.
+
 ## Usage
 
 ### TUI
