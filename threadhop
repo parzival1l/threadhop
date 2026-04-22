@@ -430,6 +430,16 @@ LOCAL_COMMAND_RE = re.compile(
 # inner text so the title stays meaningful (e.g. "/reload-plugins").
 COMMAND_TAG_RE = re.compile(r"</?(?:command-name|command-message|command-args)>")
 
+# Every `claude -p` invocation by the observer/reflector pipelines opens its
+# own Claude Code session — which then shows up as a JSONL file under
+# ~/.claude/projects/. Filter those out of the session list by matching the
+# distinctive first-line header of the prompt templates (prompts/observer.md,
+# prompts/reflector.md). Keep in sync with those prompt templates.
+OBSERVER_SUBPROCESS_SIGNATURES: tuple[str, ...] = (
+    "# ThreadHop Observer Prompt",
+    "# ThreadHop Reflector Prompt",
+)
+
 
 # --- Command metadata registry (ADR-017, task #42) ---
 #
