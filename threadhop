@@ -1325,6 +1325,37 @@ def build_parser():
         help="Optional short note to store alongside the bookmark",
     )
 
+    copy_p = subparsers.add_parser(
+        "copy",
+        parents=[shared],
+        help="Copy cleaned session transcript to the clipboard",
+        description=(
+            "Copy a session's cleaned transcript to the macOS clipboard "
+            "as markdown. Tool calls, tool results, sidechains, system "
+            "reminders, and assistant thinking blocks are stripped — "
+            "only user and assistant prose turns survive. Backs both "
+            "the CLI and the /threadhop:copy plugin command."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  threadhop copy            # last turn\n"
+            "  threadhop copy 3          # last 3 turns\n"
+            "  threadhop copy all        # entire session\n"
+            "  !threadhop copy 2         # from inside a Claude Code session"
+        ),
+    )
+    copy_p.add_argument(
+        "count",
+        nargs="?",
+        default=None,
+        help=(
+            "Number of recent turns to copy (default: 1), or 'all' for "
+            "the whole session. Counts rendered turns after filtering, "
+            "not raw JSONL lines."
+        ),
+    )
+
     subparsers.add_parser(
         "todos",
         parents=[shared],
@@ -2172,6 +2203,32 @@ def cmd_bookmark(args) -> int:
     return 0
 
 
+def cmd_copy(args) -> int:
+    """Copy the cleaned last-N-turns (or full session) to the clipboard.
+
+    Auto-detects the current session via ``_resolve_cli_session`` so
+    both plugin invocations (``/threadhop:copy`` → ``!threadhop copy``)
+    and bare CLI calls from inside a ``claude`` terminal work without
+    ``--session``. Delegates to ``copy.run_copy`` for the actual work;
+    this wrapper only handles session discovery + path resolution.
+    """
+    rc = _resolve_cli_session(args)
+    if rc != 0:
+        return rc
+    session_path = find_session_path(args.session)
+    if session_path is None:
+        print(
+            f"threadhop copy: no transcript found for session {args.session} "
+            f"under {CLAUDE_PROJECTS}.",
+            file=sys.stderr,
+        )
+        return 1
+    # Lazy import — keeps CLI startup fast for other subcommands.
+    # Module is named ``copier`` to avoid shadowing stdlib ``copy``.
+    from copier import run_copy  # noqa: PLC0415
+    return run_copy(args.count, args.session, session_path)
+
+
 ROADMAP_ENTRY_RE = re.compile(r"^- #(\d+) — (.+)$")
 
 
@@ -2442,6 +2499,8 @@ def main():
         return cmd_decisions(args)
     if args.command == "bookmark":
         return cmd_bookmark(args)
+    if args.command == "copy":
+        return cmd_copy(args)
     if args.command == "config":
         return cmd_config(args)
     if args.command == "observe":
