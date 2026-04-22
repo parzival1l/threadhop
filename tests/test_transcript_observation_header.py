@@ -9,12 +9,19 @@ import db
 
 
 def _load_threadhop_module():
+    # See test_tui_observation_indicator._load_threadhop_module for why this
+    # returns `tui` rather than the executed script: `TranscriptView` lives
+    # in tui.py, and loading the script file merely primes `sys.modules` so
+    # `import tui` can resolve its `from threadhop import *`.
+    import sys as _sys
     path = Path(__file__).resolve().parent.parent / "threadhop"
     loader = importlib.machinery.SourceFileLoader("threadhop_app", str(path))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
+    _sys.modules.setdefault(loader.name, module)
     loader.exec_module(module)
-    return module
+    import tui  # noqa: PLC0415 — deferred until the script is registered.
+    return tui
 
 
 def _dummy_transcript_view(module, conn):
