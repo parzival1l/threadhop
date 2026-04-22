@@ -9,10 +9,31 @@ name: Release
 # Because the bump is already visible in PR review — reviewers see it
 # in the diff alongside the CHANGELOG entry, so we never accidentally
 # release something unreviewed. See RELEASE.md.
+#
+# SECURITY NOTE — template interpolation of CHANGELOG content.
+# CHANGELOG entries contain backticks (e.g. `threadhop copy`),
+# `$(...)` patterns, and other bash-syntactic characters. Pasting
+# those into a shell script via GitHub Actions `${{ ... }}`
+# templating causes bash to re-interpret them as commands, which
+# explodes in production. We route every templated value through
+# the `env:` block so bash only sees them as plain environment
+# variable values — no re-parsing, no command substitution.
+# Triggered this once on 2026-04-22 when the first `release.yml`
+# tried to release v0.2.1; backticks in the /threadhop:copy
+# CHANGELOG entry got executed as commands and the step failed.
 
 on:
   push:
     branches: [main]
+  # Manual re-fire in case a push-triggered run ever fails. Passes
+  # `force: true` to skip the version-change detection (needed because
+  # a retry on the same commit would see "no change" and no-op).
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Release the version at HEAD even if unchanged vs HEAD~1"
+        required: false
+        default: "false"
 
 permissions:
   contents: write   # needed to create tags + releases via GITHUB_TOKEN
@@ -28,6 +49,8 @@ jobs:
 
       - name: Detect version change
         id: ver
+        env:
+          FORCE: ${{ github.event.inputs.force }}
         run: |
           set -euo pipefail
           NEW=$(grep -oE '^__version__ = "[^"]+"' threadhop | head -1 | cut -d'"' -f2)
@@ -36,7 +59,10 @@ jobs:
                 || echo "")
           echo "new=$NEW" >> "$GITHUB_OUTPUT"
           echo "old=$OLD" >> "$GITHUB_OUTPUT"
-          if [ -n "$NEW" ] && [ "$NEW" != "$OLD" ]; then
+          if [ "${FORCE:-false}" = "true" ] && [ -n "$NEW" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Force mode — releasing v$NEW regardless of version change."
+          elif [ -n "$NEW" ] && [ "$NEW" != "$OLD" ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
             echo "::notice::Version changed $OLD -> $NEW; proceeding to release."
           else
@@ -45,29 +71,33 @@ jobs:
 
       - name: Refuse if tag already exists
         if: steps.ver.outputs.changed == 'true'
+        env:
+          RELEASE_VERSION: ${{ steps.ver.outputs.new }}
         run: |
-          V="${{ steps.ver.outputs.new }}"
-          if git ls-remote --tags origin | grep -qE "refs/tags/v${V}$"; then
-            echo "::error::Tag v${V} already exists. Aborting to avoid overwrite."
+          if git ls-remote --tags origin | grep -qE "refs/tags/v${RELEASE_VERSION}$"; then
+            echo "::error::Tag v${RELEASE_VERSION} already exists. Aborting to avoid overwrite."
             exit 1
           fi
 
       - name: Extract CHANGELOG section for this version
         if: steps.ver.outputs.changed == 'true'
         id: notes
+        env:
+          RELEASE_VERSION: ${{ steps.ver.outputs.new }}
         run: |
           set -euo pipefail
-          V="${{ steps.ver.outputs.new }}"
           # Grab the block between `## [V]` and the next `## [` header.
-          NOTES=$(awk -v v="$V" '
+          NOTES=$(awk -v v="$RELEASE_VERSION" '
             $0 ~ "^## \\[" v "\\]" { p=1; next }
             p && $0 ~ "^## \\[" { exit }
             p { print }
           ' CHANGELOG.md)
           if [ -z "$(echo "$NOTES" | tr -d '[:space:]')" ]; then
-            echo "::error::CHANGELOG.md has no '## [${V}]' entry. Add one before bumping __version__."
+            echo "::error::CHANGELOG.md has no '## [${RELEASE_VERSION}]' entry. Add one before bumping __version__."
             exit 1
           fi
+          # Multiline output contract:
+          # https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions#multiline-strings
           {
             echo "body<<CHANGELOG_EOF"
             echo "$NOTES"
@@ -76,12 +106,17 @@ jobs:
 
       - name: Create tag and release
         if: steps.ver.outputs.changed == 'true'
+        # Route every templated value through `env:` rather than
+        # `${{ ... }}` expansion inside the script. Prevents bash from
+        # re-parsing CHANGELOG backticks / `$(...)` as commands.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_VERSION: ${{ steps.ver.outputs.new }}
+          RELEASE_SHA: ${{ github.sha }}
+          RELEASE_BODY: ${{ steps.notes.outputs.body }}
         run: |
-          V="${{ steps.ver.outputs.new }}"
-          gh release create "v${V}" \
-            --target "${{ github.sha }}" \
-            --title "v${V}" \
-            --notes "${{ steps.notes.outputs.body }}"
-          echo "::notice::Released v${V}"
+          gh release create "v${RELEASE_VERSION}" \
+            --target "${RELEASE_SHA}" \
+            --title "v${RELEASE_VERSION}" \
+            --notes "${RELEASE_BODY}"
+          echo "::notice::Released v${RELEASE_VERSION}"
