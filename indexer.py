@@ -13,7 +13,11 @@ Per ADR-003 in ``docs/DESIGN-DECISIONS.md``:
   ``tool_use`` blocks are rendered as one-line abbreviations inline —
   see `abbreviate_tool_use`.
 * ``<system-reminder>`` blocks are stripped from visible text so search
-  isn't polluted with harness plumbing.
+  isn't polluted with harness plumbing. User lines additionally lose
+  ``<local-command-*>`` and ``<command-*>`` blocks, and skill-load
+  banners (the synthetic user line Claude Code injects when a slash-
+  command loads a skill) collapse to nothing — see ``clean_user_text``
+  and ``classify_user_text``.
 * User lines carrying a ``toolUseResult`` (i.e. tool output) are skipped
   — tool output is noisy and would dominate FTS (Open Question Q5).
 * ``thinking`` blocks are skipped (they're internal reasoning and aren't
@@ -50,6 +54,40 @@ SYSTEM_REMINDER_RE = re.compile(
     r"<system-reminder>.*?</system-reminder>", re.DOTALL
 )
 
+# Claude Code prepends ``<local-command-{caveat,stdout,stderr}>`` blocks
+# to bash-passthrough turns (``!cmd``). They are harness plumbing — the
+# user saw them as UI chrome, not as words they typed — so they pollute
+# both FTS hits and the observer feed when left in place.
+LOCAL_COMMAND_BLOCK_RE = re.compile(
+    r"<local-command-(?:caveat|stdout|stderr)>"
+    r".*?"
+    r"</local-command-(?:caveat|stdout|stderr)>",
+    re.DOTALL,
+)
+
+# Slash-command invocations land as a synthetic user JSONL line whose
+# whole content is ``<command-name>/foo</command-name>`` plus optional
+# ``<command-message>`` / ``<command-args>`` siblings. Stripping the
+# whole block (not just the markup) keeps FTS focused on real prose;
+# the TUI separately classifies these lines into a compact pill so the
+# command invocation is still visible to the user. (See
+# ``classify_user_text`` and ``CommandPill`` in tui.py.)
+COMMAND_BLOCK_RE = re.compile(
+    r"<(command-name|command-message|command-args)>"
+    r".*?"
+    r"</\1>",
+    re.DOTALL,
+)
+
+# When Claude Code loads a skill (e.g. via ``/improve-codebase-architecture``)
+# it injects the entire skill markdown body as a synthetic user-role
+# JSONL line, prefixed with this banner. From the transcript's POV it
+# looks identical to a real user message — but it's pure harness chrome.
+# Detecting on the banner is structural enough to survive skill renames.
+SKILL_LOAD_BANNER_RE = re.compile(
+    r"^\s*Base directory for this skill:\s*(\S+)"
+)
+
 
 # --- Text cleanup --------------------------------------------------------
 
@@ -57,6 +95,72 @@ SYSTEM_REMINDER_RE = re.compile(
 def strip_system_reminders(text: str) -> str:
     """Remove ``<system-reminder>`` blocks and trim surrounding whitespace."""
     return SYSTEM_REMINDER_RE.sub("", text).strip()
+
+
+def clean_user_text(text: str) -> str:
+    """Strip every flavour of harness chrome from a user-line content string.
+
+    Removes ``<system-reminder>`` blocks, ``<local-command-*>`` bash
+    passthrough plumbing, and ``<command-{name,message,args}>`` slash-
+    command markup. If the residue is a skill-load banner (the markdown
+    body Claude Code injects when a skill loads), the whole line collapses
+    to ``''`` — it's plumbing, not user content, and indexing it would
+    bury real user prose under boilerplate.
+
+    Used by the indexer's FTS path and the TUI renderer's user branch so
+    both surfaces see the same cleaned view.
+    """
+    text = SYSTEM_REMINDER_RE.sub("", text)
+    text = LOCAL_COMMAND_BLOCK_RE.sub("", text)
+    text = COMMAND_BLOCK_RE.sub("", text)
+    if SKILL_LOAD_BANNER_RE.match(text.lstrip()):
+        return ""
+    return text.strip()
+
+
+def classify_user_text(text: str) -> tuple[str, str]:
+    """Classify a user-line content string into (kind, display_text).
+
+    Kinds:
+    * ``"command"`` — the line is a slash-command invocation; ``display_text``
+      is the command name (e.g. ``/improve-codebase-architecture``).
+    * ``"skill_load"`` — the line is a Claude Code skill-load banner +
+      injected skill body; ``display_text`` is the skill basename for
+      the pill label.
+    * ``"user"`` — a normal human-typed message; ``display_text`` is the
+      cleaned content (system-reminders / local-command blocks stripped).
+    * ``"empty"`` — the line had no displayable content after cleaning.
+
+    The TUI uses this to render commands and skill-loads as compact
+    pills instead of full user-message widgets — which is what fixes
+    the "skill body shows up as a fat You: message" pollution.
+    """
+    cleaned = SYSTEM_REMINDER_RE.sub("", text)
+    cleaned = LOCAL_COMMAND_BLOCK_RE.sub("", cleaned)
+
+    cmd_match = re.search(
+        r"<command-name>(.*?)</command-name>", cleaned, re.DOTALL,
+    )
+    residue = COMMAND_BLOCK_RE.sub("", cleaned).strip()
+
+    if cmd_match and not residue:
+        return ("command", cmd_match.group(1).strip())
+
+    banner = SKILL_LOAD_BANNER_RE.match(residue.lstrip()) if residue else None
+    if banner:
+        skill_path = banner.group(1)
+        skill_name = Path(skill_path).name if skill_path else "skill"
+        return ("skill_load", skill_name)
+
+    if not residue:
+        return ("empty", "")
+
+    if cmd_match:
+        # User typed extra prose alongside the slash-command — keep
+        # both, with the command first so the line still reads naturally.
+        return ("user", f"{cmd_match.group(1).strip()}\n{residue}")
+
+    return ("user", residue)
 
 
 def abbreviate_tool_use(tool_name: str, tool_input: dict) -> str:
@@ -124,7 +228,12 @@ def _extract_user_text(msg: dict) -> str | None:
         content = " ".join(parts)
     if not isinstance(content, str):
         return None
-    text = strip_system_reminders(content)
+    # ``clean_user_text`` strips system-reminders, local-command blocks,
+    # command-tag blocks, and drops skill-load banners entirely so FTS
+    # never indexes harness plumbing. Assistant lines never carry these
+    # patterns, so ``_extract_assistant_blocks`` keeps the lighter
+    # ``strip_system_reminders`` call on each text block.
+    text = clean_user_text(content)
     return text or None
 
 

@@ -183,6 +183,65 @@ def test_strips_system_reminders(conn, tmp_path):
     assert msgs[0]["text"] == "Hello  world"
 
 
+def test_skips_command_only_user_lines(conn, tmp_path):
+    """Slash-command markup is harness plumbing — must not pollute FTS.
+
+    Pre-fix this would index the whole ``<command-name>/foo</command-name>``
+    blob, so search for "command-name" returned every command invocation.
+    The fix routes user lines through ``clean_user_text`` which drops the
+    block entirely; a command-only line collapses to empty and is skipped.
+    """
+    h = _SessionHelper(conn, tmp_path)
+    h.write(_user_line(
+        "u1",
+        "<command-message>foo</command-message>"
+        "<command-name>/foo</command-name>",
+    ))
+    h.index()
+
+    assert len(h.messages()) == 0
+
+
+def test_skips_skill_load_banner_user_lines(conn, tmp_path):
+    """Skill-load banners inject the entire skill body as a user line.
+
+    Indexing them buries real prose under boilerplate and feeds the
+    Haiku observer pages of skill markdown to extract trivia from. The
+    SKILL_LOAD_BANNER_RE detection in ``clean_user_text`` collapses the
+    whole line to empty.
+    """
+    h = _SessionHelper(conn, tmp_path)
+    skill_body = (
+        "Base directory for this skill: "
+        "/Users/x/.claude/skills/improve-codebase-architecture\n\n"
+        "# Improve Codebase Architecture\n\n"
+        "Lorem ipsum body of the skill markdown.\n"
+    )
+    h.write(_user_line("u1", skill_body))
+    h.index()
+
+    assert len(h.messages()) == 0
+
+
+def test_classify_user_text_round_trip():
+    """Pin the kinds returned by classify_user_text — TUI render branches
+    in tui.py:load_transcript depend on these exact strings."""
+    import indexer
+
+    assert indexer.classify_user_text(
+        "<command-name>/foo</command-name>"
+    ) == ("command", "/foo")
+
+    kind, name = indexer.classify_user_text(
+        "Base directory for this skill: /Users/x/.claude/skills/abc\n\n# Body\n"
+    )
+    assert kind == "skill_load"
+    assert name == "abc"
+
+    assert indexer.classify_user_text("hello") == ("user", "hello")
+    assert indexer.classify_user_text("") == ("empty", "")
+
+
 # --- Chunk merging (ADR-003) -----------------------------------------------
 
 def test_merges_consecutive_assistant_chunks(conn, tmp_path):

@@ -18,6 +18,7 @@ from time import perf_counter
 
 import threadhop as _core
 from threadhop import *  # noqa: F401,F403
+import indexer  # for classify_user_text — see _parse_messages
 
 globals().update({
     name: value
@@ -77,6 +78,26 @@ def format_age(timestamp: float) -> str:
         return f"{int(age / 3600)}h"
     else:
         return f"{int(age / 86400)}d"
+
+
+def format_msg_clock(ts: str | float | None) -> str:
+    """Render a JSONL message timestamp as ``HH:MM`` for inline display.
+
+    Accepts the ISO-8601 strings Claude writes into transcript JSONL
+    (``"2026-04-26T15:42:03.123Z"``) and returns the local-time hour and
+    minute. Empty / unparseable input returns "" so callers can simply
+    skip rendering the suffix.
+    """
+    if not ts:
+        return ""
+    try:
+        if isinstance(ts, (int, float)):
+            dt = datetime.fromtimestamp(float(ts))
+        else:
+            dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        return dt.strftime("%H:%M")
+    except (ValueError, AttributeError, TypeError):
+        return ""
 
 
 def _supports_observation_emoji() -> bool:
@@ -281,6 +302,26 @@ class ToolMessage(_SelectableMessage):
     pass
 
 
+class CommandPill(_SelectableMessage):
+    """Compact one-line pill for slash-command invocations and skill loads.
+
+    Claude Code synthesises two flavours of user-role JSONL line that
+    aren't really user content: ``<command-name>/foo</command-name>``
+    invocation markers, and the skill-load banner + injected skill body
+    that follows them. Rendering either as a full UserMessage drowns the
+    real conversation in 60-line skill markdown blocks (see the screenshot
+    in the issue that prompted this widget). Collapsing both into one
+    dim pill keeps the audit trail (you can still see *that* a command
+    fired) without spending vertical space on what the user sees as UI
+    chrome.
+
+    The pill participates in selection mode so y/e still work — but it
+    has no border-left accent, so it visually recedes next to real
+    UserMessage / AssistantMessage rows.
+    """
+    pass
+
+
 class ObservationInfoHeader(Static):
     """Passive observation metadata shown above the transcript."""
 
@@ -371,7 +412,7 @@ class TranscriptView(VerticalScroll):
         """Return all message widgets in order."""
         return [
             c for c in self.children
-            if isinstance(c, (UserMessage, AssistantMessage, ToolMessage))
+            if isinstance(c, (UserMessage, AssistantMessage, ToolMessage, CommandPill))
         ]
 
     def on_key(self, event) -> None:
@@ -593,6 +634,11 @@ class TranscriptView(VerticalScroll):
                 lines.append(f"User: {raw}")
             elif isinstance(w, AssistantMessage):
                 lines.append(f"Claude: {raw}")
+            elif isinstance(w, CommandPill):
+                # Pills are already prefixed with their kind marker
+                # (▶ /foo or ✦ skill:bar) — copy the pill as-is so a
+                # pasted transcript reads naturally.
+                lines.append(raw)
             elif isinstance(w, ToolMessage):
                 lines.append(raw)
 
@@ -674,6 +720,8 @@ class TranscriptView(VerticalScroll):
                 role_label = "User"
             elif isinstance(w, AssistantMessage):
                 role_label = "Claude"
+            elif isinstance(w, CommandPill):
+                role_label = "Command"
             else:
                 role_label = "Tool"
 
@@ -796,29 +844,71 @@ class TranscriptView(VerticalScroll):
 
             flush_tools()
 
+            # Slash-command invocations and skill-load banners collapse
+            # into a one-line CommandPill. Without this, every ``/foo``
+            # invocation renders as a "You: <command-name>/foo</command-name>"
+            # message, and every skill load drops the entire skill
+            # markdown body into the transcript as a fat user message.
+            # See CommandPill's docstring and indexer.classify_user_text
+            # for the classification rules.
+            if role == "command":
+                pill = Text()
+                pill.append("▶ ", style="dim cyan")
+                pill.append(str(content), style="cyan")
+                clock = format_msg_clock(timestamp)
+                if clock:
+                    pill.append(f"  ·  {clock}", style="dim")
+                w = CommandPill(pill)
+                w._raw_text = f"▶ {content}"
+                w._timestamp = timestamp
+                w._uuid = uuid
+                widgets.append(w)
+                continue
+
+            if role == "skill_load":
+                pill = Text()
+                pill.append("✦ ", style="dim magenta")
+                pill.append("skill loaded: ", style="dim")
+                pill.append(str(content), style="magenta")
+                clock = format_msg_clock(timestamp)
+                if clock:
+                    pill.append(f"  ·  {clock}", style="dim")
+                w = CommandPill(pill)
+                w._raw_text = f"✦ skill loaded: {content}"
+                w._timestamp = timestamp
+                w._uuid = uuid
+                widgets.append(w)
+                continue
+
+            # Build a 1-line role header with optional dim timestamp,
+            # then render the body as Markdown so user-pasted code
+            # fences, lists, and inline code render the same way they
+            # do for assistant messages. The try/except falls back to
+            # plain Text if Markdown trips on the input — same defensive
+            # pattern that was already in place for assistant messages.
             if role == "user":
-                user_text = Text()
-                user_text.append("You\n", style="bold cyan")
-                user_text.append(str(content) if content else "")
-                w = UserMessage(user_text)
-                w._raw_text = str(content) if content else ""
-                w._timestamp = timestamp
-                w._uuid = uuid
-                widgets.append(w)
+                role_label, role_style, msg_class = "You", "bold cyan", UserMessage
             else:
-                header = Text()
-                header.append("Claude\n", style="bold green")
-                renderables = [header]
-                if content:
-                    try:
-                        renderables.append(Markdown(str(content)))
-                    except:
-                        renderables.append(Text(str(content)))
-                w = AssistantMessage(Group(*renderables))
-                w._raw_text = str(content) if content else ""
-                w._timestamp = timestamp
-                w._uuid = uuid
-                widgets.append(w)
+                role_label, role_style, msg_class = "Claude", "bold green", AssistantMessage
+
+            header = Text()
+            header.append(role_label, style=role_style)
+            clock = format_msg_clock(timestamp)
+            if clock:
+                header.append(f"  ·  {clock}", style="dim")
+
+            renderables = [header]
+            if content:
+                try:
+                    renderables.append(Markdown(str(content)))
+                except Exception:
+                    renderables.append(Text(str(content)))
+
+            w = msg_class(Group(*renderables))
+            w._raw_text = str(content) if content else ""
+            w._timestamp = timestamp
+            w._uuid = uuid
+            widgets.append(w)
 
         flush_tools()
 
@@ -1255,10 +1345,27 @@ class TranscriptView(VerticalScroll):
                                     ]
                                     content = " ".join(text_parts)
                                 if content and isinstance(content, str):
-                                    # Strip system-reminder tags
-                                    content = SYSTEM_REMINDER_RE.sub("", content).strip()
-                                    if content:
-                                        messages.append(("user", content, timestamp, uuid))
+                                    # ``classify_user_text`` separates real
+                                    # user prose from slash-command markup
+                                    # and skill-load banners. The pill
+                                    # roles render as compact CommandPill
+                                    # widgets (see load_transcript) so the
+                                    # transcript isn't drowned in skill
+                                    # markdown bodies — see CommandPill's
+                                    # docstring for the full rationale.
+                                    kind, text = indexer.classify_user_text(content)
+                                    if kind == "command":
+                                        messages.append((
+                                            "command", text, timestamp, uuid,
+                                        ))
+                                    elif kind == "skill_load":
+                                        messages.append((
+                                            "skill_load", text, timestamp, uuid,
+                                        ))
+                                    elif kind == "user" and text:
+                                        messages.append((
+                                            "user", text, timestamp, uuid,
+                                        ))
 
                         elif msg_type == "assistant":
                             mid = msg.get("message", {}).get("id")
@@ -2755,7 +2862,7 @@ class HelpScreen(ModalScreen):
     HelpScreen {
         layout: vertical;
         align: center middle;
-        background: $background 80%;
+        background: $background 70%;
     }
 
     #help-container {
@@ -3508,6 +3615,21 @@ class ClaudeSessions(App):
     TITLE = "ThreadHop"
     ENABLE_COMMAND_PALETTE = False
 
+    # OpenCode-style native select-to-copy. Textual >=0.86 supports
+    # click-and-drag text selection inside widgets and pushes the
+    # selection to the OS clipboard via OSC 52 on mouse-up; AUTO_COPY
+    # = True is the explicit opt-in. ALLOW_SELECT is True by default
+    # but pinned here so a future Textual upgrade flipping the default
+    # doesn't silently regress this UX.
+    #
+    # ``copy_to_clipboard`` is overridden below so the OSC 52 path is
+    # joined by a subprocess pbcopy/xclip fallback — OSC 52 requires
+    # the terminal to opt-in (iTerm2 has "Allow apps to copy to
+    # clipboard" off by default), and falling back through subprocess
+    # makes select-to-copy work regardless of terminal config.
+    ALLOW_SELECT = True
+    AUTO_COPY = True
+
     CSS = """
     Screen {
         layout: grid;
@@ -3515,16 +3637,35 @@ class ClaudeSessions(App):
         grid-columns: 36 1fr;
         grid-rows: 1fr auto;
         grid-gutter: 0;
+        /* Thin, muted scrollbars — Textual's default is 2 cells wide
+           with a $primary-tinted thumb that competes with the focus
+           accent. Reducing to 1 cell + $border-blurred thumb keeps the
+           scroll affordance present but recessive. The active thumb
+           still uses $accent so dragging is visible. */
+        scrollbar-size-vertical: 1;
+        scrollbar-size-horizontal: 1;
+        scrollbar-background: $panel;
+        scrollbar-background-hover: $panel;
+        scrollbar-background-active: $panel;
+        scrollbar-color: $border-blurred;
+        scrollbar-color-hover: $border;
+        scrollbar-color-active: $accent;
     }
 
     /* Idle panels all carry the same muted border so section boundaries
        stay visible without competing. The focused panel is promoted to
        $accent, giving the eye a single clear target — this is the TUI
-       analogue of focus-elevation via shadow on the web. */
+       analogue of focus-elevation via shadow on the web. The single-bar
+       OpenCode pattern was tried here but conflicted with per-message
+       role borders (UserMessage uses border-left: thick $accent,
+       AssistantMessage thick $success) — those role borders sit just
+       inside the panel boundary and overwhelmed the panel's own bar.
+       The four-sided box wraps around them cleanly. */
     #session-list {
         height: 100%;
         border: solid $panel;
         border-title-color: $text;
+        scrollbar-size-vertical: 1;
     }
 
     #session-list:focus-within {
@@ -3540,6 +3681,7 @@ class ClaudeSessions(App):
         height: 1fr;
         border: solid $panel;
         border-title-color: $text;
+        scrollbar-size-vertical: 1;
     }
 
     #transcript-scroll:focus-within {
@@ -3592,28 +3734,47 @@ class ClaudeSessions(App):
         background: $error 30%;
     }
 
+    /* OpenCode-style prompt: a single left-edge accent bar instead of a
+       four-sided border, sitting on a $surface fill so the input box
+       reads as one inset block. The keybind hints that previously lived
+       in border-title are already in ContextualFooter, so the input box
+       itself is title-less. Reference:
+       anomalyco/opencode packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx
+       — the outer box uses border={["left"]} with backgroundElement fill
+       and paddingLeft/Right=2 paddingTop=1, exactly mirrored here. */
     #input-container {
         column-span: 2;
-        border: solid $panel;
-        border-title-color: $text;
+        border: none;
+        border-left: thick $border-blurred;
+        background: $surface;
         height: auto;
-        min-height: 3;
+        min-height: 2;
         max-height: 10;
+        padding: 1 2 0 2;
     }
 
     #input-container:focus-within {
-        border: solid $accent;
+        border-left: thick $accent;
     }
 
+    /* TextArea ships with ``border: tall transparent`` (focused: tall $accent),
+       which reserves 2 rows even when blurred and draws a second accent
+       rectangle on focus — visible as a purple frame layered on top of the
+       container's left-bar. Disabling the TextArea's border keeps the
+       OpenCode-style single left-bar as the only focus indicator and
+       collapses the empty-state height to two rows. */
     #reply-input {
         background: $surface;
+        border: none;
         height: auto;
         min-height: 1;
         max-height: 8;
+        padding: 0;
     }
 
     #reply-input:focus {
-        background: $boost;
+        background: $surface;
+        border: none;
     }
 
     UserMessage {
@@ -3644,25 +3805,48 @@ class ClaudeSessions(App):
         background: $surface;
     }
 
+    /* CommandPill: single-line summary for slash-command invocations
+       and skill-loads. No border-left accent (those are reserved for
+       human-vs-Claude turn boundaries) and no background fill, so the
+       pill recedes visually next to real conversation while still being
+       selectable in selection mode. The same vertical-margin rule as
+       UserMessage keeps stacking density consistent. */
+    CommandPill {
+        padding: 0 1;
+        margin: 1 0 0 2;
+        color: $text-muted;
+    }
+
     .session-label {
         padding: 0 1;
     }
 
+    /* Status group dividers (Backlog / In Progress / Done / …). The
+       prior styling was muted+italic, which read as "barely there" —
+       sections didn't visually separate. The new look uses bold full-
+       contrast text on a darker recessed background and adds a 1-cell
+       top pad so each header occupies 2 rows: a clear section break
+       between groups instead of a near-invisible rule. */
     .status-header {
-        padding: 0 1;
-        color: $text-muted;
-        text-style: italic;
+        padding: 1 1 0 1;
+        color: $text;
+        text-style: bold;
     }
 
-    /* Keep header backgrounds flat so a disabled header can't be mistaken
-       for a focusable row, even if Textual briefly parks the cursor on it
-       before the disabled-skip logic fires. */
+    /* The outer ListItem carries the darker recessed background so the
+       full row width is shaded — including the cells the inner Static's
+       padding doesn't cover. ``$panel-darken-1`` is portable across
+       themes via Textual's color algebra, so OpenCode dark themes get a
+       genuine recess and lighter themes get a subtle inset. The
+       ``height: 2`` matches the inner Static's effective height (1 text
+       + 1 top padding). */
     SessionStatusHeader, SessionStatusHeader:disabled {
-        background: transparent;
+        background: $panel-darken-1;
+        height: 2;
     }
 
     ListView:focus > SessionStatusHeader.--highlight {
-        background: transparent;
+        background: $panel-darken-1;
     }
 
     .session-label.unread {
@@ -3694,7 +3878,8 @@ class ClaudeSessions(App):
     /* Selection highlight — must override per-type border-left */
     UserMessage.message-selected,
     AssistantMessage.message-selected,
-    ToolMessage.message-selected {
+    ToolMessage.message-selected,
+    CommandPill.message-selected {
         background: $warning 20%;
         border-left: thick $warning;
         tint: $warning 8%;
@@ -3703,7 +3888,8 @@ class ClaudeSessions(App):
     /* Range selection highlight — softer tint for non-cursor messages */
     UserMessage.message-range-selected,
     AssistantMessage.message-range-selected,
-    ToolMessage.message-range-selected {
+    ToolMessage.message-range-selected,
+    CommandPill.message-range-selected {
         background: $accent 15%;
         border-left: thick $accent;
         tint: $accent 5%;
@@ -3712,7 +3898,8 @@ class ClaudeSessions(App):
     /* Cursor within a range — keep the stronger warning highlight */
     UserMessage.message-selected.message-range-selected,
     AssistantMessage.message-selected.message-range-selected,
-    ToolMessage.message-selected.message-range-selected {
+    ToolMessage.message-selected.message-range-selected,
+    CommandPill.message-selected.message-range-selected {
         background: $warning 20%;
         border-left: thick $warning;
         tint: $warning 8%;
@@ -3802,6 +3989,36 @@ class ClaudeSessions(App):
         yield Vertical(TextArea(id="reply-input"), id="input-container")
         yield ContextualFooter(id="contextual-footer")
 
+    def copy_to_clipboard(self, text: str) -> None:
+        """Push ``text`` to the OS clipboard via OSC 52 *and* subprocess.
+
+        Textual's default ``copy_to_clipboard`` writes an OSC 52 escape
+        sequence to the terminal — that's the right thing for SSH
+        sessions and supports any terminal that opts in. But several
+        common macOS / Linux terminals (iTerm2 with default settings,
+        many tmux configs without ``set -g set-clipboard on``) drop
+        OSC 52 silently, which makes Textual's "AUTO_COPY on mouse-up
+        of a text selection" feel like it's broken — the user selects
+        text, releases the mouse, and nothing lands on the clipboard.
+
+        Falling back through the module-level ``copy_to_clipboard``
+        helper (pbcopy on macOS, xclip on Linux) makes select-to-copy
+        work regardless of terminal opt-in. We call both: OSC 52 for
+        the SSH-friendly path, then subprocess as belt-and-braces. If
+        both succeed, the subprocess write happens last and wins —
+        same end state, just more robust.
+        """
+        try:
+            super().copy_to_clipboard(text)
+        except Exception:
+            # OSC 52 emit can fail on exotic drivers; the subprocess
+            # fallback below still has a shot.
+            pass
+        try:
+            copy_to_clipboard(text)
+        except Exception:
+            pass
+
     def on_mount(self) -> None:
         # Apply persisted sidebar width (defaults to CSS value of 36).
         width = self.config.get("sidebar_width", self.SIDEBAR_DEFAULT)
@@ -3862,9 +4079,9 @@ class ClaudeSessions(App):
             f"Sessions{filter_info} [J/K]reorder"
         )
         self.query_one("#transcript-scroll").border_title = "Transcript"
-        self.query_one("#input-container").border_title = (
-            "Reply (Enter=send, Alt+Enter=newline, Alt+J/K=nav, Esc=cancel)"
-        )
+        # The input container has no top border in the OpenCode-style
+        # layout, so a border-title would render to nothing. Reply
+        # keybind hints live in ContextualFooter instead.
 
     def animate_spinners(self) -> None:
         self._spinner_frame = (self._spinner_frame + 1) % len(SPINNER_FRAMES)
