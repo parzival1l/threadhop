@@ -2,30 +2,31 @@
 
 from __future__ import annotations
 
-import importlib.machinery
-import importlib.util
-import sys
 from pathlib import Path
 
 from threadhop_core.storage import db
 
 
 def _load_threadhop_module():
-    # Load the script so its line-39 `sys.modules.setdefault("threadhop", …)`
-    # fires and `import tui` can resolve its `from threadhop import *`.
-    # Keep the script reference (`threadhop`) for monkeypatching CLI-side
-    # helpers like `save_app_config` — their callers' `__globals__` point
-    # at the script's dict, so patching through `tui` would miss.
-    root = Path(__file__).resolve().parents[1]
-    path = root / "threadhop"
-    module_name = "threadhop_script_test"
-    loader = importlib.machinery.SourceFileLoader(module_name, str(path))
-    spec = importlib.util.spec_from_loader(module_name, loader)
-    assert spec is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    loader.exec_module(module)
-    return module
+    """Return the recent-searches helper module post-Phase-3.
+
+    The TUI's recent-search behaviour used to live in the ``threadhop``
+    script; Phase 3 moved it to ``threadhop_core/storage/recent_searches``.
+    The test patches ``save_app_config`` on this module to assert it
+    fires; we expose the same symbol the legacy fixture did
+    (``MAX_RECENT_SEARCHES``, ``get_recent_searches``,
+    ``save_recent_search``, ``clear_recent_searches``,
+    ``save_app_config``) by re-exporting from the relevant modules.
+    """
+    from threadhop_core.config import loader as loader_mod
+    from threadhop_core.storage import recent_searches as recent_mod
+
+    # Patching ``save_app_config`` on the recent-searches module misses
+    # because its helpers ``from ..config.loader import save_app_config``
+    # *inside* the function body. Aliasing the loader module here gives
+    # the test a stable handle to monkeypatch through.
+    recent_mod._save_app_config_for_tests = loader_mod.save_app_config
+    return recent_mod
 
 
 threadhop = _load_threadhop_module()

@@ -1,8 +1,21 @@
 """ThreadHop Textual UI.
 
-Imported lazily from `threadhop` so CLI dispatch can parse args before
-importing Textual.
+Imported lazily from ``./threadhop`` so CLI dispatch can parse args
+before paying for the Textual import. Sources every shared helper
+directly from ``threadhop_core`` — there is no longer a script-level
+namespace to import from.
 """
+
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from time import perf_counter
 
 from rich.console import Group
 from rich.markdown import Markdown
@@ -14,17 +27,101 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Header, Input, ListItem, ListView, Static, TextArea
 from textual.worker import Worker
-from time import perf_counter
 
-import threadhop as _core
-from threadhop import *  # noqa: F401,F403
 from threadhop_core import indexer  # for classify_user_text — see _parse_messages
+from threadhop_core.storage import search_queries  # noqa: E402
+from threadhop_core.cli.commands.observe import _refresh_observer_state
+from threadhop_core.cli.export_cleanup import (
+    EXPORT_DIR,
+    EXPORT_RETENTION_DAYS_DEFAULT,
+    cleanup_export_markdown_files,
+)
+from threadhop_core.config.loader import (
+    CONFIG_FILE,
+    load_config,
+    save_app_config,
+)
+from threadhop_core.config.update_check import _check_for_update
+from threadhop_core.session.detection import (
+    CLAUDE_PROJECTS,
+    detect_project_from_cwd,
+    get_active_claude_session_ids,
+)
+from threadhop_core.storage.recent_searches import (
+    MAX_RECENT_SEARCHES,
+    clear_recent_searches,
+    get_recent_searches,
+    save_recent_search,
+)
+from threadhop_core.tui.keybindings import (
+    COMMAND_REGISTRY,
+    SCOPE_BOOKMARKS,
+    SCOPE_FIND,
+    SCOPE_GLOBAL,
+    SCOPE_REPLY,
+    SCOPE_SEARCH,
+    SCOPE_SELECTION,
+    SCOPE_SESSION_LIST,
+    SCOPE_TRANSCRIPT,
+    Command,
+    format_key,
+)
+from threadhop_core.tui.theme import get_available_themes
 
-globals().update({
-    name: value
-    for name, value in _core.__dict__.items()
-    if name.startswith("_") and not name.startswith("__")
-})
+
+# --- Constants the TUI used to read off the script ------------------
+# These were script-level globals before Phase 3. The TUI is the only
+# remaining consumer, so we keep the surface here rather than pulling
+# them through yet another module.
+
+DISPLAY_NAME_WIDTH = 22
+OBSERVATION_MARKER = "🗒"
+OBSERVATION_MARKER_FALLBACK = "≡"
+MAX_SESSIONS = 50
+REFRESH_INTERVAL = 5
+SPINNER_INTERVAL = 0.25
+SEARCH_PAGE_SIZE = 50
+
+SPINNER_FRAMES = ["◐", "◓", "◑", "◒"]
+
+# Regex to strip <system-reminder>...</system-reminder> blocks from text.
+SYSTEM_REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
+
+# Claude Code prepends <local-command-*> blocks to the first user message
+# when a session begins via a slash command or `!` bash passthrough. Strip
+# before using the text as a sidebar title.
+LOCAL_COMMAND_RE = re.compile(
+    r"<local-command-(?:caveat|stdout|stderr)>.*?</local-command-(?:caveat|stdout|stderr)>",
+    re.DOTALL,
+)
+
+# Slash-command invocations surface as <command-name>/foo</command-name>
+# plus <command-message>/<command-args> siblings. Strip the tag markup
+# but keep the inner text so the title stays meaningful.
+COMMAND_TAG_RE = re.compile(
+    r"</?(?:command-name|command-message|command-args)>"
+)
+
+# Filter observer/reflector subprocess sessions out of the sidebar.
+OBSERVER_SUBPROCESS_SIGNATURES: tuple[str, ...] = (
+    "# ThreadHop Observer Prompt",
+    "# ThreadHop Reflector Prompt",
+)
+
+# Status display order + labels (ADR-004) — duplicated from db.py so the
+# TUI doesn't reach into storage internals.
+from threadhop_core.storage import db  # noqa: E402
+
+STATUS_ORDER: list[str] = db.SESSION_STATUS_ORDER
+STATUS_LABELS: dict[str, str] = {
+    "active":      "Active",
+    "in_progress": "In Progress",
+    "in_review":   "In Review",
+    "done":        "Done",
+    "archived":    "Archived",
+}
+STATUS_RANK: dict[str, int] = {s: i for i, s in enumerate(STATUS_ORDER)}
+STATUS_CYCLE: list[str] = [s for s in STATUS_ORDER if s != "archived"]
 
 
 def commands_for_scope(scope: str) -> list[Command]:
@@ -144,9 +241,21 @@ def copy_to_clipboard(text: str) -> bool:
         return False
 
 
+def _threadhop_script_path() -> Path:
+    """Locate the ``./threadhop`` executable that owns this checkout.
+
+    The script lives at the project root, one level above the
+    ``threadhop_core`` package. Resolved through the package's
+    ``__file__`` so we follow symlinks (e.g. ``~/.local/bin/threadhop``
+    pointing at the cloned checkout) rather than guessing from
+    ``sys.argv[0]``.
+    """
+    return Path(indexer.__file__).resolve().parents[1] / "threadhop"
+
+
 def build_observe_command(session_id: str) -> list[str]:
     """Spawn the CLI sidecar through the current executable script."""
-    return [str(Path(_core.__file__).resolve()), "observe", "--session", session_id]
+    return [str(_threadhop_script_path()), "observe", "--session", session_id]
 
 
 def render_session_label_text(

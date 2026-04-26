@@ -9,4 +9,23 @@ etc. directly.
 
 from .loader import load_opencode_themes, OPENCODE_THEMES_DIR
 
-__all__ = ["load_opencode_themes", "OPENCODE_THEMES_DIR"]
+
+def get_available_themes() -> list[str]:
+    """Return Textual's built-in theme names.
+
+    Falls back to the dark/light pair when ``BUILTIN_THEMES`` is absent
+    on older Textual versions.
+    """
+    try:
+        from textual.theme import BUILTIN_THEMES  # noqa: PLC0415
+
+        return list(BUILTIN_THEMES.keys())
+    except Exception:  # pragma: no cover — defensive against API drift
+        return ["textual-dark", "textual-light"]
+
+
+__all__ = [
+    "load_opencode_themes",
+    "OPENCODE_THEMES_DIR",
+    "get_available_themes",
+]

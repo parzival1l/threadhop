@@ -2,29 +2,37 @@
 
 from __future__ import annotations
 
-import importlib.machinery
-import importlib.util
 import json
 import os
-import sys
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 
-ROOT = Path(__file__).resolve().parent.parent
-THREADHOP = ROOT / "threadhop"
+def _load_threadhop_module() -> SimpleNamespace:
+    """Return a namespace with the symbols this suite touches.
 
+    Phase 3 split the script into ``threadhop_core``: the export-cleanup
+    helpers live in ``threadhop_core/cli/export_cleanup`` and the
+    config loader in ``threadhop_core/config/loader``. Keeping a
+    namespace facade lets the existing tests reach
+    ``threadhop_mod.cleanup_export_markdown_files`` and
+    ``threadhop_mod.load_config`` without rewriting every call site.
+    """
+    from threadhop_core.cli import export_cleanup
+    from threadhop_core.config import loader
+    from threadhop_core.storage import db
 
-def _load_threadhop_module():
-    loader = importlib.machinery.SourceFileLoader(
-        "threadhop_test_module", str(THREADHOP)
+    return SimpleNamespace(
+        cleanup_export_markdown_files=export_cleanup.cleanup_export_markdown_files,
+        load_config=loader.load_config,
+        # Mutating these on the loader module is what
+        # ``test_load_config_*`` does via monkeypatch.setattr; expose
+        # the loader module directly so the existing patches still work.
+        CONFIG_FILE=loader.CONFIG_FILE,
+        db=db,
+        _loader=loader,
     )
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    assert spec is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[loader.name] = module
-    loader.exec_module(module)
-    return module
 
 
 def _touch_with_mtime(path: Path, when: datetime) -> None:
@@ -89,7 +97,7 @@ def test_load_config_defaults_export_retention_days(
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({"theme": "textual-light"}))
 
-    monkeypatch.setattr(threadhop_mod, "CONFIG_FILE", config_path)
+    monkeypatch.setattr(threadhop_mod._loader, "CONFIG_FILE", config_path)
     monkeypatch.setattr(threadhop_mod.db, "get_custom_names", lambda conn: {})
     monkeypatch.setattr(threadhop_mod.db, "get_session_order", lambda conn: [])
     monkeypatch.setattr(threadhop_mod.db, "get_last_viewed", lambda conn: {})
@@ -107,7 +115,7 @@ def test_load_config_coerces_export_retention_days_from_json(
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({"export_retention_days": "14"}))
 
-    monkeypatch.setattr(threadhop_mod, "CONFIG_FILE", config_path)
+    monkeypatch.setattr(threadhop_mod._loader, "CONFIG_FILE", config_path)
     monkeypatch.setattr(threadhop_mod.db, "get_custom_names", lambda conn: {})
     monkeypatch.setattr(threadhop_mod.db, "get_session_order", lambda conn: [])
     monkeypatch.setattr(threadhop_mod.db, "get_last_viewed", lambda conn: {})

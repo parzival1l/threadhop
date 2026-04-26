@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import runpy
 from pathlib import Path
 
 import pytest
@@ -10,14 +9,17 @@ import pytest
 from threadhop_core.storage import db
 
 
-ROOT = Path(__file__).resolve().parent.parent
-THREADHOP = ROOT / "threadhop"
-
-
 @pytest.fixture
 def threadhop_ns() -> dict:
-    """Load the CLI script as a module namespace without executing main()."""
-    return runpy.run_path(str(THREADHOP))
+    """Expose the observe-command module's namespace for monkeypatching.
+
+    Phase 3 split the script into ``threadhop_core/cli/commands/observe.py``;
+    the fixture's contract (a dict of names that includes ``observer``,
+    ``os``, ``signal``, and the underscore-prefixed helpers) survives by
+    handing back the module's ``__dict__``.
+    """
+    from threadhop_core.cli.commands import observe as observe_mod
+    return observe_mod.__dict__
 
 
 def _seed_observation_state(conn, tmp_path: Path, session_id: str, **kwargs) -> None:
