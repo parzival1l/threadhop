@@ -564,13 +564,54 @@ class ClaudeSessions(App):
         if isinstance(top, KanbanScreen):
             try:
                 top.update_sessions(
-                    self.sessions,
+                    self._visible_sessions(),
                     self.config.get("session_names", {}) or {},
                 )
             except Exception:
                 # A render hiccup in the modal must not break the 5s
                 # refresh loop for the rest of the app.
                 pass
+
+    def _visible_sessions(self) -> list[dict]:
+        """Single source of truth for "which sessions are visible right now".
+
+        The sidebar and the Kanban board used to apply different filters to
+        ``self.sessions`` — the sidebar capped at ``MAX_SESSIONS`` and hid
+        archived rows, the Kanban took the full list. Past ~50 sessions the
+        global cap (combined with the ``status_rank`` sort in
+        ``_apply_stable_ordering``, which puts ``active`` first and ``done``
+        last) ate later-status buckets first, so a card visible on the
+        board could be missing from the sidebar — and clicking it did
+        nothing because ``_on_kanban_dismissed`` searches the sidebar
+        ListView to drive selection.
+
+        This helper applies the cap **per status bucket** so each column
+        keeps a reasonable budget independent of the others, and honors
+        the same ``_show_archived`` toggle the sidebar uses. Both surfaces
+        feed off this list so they never disagree on what's clickable.
+        Within-bucket ordering is preserved (the master list is already
+        sorted by ``(status_rank, manual_sort_order)``).
+        """
+        per_bucket: dict[str, list[dict]] = {}
+        for s in self.sessions:
+            status = s.get("status", "active")
+            if status == "archived" and not self._show_archived:
+                continue
+            bucket = per_bucket.setdefault(status, [])
+            if len(bucket) < MAX_SESSIONS:
+                bucket.append(s)
+
+        out: list[dict] = []
+        for status in STATUS_ORDER:
+            out.extend(per_bucket.get(status, []))
+        # Catch-all for unknown statuses (defensive — shouldn't fire given
+        # the CHECK constraint in storage/db.py, but matches the same
+        # tail-append the sidebar already does).
+        for status, bucket in per_bucket.items():
+            if status in STATUS_RANK:
+                continue
+            out.extend(bucket)
+        return out
 
     def _apply_stable_ordering(self) -> None:
         if "session_order" not in self.config:
@@ -609,16 +650,11 @@ class ClaudeSessions(App):
         )
 
     def _update_session_list(self, force_rebuild: bool = False) -> None:
-        all_sessions = self.sessions[:MAX_SESSIONS]
-
-        # Split into active (non-archived) and archived groups.
-        active_sessions = [s for s in all_sessions if s.get("status") != "archived"]
-        archived_sessions = [s for s in all_sessions if s.get("status") == "archived"]
-
-        if self._show_archived:
-            display_sessions = active_sessions + archived_sessions
-        else:
-            display_sessions = active_sessions
+        # Single source of truth for visibility — same list the Kanban
+        # board sees, so a card on the board is always reachable from
+        # the sidebar's ListView (which is what _on_kanban_dismissed
+        # walks to drive selection on click).
+        display_sessions = self._visible_sessions()
 
         # Bucket sessions by status. Preserve the in-memory order inside
         # each bucket — the sort in _apply_stable_ordering already put them
@@ -1236,7 +1272,7 @@ class ClaudeSessions(App):
             return
         custom_names = self.config.get("session_names", {}) or {}
         self.push_screen(
-            KanbanScreen(self.sessions, custom_names),
+            KanbanScreen(self._visible_sessions(), custom_names),
             self._on_kanban_dismissed,
         )
 
@@ -1247,18 +1283,47 @@ class ClaudeSessions(App):
         normal ListView.Highlighted handler drive the transcript load —
         that path also stamps last_viewed and clears the unread flag,
         which we'd otherwise have to duplicate here.
+
+        If the session isn't in the current sidebar list (e.g. it's
+        archived and ``_show_archived`` is False), we flip the toggle on
+        and force-rebuild before re-searching. Without this fallback, an
+        archived card on the Kanban board would dismiss with a valid id
+        but the sidebar would silently fail to navigate — the original
+        symptom that prompted the visible-sessions unification.
         """
         if not session_id:
             return
         list_view = self.query_one("#session-list", ListView)
-        for idx, item in enumerate(list_view.children):
-            if (
-                isinstance(item, SessionItem)
-                and item.session_data.get("session_id") == session_id
-            ):
-                list_view.index = idx
-                list_view.focus()
-                return
+
+        def _find_and_select() -> bool:
+            for idx, item in enumerate(list_view.children):
+                if (
+                    isinstance(item, SessionItem)
+                    and item.session_data.get("session_id") == session_id
+                ):
+                    list_view.index = idx
+                    list_view.focus()
+                    return True
+            return False
+
+        if _find_and_select():
+            return
+
+        # Fallback: the picked session must be in self.sessions (the Kanban
+        # was rendered from a subset of it) but is hidden from the sidebar
+        # by the archived toggle. Reveal it, rebuild, and try once more.
+        target = next(
+            (s for s in self.sessions if s.get("session_id") == session_id),
+            None,
+        )
+        if target is None:
+            return
+        if target.get("status") == "archived" and not self._show_archived:
+            self._show_archived = True
+            self._update_session_list(force_rebuild=True)
+            # Rebuild is synchronous (clear + append) so children are
+            # ready to walk immediately.
+            _find_and_select()
 
     def bookmark_toggle_selection(self) -> None:
         """Selection-mode `space`: toggle a bookmark on each selected
@@ -1812,7 +1877,10 @@ class ClaudeSessions(App):
         if session_id not in order:
             return
 
-        visible_ids = [s["session_id"] for s in self.sessions[:MAX_SESSIONS]]
+        # Use the same visibility semantics as the sidebar/Kanban so a
+        # manual reorder always swaps with the row that actually appears
+        # next to the cursor on screen.
+        visible_ids = [s["session_id"] for s in self._visible_sessions()]
         if session_id not in visible_ids:
             return
 
