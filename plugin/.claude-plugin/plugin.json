@@ -1,6 +1,6 @@
 {
   "name": "threadhop",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Browse, search, and carry context across Claude Code sessions. Exposes /threadhop:handoff, /threadhop:observe, /threadhop:tag.",
   "author": {
     "name": "ThreadHop",

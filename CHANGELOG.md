@@ -4,6 +4,51 @@ All notable changes to ThreadHop are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions
 follow `major.minor.patch`.
 
+## [0.3.0] — 2026-04-26
+
+### Added
+- TUI theme system with five vendored themes — `opencode`, `nord`,
+  `gruvbox`, `catppuccin`, `tokyonight`. Themes are JSON files loaded
+  by `threadhop_core/tui/theme/loader.py` and registered as Textual
+  themes at app startup. The default look-and-feel mirrors OpenCode's
+  palette and message-surface treatment so transcripts feel at home
+  next to a Claude Code terminal session.
+- TUI visual updates inspired by OpenCode — refreshed message
+  surfaces, role borders, status pills, sidebar density, and
+  contextual-footer styling. Behavior unchanged; the diff is in the
+  `*.tcss` stylesheets and message-widget rendering.
+
+### Changed
+- Slash-command rendering in the transcript no longer stalls on long
+  sessions. The indexer now streams parsed messages incrementally
+  instead of loading the entire JSONL file before mounting the first
+  widget, so the transcript paints quickly even on multi-megabyte
+  sessions.
+- Session-loading spinner clears as soon as the first batch of
+  messages is mounted rather than waiting for the full parse.
+
+### Notes
+- **Internal repo refactor (no user-visible behavior change).** The
+  monolithic `./threadhop` script (2500+ lines) and `./tui.py`
+  (5900+ lines) have been split into a proper Python package at
+  `threadhop_core/` with submodules for `cli/`, `cli/commands/`,
+  `storage/`, `observation/`, `harness/`, `session/`, `config/`, and
+  `tui/{widgets,screens,css,theme}/`. The `./threadhop` entrypoint is
+  now a ~27-line dispatcher that hands off to
+  `threadhop_core.cli.dispatch.main`. `tui.py` at the repo root
+  remains as a thin backward-compat shim. All 201 tests pass; CLI
+  surface, DB schema, and observation pipeline are unchanged.
+- New `threadhop_core/harness/claude.py` adapter unifies the three
+  near-identical `claude -p` subprocess call sites (`observer`,
+  `reflector`, `handoff`) behind one `run_claude_p()` entrypoint.
+  Documented as ADR-028 in `docs/DESIGN-DECISIONS.md`; prepares the
+  seam for future `codex.py` / `gemini.py` adapters.
+- `RELEASE.md` rewritten as an agent-followable runbook with explicit
+  pre-flight, version-decision, failure-mode, and recovery sections.
+  CI workflows (`validate.yml`, `release.yml`) repointed at the new
+  `threadhop_core/__init__.py` version-of-truth so version detection
+  survives the package refactor.
+
 ## [0.2.1] — 2026-04-22
 
 ### Added
