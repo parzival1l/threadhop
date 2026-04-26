@@ -16,9 +16,11 @@ from pathlib import Path
 from typing import Any
 
 from ..storage import db
+from ..harness import prompts as harness_prompts
+from ..harness.claude import run_claude_p
 
 
-PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "reflector.md"
+PROMPT_PATH = harness_prompts.prompt_path("reflector")
 DEFAULT_TIMEOUT_SEC = 180.0
 
 
@@ -219,16 +221,12 @@ def reflect_session(
     )
     before_count = entry_count
     try:
-        proc = subprocess.run(
-            [
-                claude_bin, "-p", prompt,
-                "--model", "haiku",
-                "--permission-mode", "acceptEdits",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
+        proc = run_claude_p(
+            prompt,
+            model="haiku",
+            permission_mode="acceptEdits",
             timeout=timeout,
+            claude_bin=claude_bin,
         )
     except subprocess.TimeoutExpired:
         return {

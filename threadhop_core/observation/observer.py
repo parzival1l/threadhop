@@ -51,6 +51,8 @@ from typing import Any, Callable
 
 from ..storage import db
 from .. import indexer
+from ..harness import prompts as harness_prompts
+from ..harness.claude import run_claude_p
 from . import reflector
 
 
@@ -63,8 +65,10 @@ from . import reflector
 BATCH_THRESHOLD = 3
 
 # Location of the shared observer prompt. Bundled with the app — the runtime
-# does not need anything in ``~/.config/threadhop/prompts/``.
-PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "observer.md"
+# does not need anything in ``~/.config/threadhop/prompts/``. Resolved via
+# the central harness prompt loader so all three callers (observer,
+# reflector, handoff) compute the path the same way.
+PROMPT_PATH = harness_prompts.prompt_path("observer")
 
 # Default subprocess timeout. Haiku usually responds in seconds, but the
 # first call of a session can pay an auth/warmup cost, and extremely large
@@ -483,16 +487,12 @@ def observe_session(
 
     before_count = _count_obs_lines(obs_path)
     try:
-        proc = subprocess.run(
-            [
-                claude_bin, "-p", prompt,
-                "--model", model,
-                "--permission-mode", "acceptEdits",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
+        proc = run_claude_p(
+            prompt,
+            model=model,
+            permission_mode="acceptEdits",
             timeout=timeout,
+            claude_bin=claude_bin,
         )
     except subprocess.TimeoutExpired:
         return {

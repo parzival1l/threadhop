@@ -43,6 +43,8 @@ from typing import Any, Callable
 
 from .storage import db
 from . import indexer
+from .harness import prompts as harness_prompts
+from .harness.claude import run_claude_p
 from .observation import observer
 from .observation import reflector
 
@@ -68,8 +70,10 @@ DEFAULT_POLISH_TIMEOUT_SEC = 240.0
 HANDOFF_BATCH_THRESHOLD = 1
 
 # Location of the polish prompt. Bundled with the app alongside
-# ``prompts/observer.md`` and ``prompts/reflector.md``.
-POLISH_PROMPT_PATH = Path(__file__).resolve().parents[1] / "prompts" / "handoff.md"
+# ``prompts/observer.md`` and ``prompts/reflector.md``. Resolved via the
+# central harness prompt loader so all three callers share one path
+# computation.
+POLISH_PROMPT_PATH = harness_prompts.prompt_path("handoff")
 
 # Observation types in display order. Mirrors observer.py's ``_TYPE_ORDER``
 # but reorders for a reader: decisions/ADRs first (the "what was chosen"),
@@ -242,16 +246,12 @@ def _invoke_polish(
         return "", {"error": f"{claude_bin} not found on PATH"}
 
     try:
-        proc = subprocess.run(
-            [
-                claude_bin, "-p", prompt,
-                "--model", "haiku",
-                "--permission-mode", "acceptEdits",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
+        proc = run_claude_p(
+            prompt,
+            model="haiku",
+            permission_mode="acceptEdits",
             timeout=timeout,
+            claude_bin=claude_bin,
         )
     except subprocess.TimeoutExpired:
         return "", {"error": f"polish timed out after {timeout}s"}
