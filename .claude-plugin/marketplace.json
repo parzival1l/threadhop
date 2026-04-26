@@ -11,7 +11,7 @@
       "name": "threadhop",
       "source": "./plugin",
       "description": "Persistent, searchable, cross-session memory for Claude Code — browse sessions, extract TODOs/decisions, produce handoff briefs.",
-      "version": "0.2.1",
+      "version": "0.3.0",
       "author": {
         "name": "parzival1l"
       },
