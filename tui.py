@@ -1945,38 +1945,44 @@ class SearchScreen(ModalScreen):
         max-width: 140;
         height: 85%;
         margin-top: 1;
-        background: $surface;
-        border: thick $accent;
+        background: $panel;
+        border: none;
+        padding: 1 2;
         layout: vertical;
     }
 
+    /* Inner widgets inherit the panel background so the modal reads as
+       one continuous surface (OpenCode palette pattern). The previous
+       $boost/$surface fills produced a visible color band where the
+       container's 1-cell padding sat between the panel and the inner
+       widgets. */
     #search-input {
         margin: 0;
         border: none;
-        background: $boost;
+        background: transparent;
     }
 
     #search-input:focus {
-        background: $boost;
+        background: transparent;
     }
 
     #search-results {
         height: 1fr;
-        background: $surface;
+        background: transparent;
     }
 
     #search-status {
         height: 1;
         padding: 0 1;
         color: $text-muted;
-        background: $boost;
+        background: transparent;
     }
 
     #search-help {
         height: 1;
         padding: 0 1;
         color: $text-muted;
-        background: $boost;
+        background: transparent;
         text-style: italic;
     }
 
@@ -2362,38 +2368,41 @@ class BookmarkBrowserScreen(ModalScreen):
         max-width: 140;
         height: 85%;
         margin-top: 1;
-        background: $surface;
-        border: thick $accent;
+        background: $panel;
+        border: none;
+        padding: 1 2;
         layout: vertical;
     }
 
+    /* Inner widgets inherit the panel background so the modal reads as
+       one continuous surface — same pattern as the search modal above. */
     #bookmark-input {
         margin: 0;
         border: none;
-        background: $boost;
+        background: transparent;
     }
 
     #bookmark-input:focus {
-        background: $boost;
+        background: transparent;
     }
 
     #bookmark-results {
         height: 1fr;
-        background: $surface;
+        background: transparent;
     }
 
     #bookmark-status {
         height: 1;
         padding: 0 1;
         color: $text-muted;
-        background: $boost;
+        background: transparent;
     }
 
     #bookmark-help {
         height: 1;
         padding: 0 1;
         color: $text-muted;
-        background: $boost;
+        background: transparent;
         text-style: italic;
     }
 
@@ -2607,8 +2616,8 @@ class LabelPromptScreen(ModalScreen):
         width: 70;
         max-width: 90%;
         height: auto;
-        background: $surface;
-        border: thick $accent;
+        background: $panel;
+        border: none;
         padding: 1 2;
         layout: vertical;
     }
@@ -2686,8 +2695,8 @@ class ConfirmScreen(ModalScreen):
         width: 72;
         max-width: 90%;
         height: auto;
-        background: $surface;
-        border: thick $accent;
+        background: $panel;
+        border: none;
         padding: 1 2;
         layout: vertical;
     }
@@ -2735,64 +2744,84 @@ class HelpScreen(ModalScreen):
         Binding("q", "close", "Close", priority=True),
     ]
 
+    # OpenCode-style command palette: no border, contrast comes from a
+    # 2-step luminance jump between the dimmed page and the panel
+    # background. Section headers are muted (not bright accent), and the
+    # only colored element is the keybinding column. This matches what
+    # makes OpenCode's palette feel "sleek" — one fill defines the
+    # surface, one accent highlights the focused row, and everything
+    # else is text/muted-text.
     CSS = """
     HelpScreen {
         layout: vertical;
-        align: center top;
-        background: $background 70%;
+        align: center middle;
+        background: $background 80%;
     }
 
     #help-container {
-        width: 90%;
-        max-width: 120;
-        height: 85%;
-        margin-top: 1;
-        background: $surface;
-        border: thick $accent;
+        width: 70;
+        max-width: 90;
+        height: 70%;
+        background: $panel;
+        border: none;
+        padding: 1 2;
         layout: vertical;
     }
 
     #help-title {
         height: 1;
-        padding: 0 1;
-        background: $boost;
-        color: $text;
-        text-style: bold;
+        color: $text-muted;
+        text-style: none;
     }
 
     #help-body {
         height: 1fr;
-        padding: 1 2;
+        padding: 1 0;
     }
 
     #help-hint {
         height: 1;
-        padding: 0 1;
         color: $text-muted;
-        background: $boost;
-        text-style: italic;
+        text-style: none;
     }
 
     .help-scope {
         margin-top: 1;
-        text-style: bold;
-        color: $accent;
+        padding-right: 2;
+        color: $text-muted;
+        text-style: none;
     }
 
     .help-scope:first-of-type {
         margin-top: 0;
     }
+
+    /* Each row is a horizontal layout with the description filling
+       available width on the left and the keybinding pinned to the
+       right, so widths adapt to any container size and we don't have to
+       guess at scrollbar reservation. Avoiding Rich markup also
+       sidesteps escaping issues for keys that are literal brackets
+       (`[`, `]`). The row's right padding (2 cells) creates breathing
+       room between the rightmost keybinding and the scrollbar gutter. */
+    .help-row {
+        height: 1;
+        layout: horizontal;
+        padding-right: 2;
+    }
+    .help-row-desc {
+        width: 1fr;
+    }
+    .help-row-keys {
+        width: auto;
+        color: $text-muted;
+    }
     """
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="help-container") as container:
-            container.border_title = "Help — keys grouped by context"
-            yield Static("ThreadHop commands", id="help-title")
+        with Vertical(id="help-container"):
+            yield Static("Commands", id="help-title")
             yield VerticalScroll(id="help-body")
-            yield Static(
-                "Esc / ? / q close • keys are grouped by where they're live",
-                id="help-hint",
-            )
+            yield Static("esc to close", id="help-hint")
 
     def on_mount(self) -> None:
         body = self.query_one("#help-body", VerticalScroll)
@@ -2801,13 +2830,14 @@ class HelpScreen(ModalScreen):
             if not commands:
                 continue
             body.mount(Static(SCOPE_LABELS[scope], classes="help-scope"))
-            # Width of the keys column is computed per-scope so shorter
-            # sections don't pay for a long key name in another scope.
-            key_width = max(len(format_command_keys(c)) for c in commands)
-            key_width = max(key_width, 6)
             for cmd in commands:
-                keys = format_command_keys(cmd).ljust(key_width)
-                body.mount(Static(f"  {keys}   {cmd.description}"))
+                body.mount(
+                    Horizontal(
+                        Static(cmd.description, classes="help-row-desc"),
+                        Static(format_command_keys(cmd), classes="help-row-keys"),
+                        classes="help-row",
+                    )
+                )
 
     def action_close(self) -> None:
         self.dismiss(None)
@@ -3094,8 +3124,8 @@ class KanbanScreen(ModalScreen):
     #kanban-container {
         width: 95%;
         height: 90%;
-        background: $surface;
-        border: round $primary;
+        background: $panel;
+        border: round $panel-lighten-2;
         padding: 1 2;
         layout: vertical;
     }
@@ -3599,8 +3629,19 @@ class ClaudeSessions(App):
         border-left: thick $success;
     }
 
+    /* OpenCode-style tool block: round single-cell border one luminance
+       step from the panel so the widget reads as a contained unit
+       without competing with the message it belongs to. The left
+       padding (3 cells in the old version) is now spent on the border
+       + inner padding instead, so total horizontal weight is unchanged.
+       $panel-lighten-2 is portable across themes via Textual's color
+       algebra — works on built-in themes and OpenCode-derived ones
+       alike. */
     ToolMessage {
-        padding: 0 1 0 3;
+        padding: 0 1;
+        margin: 0 0 0 2;
+        border: round $panel-lighten-2;
+        background: $surface;
     }
 
     .session-label {
@@ -3730,9 +3771,19 @@ class ClaudeSessions(App):
             self.config["session_names"] = {}
         if "session_order" not in self.config:
             self.config["session_order"] = []
-        saved_theme = self.config.get("theme", "textual-dark")
-        themes = get_available_themes()
-        if saved_theme in themes:
+        # Register OpenCode-derived themes (ADR-portable Radix 12-step
+        # scale, both dark/light variants). Done before the saved-theme
+        # lookup so a config that names "opencode-dark" resolves cleanly
+        # on first launch.
+        try:
+            from themes import load_opencode_themes
+            for theme in load_opencode_themes():
+                self.register_theme(theme)
+        except Exception:
+            pass
+
+        saved_theme = self.config.get("theme", "opencode-dark")
+        if saved_theme in self.available_themes:
             self.theme = saved_theme
 
     def notify(self, message, **kwargs):
@@ -4343,7 +4394,11 @@ class ClaudeSessions(App):
             self._cycle_theme(-1)
 
     def _cycle_theme(self, direction: int) -> None:
-        themes = get_available_themes()
+        # ``available_themes`` is the live registry — it includes both the
+        # built-ins from Textual *and* the OpenCode-derived themes we
+        # registered in __init__. ``get_available_themes`` returns only
+        # the static built-in list, so prefer the live source.
+        themes = list(self.available_themes.keys())
         try:
             current_idx = themes.index(self.theme)
             next_idx = (current_idx + direction) % len(themes)
