@@ -29,7 +29,7 @@ def main() -> int:
             _print_cli_update_notice(info)
 
     if args.command is None:
-        from tui import run_tui  # noqa: PLC0415 — Textual import is heavy
+        from threadhop_core.tui.app import run_tui  # noqa: PLC0415 — Textual import is heavy
 
         return run_tui(
             project=args.project,

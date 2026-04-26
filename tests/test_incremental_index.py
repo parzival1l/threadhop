@@ -225,7 +225,8 @@ def test_skips_skill_load_banner_user_lines(conn, tmp_path):
 
 def test_classify_user_text_round_trip():
     """Pin the kinds returned by classify_user_text — TUI render branches
-    in tui.py:load_transcript depend on these exact strings."""
+    in threadhop_core/tui/widgets/transcript.py:load_transcript depend on
+    these exact strings."""
     from threadhop_core import indexer
 
     assert indexer.classify_user_text(

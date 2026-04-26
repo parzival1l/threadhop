@@ -2,36 +2,24 @@
 
 from __future__ import annotations
 
-import importlib.util
-import sys
 import time
-from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 from threadhop_core.storage import db
+from threadhop_core.tui.app import ClaudeSessions
+from threadhop_core.tui.constants import (
+    OBSERVATION_MARKER,
+    OBSERVATION_MARKER_FALLBACK,
+)
+from threadhop_core.tui.utils import (
+    _supports_observation_emoji,
+    build_observe_command,
+    render_session_label_text,
+)
 
 
 ROOT = Path(__file__).resolve().parent.parent
 THREADHOP = ROOT / "threadhop"
-
-
-def _load_threadhop_ns() -> dict:
-    # Symbols this suite touches (`build_observe_command`,
-    # `render_session_label_text`, `ClaudeSessions`, `OBSERVATION_MARKER`,
-    # `_supports_observation_emoji`, `OBSERVATION_MARKER_FALLBACK`) all
-    # live in tui.py or are re-exported into it. Loading the script
-    # primes `sys.modules["threadhop"]` via its own setdefault, then
-    # `import tui` resolves and returns a namespace that covers every
-    # symbol the tests reach for.
-    module_name = "threadhop_app"
-    if module_name not in sys.modules:
-        loader = SourceFileLoader(module_name, str(THREADHOP))
-        spec = importlib.util.spec_from_loader(module_name, loader)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = module
-        loader.exec_module(module)
-    import tui  # noqa: PLC0415 — deferred until the script is registered.
-    return tui.__dict__
 
 
 class _FakeItem:
@@ -89,15 +77,12 @@ def test_get_observed_sessions_includes_obs_path(conn, tmp_path: Path):
 
 
 def test_build_observe_command_targets_current_script():
-    ns = _load_threadhop_ns()
-
-    argv = ns["build_observe_command"]("sess-1")
+    argv = build_observe_command("sess-1")
 
     assert argv == [str(THREADHOP.resolve()), "observe", "--session", "sess-1"]
 
 
 def test_render_session_label_text_adds_observation_indicator():
-    ns = _load_threadhop_ns()
     session_data = {
         "modified": time.time(),
         "project": "proj",
@@ -105,25 +90,24 @@ def test_render_session_label_text_adds_observation_indicator():
         "has_observations": True,
     }
 
-    observed = ns["render_session_label_text"](session_data)
-    plain = ns["render_session_label_text"](
+    observed = render_session_label_text(session_data)
+    plain = render_session_label_text(
         {**session_data, "has_observations": False}
     )
 
     indicator = (
-        ns["OBSERVATION_MARKER"]
-        if ns["_supports_observation_emoji"]()
-        else ns["OBSERVATION_MARKER_FALLBACK"]
+        OBSERVATION_MARKER
+        if _supports_observation_emoji()
+        else OBSERVATION_MARKER_FALLBACK
     )
     assert indicator in observed.plain
     assert indicator not in plain.plain
 
 
 def test_action_observe_session_copies_observation_path(monkeypatch):
-    ns = _load_threadhop_ns()
     copied: list[str] = []
     monkeypatch.setitem(
-        ns["ClaudeSessions"].action_observe_session.__globals__,
+        ClaudeSessions.action_observe_session.__globals__,
         "copy_to_clipboard",
         lambda text: copied.append(text) or True,
     )
@@ -137,17 +121,16 @@ def test_action_observe_session_copies_observation_path(monkeypatch):
         state={"entry_count": 2, "obs_path": "/tmp/sess-1.jsonl"},
     )
 
-    ns["ClaudeSessions"].action_observe_session(app)
+    ClaudeSessions.action_observe_session(app)
 
     assert copied == ["/tmp/sess-1.jsonl"]
     assert app.notifications == [("Observation path copied", {})]
 
 
 def test_action_observe_session_prompts_to_start_when_unobserved():
-    ns = _load_threadhop_ns()
     app = _FakeApp(_FakeItem({"session_id": "sess-1", "has_observations": False}))
 
-    ns["ClaudeSessions"].action_observe_session(app)
+    ClaudeSessions.action_observe_session(app)
 
     assert app.confirmations == [
         (
@@ -159,7 +142,6 @@ def test_action_observe_session_prompts_to_start_when_unobserved():
 
 
 def test_action_resume_observation_prompts_when_stopped_and_observed():
-    ns = _load_threadhop_ns()
     app = _FakeApp(
         _FakeItem(
             {
@@ -170,7 +152,7 @@ def test_action_resume_observation_prompts_when_stopped_and_observed():
         state={"entry_count": 4, "observer_pid": None, "status": "stopped"},
     )
 
-    ns["ClaudeSessions"].action_resume_observation(app)
+    ClaudeSessions.action_resume_observation(app)
 
     assert app.confirmations == [
         (

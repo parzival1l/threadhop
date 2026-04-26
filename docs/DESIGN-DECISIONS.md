@@ -1536,6 +1536,85 @@ at all.
 
 ---
 
+### ADR-028: Harness adapter seam (single concrete adapter)
+
+**Status:** Accepted (2026-04-26)
+
+**Context:** ThreadHop shells out to `claude -p` from three sites — the
+observer (`threadhop_core/observation/observer.py`), the reflector
+(`threadhop_core/observation/reflector.py`), and handoff brief
+generation (`threadhop_core/handoff.py`). Originally each call site
+carried its own `subprocess.run` block, its own argv assembly, its own
+prompt-path resolution, and its own quirks (working directory, timeout,
+env munging). Adding a second LLM CLI (e.g. `codex`, `gemini`) under
+this layout would mean three parallel duplications times N adapters —
+untenable at the first migration.
+
+The package reorganisation (Phases 1-4) made the duplication acutely
+visible because each module suddenly computed `parents[N]` differently
+to find the bundled `prompts/` directory after moving deeper into the
+tree.
+
+**Decision:** Unify the subprocess invocation and prompt-template
+loading behind a thin harness module, but do **not** introduce a
+`Harness` Protocol or registry yet:
+
+1. **`threadhop_core/harness/claude.py::run_claude_p()`** — the single
+   entry point for invoking `claude -p`. Owns argv construction, model
+   selection, working-directory normalisation, timeout, stdout/stderr
+   capture, and returns a frozen `HarnessResult` dataclass whose field
+   names mirror `subprocess.CompletedProcess` (`returncode`, `stdout`,
+   `stderr`).
+2. **`threadhop_core/harness/prompts.py::load_prompt()`** — reads
+   bundled prompt templates from the repo's top-level `prompts/`
+   directory using a single, package-anchored path resolution. The
+   three call sites no longer compute `parents[N]` themselves.
+3. **No `Harness` Protocol, no registry, no factory.** There is one
+   concrete adapter today. Per the "one adapter = hypothetical seam,
+   two adapters = real seam" rule, the abstraction is premature: its
+   shape would be guesswork without a second adapter to constrain it.
+
+**Rationale:**
+- The natural Protocol shape is *already* the public signature of
+  `run_claude_p(prompt, *, model, ...) -> HarnessResult`. When a
+  second adapter (`codex.py`, `gemini.py`) lands, the Protocol can be
+  extracted directly from this signature with no design churn.
+- `HarnessResult` mirrors `subprocess.CompletedProcess` deliberately
+  so existing tests that mock `subprocess.run` keep working without
+  rewrites — the seam is invisible to test fixtures.
+- Centralising prompt-path resolution removes a class of
+  package-relocation footguns. Future package moves only update one
+  file (`harness/prompts.py`) instead of three.
+- Adding the second adapter is now a parallel-file change
+  (`harness/codex.py` with `run_codex(prompt, *, model, ...)`,
+  `harness/gemini.py`, etc.) plus a thin selection layer at the call
+  sites — env var, config key, or per-session preference — wired in
+  at the moment of the second adapter, not speculatively now.
+
+**Rejected:**
+- **Build the `Harness` Protocol now, with one implementation.**
+  Speculative generality. The Protocol's method names, exception
+  shape, and capability negotiation surface (e.g. does `codex`
+  support `--permission-mode`? does `gemini` accept stdin prompts?)
+  are guesswork without a second concrete adapter to constrain them.
+  Better to ship the Protocol when it has two callers to satisfy.
+- **Keep the three duplicated `subprocess.run` blocks until a second
+  adapter arrives.** Rejected: the duplication was already a nuisance
+  for prompt-path resolution after the package reorg, and re-paying
+  the cleanup cost three times during the second-adapter migration is
+  worse than paying it once now.
+- **Stuff the harness into a class hierarchy with abstract methods.**
+  Python protocols + module-level functions are simpler, friendlier
+  to mocks, and have zero import-time cost.
+
+**Revisit when:** A second LLM CLI adapter is added. At that point,
+extract `Harness` Protocol from `run_claude_p`'s signature, add a
+registry (env-var or config-driven), and update the three call sites
+to ask the registry for the active adapter. The seam is already in
+the right place; it just becomes load-bearing.
+
+---
+
 ## Implementation Plan
 
 ### Phase 1: SQLite Foundation + Session Tags + Archive

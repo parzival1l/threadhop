@@ -29,37 +29,63 @@ No build step. The script uses `uv run --script` with PEP 723 inline metadata. R
 
 ## Architecture
 
-Core modules:
-- `threadhop` — executable entry point, TUI, argparse routing, CLI handlers, command registry + help overlay
-- `db.py` — SQLite schema, migrations, session / bookmark / observation-state / memory helpers, CHECK constraints (ADR-004)
-- `models.py` — Pydantic validation boundary for JSONL parsing and DB-row shapes; `Literal` enums mirrored by SQL CHECKs (task #24)
-- `indexer.py` — transcript normalization + FTS ingestion; merges assistant streaming chunks by `message.id` (ADR-003)
-- `observer.py` — sidecar orchestrator: seek-from-byte-offset, batch-threshold gate, `claude -p --model haiku` extractor, watch-mode with poll/fsevents backends (ADR-018)
-- `reflector.py` — reads observation JSONL across sessions in one project, appends `type: "conflict"` entries back into the same file (ADR-020)
-- `cli_queries.py` — shared CLI helpers: session-to-project sync, observer catch-up driver for `todos`/`decisions`/`observations`/`conflicts`
-- `observation_queries.py` — low-level readers for per-session observation JSONL
-- `migration.py` — one-time move of session metadata from `config.json` into SQLite (ADR-001); idempotent, transactional
-- `prompts/observer.md`, `prompts/reflector.md` — system prompts spliced with live context before each `claude -p` call
+ThreadHop is organized as a Python package `threadhop_core/` plus a thin
+`./threadhop` executable script (PEP 723 inline metadata, runs via uv).
+The script does sys.path setup and dispatches into
+`threadhop_core.cli.dispatch.main`; everything else lives in the package.
+
+### Top-level layout
+
+| Path | Owns |
+|------|------|
+| `threadhop` | Executable entrypoint (~27 lines): PEP 723 metadata, sys.path setup, hands off to `threadhop_core.cli.dispatch.main` |
+| `threadhop_core/` | The package — all runtime code |
+| `threadhop_core/cli/dispatch.py` | Argparse tree + top-level command router |
+| `threadhop_core/cli/bootstrap.py` | `cli_bootstrap()` ctx-manager — opens DB, runs migrations, lazy-loads config, yields a `CLIContext` |
+| `threadhop_core/cli/commands/` | One file per CLI verb: `tag`, `bookmark`, `copy`, `todos`, `decisions`, `observations`, `conflicts`, `observe`, `config`, `handoff`, `update`, `changelog`, `future` |
+| `threadhop_core/storage/` | SQLite schema (`db.py`), migrations, FTS search helpers, recent-search history. CHECK constraints (ADR-004) live here. |
+| `threadhop_core/observation/` | `observer.py` (sidecar orchestrator, ADR-018), `reflector.py` (cross-session decision conflicts, ADR-020), `queries.py` (per-session JSONL readers), `observer_state.py` |
+| `threadhop_core/handoff.py` | Handoff brief builder (drives the `/threadhop:handoff` skill) |
+| `threadhop_core/harness/` | `claude.py` exposing `run_claude_p()` (unified `claude -p` subprocess wrapper, ADR for harness seam below) and `prompts.py::load_prompt()` for prompt-template loading. One concrete adapter today; future `codex.py` / `gemini.py` adapters become parallel files. |
+| `threadhop_core/session/` | macOS session-detection (`ps`/`lsof` process-tree walking) |
+| `threadhop_core/config/loader.py` | App-level config loader; one-time migration of session metadata from `config.json` into SQLite (ADR-001) lives here, idempotent + transactional |
+| `threadhop_core/config/update_check.py` | ADR-027 update-check |
+| `threadhop_core/models.py` | Pydantic schemas — JSONL parsing + DB-row validation boundary; `Literal` enums mirrored by SQL CHECKs (task #24) |
+| `threadhop_core/indexer.py` | JSONL transcript parser + FTS ingestion; merges assistant streaming chunks by `message.id` (ADR-003); `parse_byte_range` provides the cleaned-transcript view shared by TUI + observer |
+| `threadhop_core/copier.py` | Clipboard / export logic |
+| `threadhop_core/tui/app.py` | `ClaudeSessions` App class + `run_tui()` |
+| `threadhop_core/tui/widgets/` | Reusable widgets: `session_list`, `transcript`, `messages`, `find_bar`, `contextual_footer` |
+| `threadhop_core/tui/screens/` | Modal screens: `search`, `bookmark`, `kanban`, `help`, `label_prompt`, `confirm` |
+| `threadhop_core/tui/css/` | External Textual stylesheets, one per surface, loaded via `App.CSS_PATH` |
+| `threadhop_core/tui/theme/` | OpenCode theme loader + vendored theme JSON |
+| `threadhop_core/tui/keybindings.py` | `COMMAND_REGISTRY` (declarative key + scope + label registry; drives footer + help overlay) |
+| `threadhop_core/tui/constants.py` | Module-level constants used across TUI surfaces (`OBSERVATION_MARKER`, etc.) |
+| `threadhop_core/tui/utils.py` | Pure helpers (`render_session_label_text`, `format_age`, `commands_for_scope`, `build_observe_command`, `_supports_observation_emoji`) |
+| `prompts/` | Bundled LLM prompt templates: `observer.md`, `reflector.md`, etc. — loaded by `harness/prompts.py` |
+| `tests/` | pytest suite — 201 tests as of this layout |
 
 ### Key Classes
 
-| Class | Role |
-|-------|------|
-| `ClaudeSessions(App)` | Main Textual app — layout, refresh loop, keybindings, session discovery, command registry dispatch |
-| `TranscriptView(VerticalScroll)` | Parses JSONL, renders conversation as `UserMessage`/`AssistantMessage`/`ToolMessage` widgets; select-mode + bookmark toggle |
-| `SessionItem(ListItem)` | Renders one session row: status icon (◐ working / ● active / ○ inactive) + name + age |
-| `SearchScreen(ModalScreen)` | FTS5 search across indexed messages |
-| `BookmarkBrowserScreen(ModalScreen)` | Pinned-message browser; list → enter jumps to message in transcript (task #18) |
+| Class | Location | Role |
+|-------|----------|------|
+| `ClaudeSessions(App)` | `threadhop_core/tui/app.py` | Main Textual app — layout, refresh loop, screen management, command registry dispatch |
+| `TranscriptView(VerticalScroll)` | `threadhop_core/tui/widgets/transcript.py` | Parses JSONL, renders `UserMessage`/`AssistantMessage`/`ToolMessage` widgets; owns selection + find state + bookmark toggle |
+| `SessionListPanel(Vertical)` | `threadhop_core/tui/widgets/session_list.py` | Sidebar with one `SessionItem` per session; status icon (◐ working / ● active / ○ inactive) + name + age |
+| `SearchScreen(ModalScreen)` | `threadhop_core/tui/screens/search.py` | FTS5 search across indexed messages |
+| `BookmarkBrowserScreen(ModalScreen)` | `threadhop_core/tui/screens/bookmark.py` | Pinned-message browser; list → enter jumps to message in transcript (task #18) |
+| `KanbanScreen(ModalScreen)` | `threadhop_core/tui/screens/kanban.py` | Status-board view of sessions |
+| `CLIContext` | `threadhop_core/cli/bootstrap.py` | Carries `conn` + lazy `config` to every CLI handler |
+| `HarnessResult` | `threadhop_core/harness/claude.py` | Frozen dataclass mirroring `subprocess.CompletedProcess` field shape |
 
 ### Data Flow
 
-1. **Discovery**: `_gather_session_data()` runs in a background worker every 5s — scans `~/.claude/projects/**/*.jsonl`, reads first 100 lines for metadata
-2. **Active detection**: `_get_active_claude_sessions()` runs `ps -eo pid,args`, finds `claude` processes, resolves CWD via `lsof -a -d cwd -p <pid>`, matches to session IDs
+1. **Discovery**: `_gather_session_data()` (in `threadhop_core/tui/app.py`) runs in a background worker every 5s — scans `~/.claude/projects/**/*.jsonl`, reads first 100 lines for metadata
+2. **Active detection**: `threadhop_core/session/` runs `ps -eo pid,args`, finds `claude` processes, resolves CWD via `lsof -a -d cwd -p <pid>`, matches to session IDs
 3. **Display**: `_update_session_list()` diffs old/new session lists — full rebuild on change, in-place spinner updates otherwise
-4. **Transcript**: `load_transcript()` parses full JSONL via `models.parse_transcript_line`, strips `<system-reminder>` tags, abbreviates tool calls, mounts message widgets
-5. **Observer pipeline**: `observer.observe_session()` reads `observation_state.source_byte_offset`, re-uses the cleaned transcript from `indexer.parse_byte_range` (same view the TUI shows), gates on `BATCH_THRESHOLD` new turns, invokes `claude -p --model haiku --permission-mode acceptEdits` with `prompts/observer.md` — the child process appends JSONL into `~/.config/threadhop/observations/<session_id>.jsonl`. Watch-mode loops this with fsevents/poll until `--stop`.
-6. **Reflector pipeline**: after enough new observations accumulate, `reflector.reflect_session()` compares the session's decisions against sibling sessions in the same project and appends `type: "conflict"` rows to the same observation JSONL.
-7. **Observation CLI**: `todos` / `decisions` / `observations` / `conflicts` run observer catch-up for tracked sessions via `cli_queries`, then read the per-session JSONL. `conflicts --resolved` writes review state into the `conflict_reviews` table instead of mutating append-only JSONL.
+4. **Transcript**: `TranscriptView.load_transcript()` parses full JSONL via `threadhop_core.models.parse_transcript_line`, strips `<system-reminder>` tags, abbreviates tool calls, mounts message widgets
+5. **Observer pipeline**: `threadhop_core.observation.observer.observe_session()` reads `observation_state.source_byte_offset`, re-uses the cleaned transcript from `threadhop_core.indexer.parse_byte_range` (same view the TUI shows), gates on `BATCH_THRESHOLD` new turns, invokes `claude -p --model haiku --permission-mode acceptEdits` via `threadhop_core.harness.claude.run_claude_p()` with `prompts/observer.md` — the child process appends JSONL into `~/.config/threadhop/observations/<session_id>.jsonl`. Watch-mode loops this with fsevents/poll until `--stop`.
+6. **Reflector pipeline**: after enough new observations accumulate, `threadhop_core.observation.reflector.reflect_session()` compares the session's decisions against sibling sessions in the same project and appends `type: "conflict"` rows to the same observation JSONL.
+7. **Observation CLI**: `todos` / `decisions` / `observations` / `conflicts` (in `threadhop_core/cli/commands/`) run observer catch-up for tracked sessions via shared CLI helpers, then read the per-session JSONL. `conflicts --resolved` writes review state into the `conflict_reviews` table instead of mutating append-only JSONL.
 
 ### Session State
 
@@ -68,13 +94,13 @@ Core modules:
 
 ### Persistent Config
 
-- `~/.config/threadhop/config.json` — app-level settings only (theme, sidebar width). Unknown keys are preserved by `migration.py`.
-- `~/.config/threadhop/sessions.db` — SQLite: sessions, messages + FTS5, bookmarks, memory, observation_state, conflict_reviews. Migrations live in `db.py` and run on every `init_db()`.
+- `~/.config/threadhop/config.json` — app-level settings only (theme, sidebar width). Unknown keys are preserved by `threadhop_core/migration.py`.
+- `~/.config/threadhop/sessions.db` — SQLite: sessions, messages + FTS5, bookmarks, memory, observation_state, conflict_reviews. Migrations live in `threadhop_core/storage/db.py` and run on every `init_db()`.
 - `~/.config/threadhop/observations/<session_id>.jsonl` — per-session observation file, shared by observer and reflector (ADR-019, ADR-020).
 
 ## Styling
 
-Textual CSS is inline in `ClaudeSessions.CSS` string. Grid layout: 2-column (36-char session list + fill transcript), 2-row (content + reply input). Message types use colored left borders and background tints.
+Textual CSS lives in `threadhop_core/tui/css/*.tcss` files, loaded via `App.CSS_PATH`. One stylesheet per surface (app, session_list, transcript, search, bookmark, kanban, help, label_prompt, confirm, contextual_footer). Grid layout: 2-column (36-char session list + fill transcript), 2-row (content + reply input). Message types use colored left borders and background tints.
 
 ## Session Detection (macOS)
 
@@ -92,8 +118,8 @@ Every message line has native fields useful for indexing:
 
 ## Anti-patterns
 
-- **Don't feed the observer raw JSONL.** It must see the same cleaned transcript the TUI shows (via `indexer.parse_byte_range`) — otherwise tool output, system-reminders, and thinking blocks dominate and Haiku extracts trivia.
-- **Don't add a DB enum-like column without matching `Literal`+CHECK.** `models.py` and `db.py` enforce the same shape in two places on purpose (task #24). Drift here re-introduces the bugs the hardening was meant to prevent.
+- **Don't feed the observer raw JSONL.** It must see the same cleaned transcript the TUI shows (via `threadhop_core.indexer.parse_byte_range`) — otherwise tool output, system-reminders, and thinking blocks dominate and Haiku extracts trivia.
+- **Don't add a DB enum-like column without matching `Literal`+CHECK.** `threadhop_core/models.py` and `threadhop_core/storage/db.py` enforce the same shape in two places on purpose (task #24). Drift here re-introduces the bugs the hardening was meant to prevent.
 - **Don't run the observer under `--permission-mode default`.** The child appends to the observation file itself; `acceptEdits` is the minimum that works.
 
 ## In Progress
