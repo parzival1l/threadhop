@@ -12,6 +12,7 @@ from textual.app import ComposeResult
 from textual.widgets import ListItem, Static
 
 from ..constants import STATUS_LABELS
+from ..utils import render_session_label_text
 
 
 class SessionItem(ListItem):
@@ -36,11 +37,6 @@ class SessionItem(ListItem):
         yield label
 
     def _render_label(self) -> Text:
-        # Lazy import — render_session_label_text lives in the legacy
-        # tui module while the App body still owns it. Once the App
-        # extraction lands, this will switch to ``..utils``.
-        from tui import render_session_label_text  # noqa: WPS433
-
         return render_session_label_text(
             self.session_data,
             custom_name=self.custom_name,
