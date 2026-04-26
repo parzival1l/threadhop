@@ -1,0 +1,27 @@
+ConfirmScreen {
+    layout: vertical;
+    align: center middle;
+    background: $background 70%;
+}
+
+#confirm-container {
+    width: 72;
+    max-width: 90%;
+    height: auto;
+    background: $panel;
+    border: none;
+    padding: 1 2;
+    layout: vertical;
+}
+
+#confirm-title {
+    color: $text;
+    text-style: bold;
+}
+
+#confirm-hint {
+    height: 1;
+    margin-top: 1;
+    color: $text-muted;
+    text-style: italic;
+}

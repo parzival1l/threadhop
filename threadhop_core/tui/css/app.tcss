@@ -1,0 +1,277 @@
+Screen {
+    layout: grid;
+    grid-size: 2 2;
+    grid-columns: 36 1fr;
+    grid-rows: 1fr auto;
+    grid-gutter: 0;
+    /* Thin, muted scrollbars — Textual's default is 2 cells wide
+       with a $primary-tinted thumb that competes with the focus
+       accent. Reducing to 1 cell + $border-blurred thumb keeps the
+       scroll affordance present but recessive. The active thumb
+       still uses $accent so dragging is visible. */
+    scrollbar-size-vertical: 1;
+    scrollbar-size-horizontal: 1;
+    scrollbar-background: $panel;
+    scrollbar-background-hover: $panel;
+    scrollbar-background-active: $panel;
+    scrollbar-color: $border-blurred;
+    scrollbar-color-hover: $border;
+    scrollbar-color-active: $accent;
+}
+
+/* Idle panels all carry the same muted border so section boundaries
+   stay visible without competing. The focused panel is promoted to
+   $accent, giving the eye a single clear target — this is the TUI
+   analogue of focus-elevation via shadow on the web. The single-bar
+   OpenCode pattern was tried here but conflicted with per-message
+   role borders (UserMessage uses border-left: thick $accent,
+   AssistantMessage thick $success) — those role borders sit just
+   inside the panel boundary and overwhelmed the panel's own bar.
+   The four-sided box wraps around them cleanly. */
+#session-list {
+    height: 100%;
+    border: solid $panel;
+    border-title-color: $text;
+    scrollbar-size-vertical: 1;
+}
+
+#session-list:focus-within {
+    border: solid $accent;
+}
+
+#transcript-column {
+    height: 100%;
+    layout: vertical;
+}
+
+#transcript-scroll {
+    height: 1fr;
+    border: solid $panel;
+    border-title-color: $text;
+    scrollbar-size-vertical: 1;
+}
+
+#transcript-scroll:focus-within {
+    border: solid $accent;
+}
+
+ObservationInfoHeader {
+    padding: 0 1;
+    margin: 0;
+    color: $text-muted;
+    background: $panel;
+}
+
+FindBar {
+    height: 1;
+    background: $boost;
+    layout: horizontal;
+}
+
+#find-input {
+    width: 1fr;
+    height: 1;
+    border: none;
+    padding: 0 1;
+    background: $boost;
+}
+
+#find-input:focus {
+    background: $surface;
+}
+
+#find-status {
+    width: auto;
+    height: 1;
+    padding: 0 2;
+    color: $text-muted;
+}
+
+/* 5 cells wide (was 3) so the mouse target is comfortable without
+   pushing the status counter. Visible glyph stays centered. */
+#find-close {
+    width: 5;
+    height: 1;
+    content-align: center middle;
+    color: $error;
+    background: $error 15%;
+}
+
+#find-close:hover {
+    background: $error 30%;
+}
+
+/* OpenCode-style prompt: a single left-edge accent bar instead of a
+   four-sided border, sitting on a $surface fill so the input box
+   reads as one inset block. The keybind hints that previously lived
+   in border-title are already in ContextualFooter, so the input box
+   itself is title-less. Reference:
+   anomalyco/opencode packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx
+   — the outer box uses border={["left"]} with backgroundElement fill
+   and paddingLeft/Right=2 paddingTop=1, exactly mirrored here. */
+#input-container {
+    column-span: 2;
+    border: none;
+    border-left: thick $border-blurred;
+    background: $surface;
+    height: auto;
+    min-height: 2;
+    max-height: 10;
+    padding: 1 2 0 2;
+}
+
+#input-container:focus-within {
+    border-left: thick $accent;
+}
+
+/* TextArea ships with ``border: tall transparent`` (focused: tall $accent),
+   which reserves 2 rows even when blurred and draws a second accent
+   rectangle on focus — visible as a purple frame layered on top of the
+   container's left-bar. Disabling the TextArea's border keeps the
+   OpenCode-style single left-bar as the only focus indicator and
+   collapses the empty-state height to two rows. */
+#reply-input {
+    background: $surface;
+    border: none;
+    height: auto;
+    min-height: 1;
+    max-height: 8;
+    padding: 0;
+}
+
+#reply-input:focus {
+    background: $surface;
+    border: none;
+}
+
+UserMessage {
+    padding: 1 1;
+    margin: 1 0 0 0;
+    background: $primary-background 15%;
+    border-left: thick $accent;
+}
+
+AssistantMessage {
+    padding: 1 1;
+    margin: 1 0 0 0;
+    border-left: thick $success;
+}
+
+/* OpenCode-style tool block: round single-cell border one luminance
+   step from the panel so the widget reads as a contained unit
+   without competing with the message it belongs to. The left
+   padding (3 cells in the old version) is now spent on the border
+   + inner padding instead, so total horizontal weight is unchanged.
+   $panel-lighten-2 is portable across themes via Textual's color
+   algebra — works on built-in themes and OpenCode-derived ones
+   alike. */
+ToolMessage {
+    padding: 0 1;
+    margin: 0 0 0 2;
+    border: round $panel-lighten-2;
+    background: $surface;
+}
+
+/* CommandPill: single-line summary for slash-command invocations
+   and skill-loads. No border-left accent (those are reserved for
+   human-vs-Claude turn boundaries) and no background fill, so the
+   pill recedes visually next to real conversation while still being
+   selectable in selection mode. The same vertical-margin rule as
+   UserMessage keeps stacking density consistent. */
+CommandPill {
+    padding: 0 1;
+    margin: 1 0 0 2;
+    color: $text-muted;
+}
+
+.session-label {
+    padding: 0 1;
+}
+
+/* Status group dividers (Backlog / In Progress / Done / …). The
+   prior styling was muted+italic, which read as "barely there" —
+   sections didn't visually separate. The new look uses bold full-
+   contrast text on a darker recessed background and adds a 1-cell
+   top pad so each header occupies 2 rows: a clear section break
+   between groups instead of a near-invisible rule. */
+.status-header {
+    padding: 1 1 0 1;
+    color: $text;
+    text-style: bold;
+}
+
+/* The outer ListItem carries the darker recessed background so the
+   full row width is shaded — including the cells the inner Static's
+   padding doesn't cover. ``$panel-darken-1`` is portable across
+   themes via Textual's color algebra, so OpenCode dark themes get a
+   genuine recess and lighter themes get a subtle inset. The
+   ``height: 2`` matches the inner Static's effective height (1 text
+   + 1 top padding). */
+SessionStatusHeader, SessionStatusHeader:disabled {
+    background: $panel-darken-1;
+    height: 2;
+}
+
+ListView:focus > SessionStatusHeader.--highlight {
+    background: $panel-darken-1;
+}
+
+.session-label.unread {
+    color: $warning;
+    text-style: bold;
+}
+
+.session-label.active {
+    color: $accent;
+}
+
+.session-label.working {
+    color: $success;
+}
+
+.session-label.archived {
+    color: $text-muted;
+    text-style: italic;
+}
+
+ListView > ListItem.--highlight {
+    background: $boost;
+}
+
+ListView:focus > ListItem.--highlight {
+    background: $accent;
+}
+
+/* Selection highlight — must override per-type border-left */
+UserMessage.message-selected,
+AssistantMessage.message-selected,
+ToolMessage.message-selected,
+CommandPill.message-selected {
+    background: $warning 20%;
+    border-left: thick $warning;
+    tint: $warning 8%;
+}
+
+/* Range selection highlight — softer tint for non-cursor messages */
+UserMessage.message-range-selected,
+AssistantMessage.message-range-selected,
+ToolMessage.message-range-selected,
+CommandPill.message-range-selected {
+    background: $accent 15%;
+    border-left: thick $accent;
+    tint: $accent 5%;
+}
+
+/* Cursor within a range — keep the stronger warning highlight */
+UserMessage.message-selected.message-range-selected,
+AssistantMessage.message-selected.message-range-selected,
+ToolMessage.message-selected.message-range-selected,
+CommandPill.message-selected.message-range-selected {
+    background: $warning 20%;
+    border-left: thick $warning;
+    tint: $warning 8%;
+}
+
+ToastRack {
+    margin-bottom: 2;
+}

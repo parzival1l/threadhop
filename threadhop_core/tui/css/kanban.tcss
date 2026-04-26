@@ -1,0 +1,86 @@
+KanbanScreen {
+    layout: vertical;
+    align: center middle;
+    background: $background 70%;
+}
+#kanban-container {
+    width: 95%;
+    height: 90%;
+    background: $panel;
+    border: round $panel-lighten-2;
+    padding: 1 2;
+    layout: vertical;
+}
+#kanban-title {
+    height: 1;
+    content-align: center middle;
+    text-style: bold;
+    color: $accent;
+}
+#kanban-columns {
+    height: 1fr;
+    layout: horizontal;
+}
+.kanban-column {
+    width: 1fr;
+    min-width: 18;
+    height: 100%;
+    margin: 0 1;
+    layout: vertical;
+}
+.kanban-column-header {
+    height: 2;
+    content-align: center middle;
+    text-style: bold;
+    background: $boost;
+    color: $accent;
+}
+.kanban-column-scroll {
+    height: 1fr;
+    border: round $primary-darken-2;
+    padding: 0 1;
+}
+.kanban-card {
+    height: 5;
+    padding: 0 1;
+    margin-top: 1;
+    border: tall $primary-darken-2;
+    layout: vertical;
+}
+/* Title fills any rows left over after the meta row; wrapping
+   is allowed but excess rows clip here, so a freakishly long
+   title can't push meta out of the card. */
+.kanban-card-title {
+    height: 1fr;
+    overflow-y: hidden;
+}
+/* Meta is always exactly one row at the bottom — the guarantee
+   that turns / age / activity stay visible regardless of title
+   length. */
+.kanban-card-meta {
+    height: 1;
+}
+/* Three-layer selection highlight mirrors the transcript
+   message-selected rule (tui.py:3470) so the selected state looks
+   like "selected" across every theme. $warning is reserved and
+   always contrasts strongly against $surface/$background, so the
+   cursor stays visible whether the user is on dracula, nord,
+   monokai, or one of the light variants. */
+.kanban-card.-selected {
+    border: heavy $warning;
+    background: $warning 25%;
+    tint: $warning 8%;
+}
+.kanban-card:hover {
+    border: tall $accent;
+}
+.kanban-empty {
+    color: $text-muted;
+    text-style: italic;
+    padding: 1;
+}
+#kanban-hint {
+    height: 1;
+    content-align: center middle;
+    color: $text-muted;
+}

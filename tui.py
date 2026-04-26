@@ -30,7 +30,7 @@ from textual.worker import Worker
 
 from threadhop_core import indexer  # for classify_user_text — see _parse_messages
 from threadhop_core.storage import search_queries  # noqa: E402
-from threadhop_core.cli.commands.observe import _refresh_observer_state
+from threadhop_core.observation.observer_state import _refresh_observer_state
 from threadhop_core.cli.export_cleanup import (
     EXPORT_DIR,
     EXPORT_RETENTION_DAYS_DEFAULT,
@@ -69,59 +69,48 @@ from threadhop_core.tui.keybindings import (
 from threadhop_core.tui.theme import get_available_themes
 
 
-# --- Constants the TUI used to read off the script ------------------
-# These were script-level globals before Phase 3. The TUI is the only
-# remaining consumer, so we keep the surface here rather than pulling
-# them through yet another module.
+# CSS lives in external Textual stylesheet files under
+# ``threadhop_core/tui/css/`` (one per surface). They're loaded via the
+# App's ``CSS_PATH`` so individual widgets and modal screens stay free
+# of inline ``CSS = """..."""`` blocks.
+_TUI_CSS_DIR = Path(__file__).resolve().parent / "threadhop_core" / "tui" / "css"
+_TUI_CSS_FILES = [
+    str(_TUI_CSS_DIR / "app.tcss"),
+    str(_TUI_CSS_DIR / "search.tcss"),
+    str(_TUI_CSS_DIR / "bookmark.tcss"),
+    str(_TUI_CSS_DIR / "label_prompt.tcss"),
+    str(_TUI_CSS_DIR / "confirm.tcss"),
+    str(_TUI_CSS_DIR / "help.tcss"),
+    str(_TUI_CSS_DIR / "contextual_footer.tcss"),
+    str(_TUI_CSS_DIR / "kanban.tcss"),
+]
 
-DISPLAY_NAME_WIDTH = 22
-OBSERVATION_MARKER = "🗒"
-OBSERVATION_MARKER_FALLBACK = "≡"
-MAX_SESSIONS = 50
-REFRESH_INTERVAL = 5
-SPINNER_INTERVAL = 0.25
-SEARCH_PAGE_SIZE = 50
-
-SPINNER_FRAMES = ["◐", "◓", "◑", "◒"]
-
-# Regex to strip <system-reminder>...</system-reminder> blocks from text.
-SYSTEM_REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
-
-# Claude Code prepends <local-command-*> blocks to the first user message
-# when a session begins via a slash command or `!` bash passthrough. Strip
-# before using the text as a sidebar title.
-LOCAL_COMMAND_RE = re.compile(
-    r"<local-command-(?:caveat|stdout|stderr)>.*?</local-command-(?:caveat|stdout|stderr)>",
-    re.DOTALL,
-)
-
-# Slash-command invocations surface as <command-name>/foo</command-name>
-# plus <command-message>/<command-args> siblings. Strip the tag markup
-# but keep the inner text so the title stays meaningful.
-COMMAND_TAG_RE = re.compile(
-    r"</?(?:command-name|command-message|command-args)>"
-)
-
-# Filter observer/reflector subprocess sessions out of the sidebar.
-OBSERVER_SUBPROCESS_SIGNATURES: tuple[str, ...] = (
-    "# ThreadHop Observer Prompt",
-    "# ThreadHop Reflector Prompt",
-)
 
 # Status display order + labels (ADR-004) — duplicated from db.py so the
 # TUI doesn't reach into storage internals.
 from threadhop_core.storage import db  # noqa: E402
 
-STATUS_ORDER: list[str] = db.SESSION_STATUS_ORDER
-STATUS_LABELS: dict[str, str] = {
-    "active":      "Active",
-    "in_progress": "In Progress",
-    "in_review":   "In Review",
-    "done":        "Done",
-    "archived":    "Archived",
-}
-STATUS_RANK: dict[str, int] = {s: i for i, s in enumerate(STATUS_ORDER)}
-STATUS_CYCLE: list[str] = [s for s in STATUS_ORDER if s != "archived"]
+# Module-level TUI constants live in threadhop_core/tui/constants.py;
+# we re-export the full surface here so existing references inside this
+# file (and downstream importers of `tui`) keep working.
+from threadhop_core.tui.constants import (  # noqa: E402
+    COMMAND_TAG_RE,
+    DISPLAY_NAME_WIDTH,
+    LOCAL_COMMAND_RE,
+    MAX_SESSIONS,
+    OBSERVATION_MARKER,
+    OBSERVATION_MARKER_FALLBACK,
+    OBSERVER_SUBPROCESS_SIGNATURES,
+    REFRESH_INTERVAL,
+    SEARCH_PAGE_SIZE,
+    SPINNER_FRAMES,
+    SPINNER_INTERVAL,
+    STATUS_CYCLE,
+    STATUS_LABELS,
+    STATUS_ORDER,
+    STATUS_RANK,
+    SYSTEM_REMINDER_RE,
+)
 
 
 def commands_for_scope(scope: str) -> list[Command]:
@@ -300,141 +289,20 @@ def render_session_label_text(
     return text
 
 
-class SessionItem(ListItem):
-    """A session in the list"""
-
-    def __init__(
-        self,
-        session_data: dict,
-        custom_name: str | None = None,
-        is_unread: bool = False,
-        spinner_frame: int = 0,
-    ):
-        self.session_data = session_data
-        self.custom_name = custom_name
-        self.is_unread = is_unread
-        self.spinner_frame = spinner_frame
-        super().__init__()
-
-    def compose(self) -> ComposeResult:
-        label = Static(self._render_label(), classes="session-label")
-        self._sync_label_classes(label)
-        yield label
-
-    def _render_label(self) -> Text:
-        return render_session_label_text(
-            self.session_data,
-            custom_name=self.custom_name,
-            spinner_frame=self.spinner_frame,
-        )
-
-    def _sync_label_classes(self, label: Static) -> None:
-        if self.is_unread:
-            label.add_class("unread")
-        else:
-            label.remove_class("unread")
-
-        if self.session_data.get("is_working", False):
-            label.add_class("working")
-        else:
-            label.remove_class("working")
-
-        if (
-            self.session_data.get("is_active", False)
-            and not self.session_data.get("is_working", False)
-        ):
-            label.add_class("active")
-        else:
-            label.remove_class("active")
-
-        if self.session_data.get("status") == "archived":
-            label.add_class("archived")
-        else:
-            label.remove_class("archived")
-
-    def refresh_label(self) -> None:
-        try:
-            label = self.query_one(".session-label", Static)
-            label.update(self._render_label())
-            self._sync_label_classes(label)
-        except Exception:
-            pass
-
-    def update_spinner(self, frame: int) -> None:
-        """Update spinner animation frame"""
-        if not self.session_data.get("is_working"):
-            return
-        self.spinner_frame = frame
-        self.refresh_label()
+from threadhop_core.tui.widgets.session_list import (  # noqa: E402
+    SessionItem,
+    SessionStatusHeader,
+)
 
 
-
-class SessionStatusHeader(ListItem):
-    """Non-selectable divider between status groups in the sidebar (ADR-004).
-
-    Rendered as a dim rule with the status label. `disabled=True` tells
-    ListView to skip over it when the cursor moves with j/k — so users see
-    the grouping but never land on a header.
-    """
-
-    def __init__(self, status: str):
-        self.status = status
-        super().__init__(disabled=True)
-
-    def compose(self) -> ComposeResult:
-        label = STATUS_LABELS.get(self.status, self.status)
-        yield Static(f"── {label} ", classes="status-header")
-
-
-class _SelectableMessage(Static):
-    """Base for message widgets that participate in selection mode.
-
-    can_focus is deliberately False — focus stays on the parent
-    TranscriptView so its on_key handler receives all keypresses.
-    Highlighting is driven purely by the .message-selected CSS class.
-    """
-    can_focus = False
-
-
-class UserMessage(_SelectableMessage):
-    """A user message in the transcript"""
-    pass
-
-
-class AssistantMessage(_SelectableMessage):
-    """An assistant message in the transcript"""
-    pass
-
-
-class ToolMessage(_SelectableMessage):
-    """A tool call/result in the transcript"""
-    pass
-
-
-class CommandPill(_SelectableMessage):
-    """Compact one-line pill for slash-command invocations and skill loads.
-
-    Claude Code synthesises two flavours of user-role JSONL line that
-    aren't really user content: ``<command-name>/foo</command-name>``
-    invocation markers, and the skill-load banner + injected skill body
-    that follows them. Rendering either as a full UserMessage drowns the
-    real conversation in 60-line skill markdown blocks (see the screenshot
-    in the issue that prompted this widget). Collapsing both into one
-    dim pill keeps the audit trail (you can still see *that* a command
-    fired) without spending vertical space on what the user sees as UI
-    chrome.
-
-    The pill participates in selection mode so y/e still work — but it
-    has no border-left accent, so it visually recedes next to real
-    UserMessage / AssistantMessage rows.
-    """
-    pass
-
-
-class ObservationInfoHeader(Static):
-    """Passive observation metadata shown above the transcript."""
-
-    can_focus = False
+from threadhop_core.tui.widgets.messages import (  # noqa: E402
+    AssistantMessage,
+    CommandPill,
+    ObservationInfoHeader,
+    ToolMessage,
+    UserMessage,
+    _SelectableMessage,
+)
 
 
 class TranscriptView(VerticalScroll):
@@ -2145,71 +2013,6 @@ class SearchScreen(ModalScreen):
         Binding("enter", "open_result", "Open", priority=True, show=False),
     ]
 
-    CSS = """
-    /* Explicitly reset layout here — the app's top-level
-       `Screen { layout: grid; grid-columns: 36 1fr; ... }` rule cascades
-       to ModalScreen subclasses too, which would otherwise squeeze the
-       modal into the 36-col first grid cell. */
-    SearchScreen {
-        layout: vertical;
-        align: center top;
-        background: $background 70%;
-    }
-
-    #search-container {
-        width: 90%;
-        max-width: 140;
-        height: 85%;
-        margin-top: 1;
-        background: $panel;
-        border: none;
-        padding: 1 2;
-        layout: vertical;
-    }
-
-    /* Inner widgets inherit the panel background so the modal reads as
-       one continuous surface (OpenCode palette pattern). The previous
-       $boost/$surface fills produced a visible color band where the
-       container's 1-cell padding sat between the panel and the inner
-       widgets. */
-    #search-input {
-        margin: 0;
-        border: none;
-        background: transparent;
-    }
-
-    #search-input:focus {
-        background: transparent;
-    }
-
-    #search-results {
-        height: 1fr;
-        background: transparent;
-    }
-
-    #search-status {
-        height: 1;
-        padding: 0 1;
-        color: $text-muted;
-        background: transparent;
-    }
-
-    #search-help {
-        height: 1;
-        padding: 0 1;
-        color: $text-muted;
-        background: transparent;
-        text-style: italic;
-    }
-
-    .search-result {
-        padding: 0 1;
-    }
-
-    SearchResultItem {
-        padding: 0;
-    }
-    """
 
     def __init__(
         self,
@@ -2572,64 +2375,6 @@ class BookmarkBrowserScreen(ModalScreen):
         Binding("enter", "open_result", "Open", priority=True, show=False),
     ]
 
-    CSS = """
-    BookmarkBrowserScreen {
-        layout: vertical;
-        align: center top;
-        background: $background 70%;
-    }
-
-    #bookmark-container {
-        width: 90%;
-        max-width: 140;
-        height: 85%;
-        margin-top: 1;
-        background: $panel;
-        border: none;
-        padding: 1 2;
-        layout: vertical;
-    }
-
-    /* Inner widgets inherit the panel background so the modal reads as
-       one continuous surface — same pattern as the search modal above. */
-    #bookmark-input {
-        margin: 0;
-        border: none;
-        background: transparent;
-    }
-
-    #bookmark-input:focus {
-        background: transparent;
-    }
-
-    #bookmark-results {
-        height: 1fr;
-        background: transparent;
-    }
-
-    #bookmark-status {
-        height: 1;
-        padding: 0 1;
-        color: $text-muted;
-        background: transparent;
-    }
-
-    #bookmark-help {
-        height: 1;
-        padding: 0 1;
-        color: $text-muted;
-        background: transparent;
-        text-style: italic;
-    }
-
-    .bookmark-item {
-        padding: 0 1;
-    }
-
-    BookmarkItem {
-        padding: 0;
-    }
-    """
 
     def __init__(self, conn: sqlite3.Connection):
         super().__init__()
@@ -2806,257 +2551,11 @@ class BookmarkBrowserScreen(ModalScreen):
         self.app.notify("Bookmark removed")
 
 
-class LabelPromptScreen(ModalScreen):
-    """Tiny modal that captures a single line of text.
-
-    Used both when setting a note from selection mode and when editing one from
-    the browser. Returns the submitted string on Enter, or ``None`` on Escape.
-    The caller decides whether an empty submission means "clear" (bookmark
-    browser does that via ``set_bookmark_note``'s blank-collapses-to-NULL
-    behaviour).
-    """
-
-    BINDINGS = [
-        Binding("enter", "submit", "Save", priority=True, show=False),
-        Binding("escape", "cancel", "Cancel", priority=True, show=False),
-    ]
-
-    CSS = """
-    LabelPromptScreen {
-        layout: vertical;
-        align: center middle;
-        background: $background 70%;
-    }
-
-    #label-container {
-        width: 70;
-        max-width: 90%;
-        height: auto;
-        background: $panel;
-        border: none;
-        padding: 1 2;
-        layout: vertical;
-    }
-
-    #label-title {
-        height: 1;
-        text-style: bold;
-        color: $text;
-    }
-
-    #label-input {
-        margin-top: 1;
-    }
-
-    #label-hint {
-        height: 1;
-        margin-top: 1;
-        color: $text-muted;
-        text-style: italic;
-    }
-    """
-
-    def __init__(self, initial: str = ""):
-        super().__init__()
-        self._initial = initial
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="label-container"):
-            yield Static("Bookmark note", id="label-title")
-            yield Input(
-                value=self._initial,
-                placeholder="Note (blank = clear)",
-                id="label-input",
-            )
-            yield Static("Enter to save • Esc to cancel", id="label-hint")
-
-    def on_mount(self) -> None:
-        self.query_one("#label-input", Input).focus()
-
-    def action_submit(self) -> None:
-        value = self.query_one("#label-input", Input).value or ""
-        self.dismiss(value)
-
-    def action_cancel(self) -> None:
-        self.dismiss(None)
-
-    def on_input_submitted(self, event) -> None:
-        try:
-            if event.input.id != "label-input":
-                return
-        except AttributeError:
-            return
-        event.stop()
-        self.action_submit()
+from threadhop_core.tui.screens.label_prompt import LabelPromptScreen  # noqa: E402
+from threadhop_core.tui.screens.confirm import ConfirmScreen  # noqa: E402
 
 
-class ConfirmScreen(ModalScreen):
-    """Minimal yes/no confirmation modal for TUI actions."""
-
-    BINDINGS = [
-        Binding("y", "confirm", "Yes", priority=True, show=False),
-        Binding("n", "cancel", "No", priority=True, show=False),
-        Binding("enter", "confirm", "Yes", priority=True, show=False),
-        Binding("escape", "cancel", "No", priority=True, show=False),
-    ]
-
-    CSS = """
-    ConfirmScreen {
-        layout: vertical;
-        align: center middle;
-        background: $background 70%;
-    }
-
-    #confirm-container {
-        width: 72;
-        max-width: 90%;
-        height: auto;
-        background: $panel;
-        border: none;
-        padding: 1 2;
-        layout: vertical;
-    }
-
-    #confirm-title {
-        color: $text;
-        text-style: bold;
-    }
-
-    #confirm-hint {
-        height: 1;
-        margin-top: 1;
-        color: $text-muted;
-        text-style: italic;
-    }
-    """
-
-    def __init__(self, title: str):
-        super().__init__()
-        self._title = title
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="confirm-container"):
-            yield Static(self._title, id="confirm-title")
-            yield Static("y/Enter = yes • n/Esc = no", id="confirm-hint")
-
-    def action_confirm(self) -> None:
-        self.dismiss(True)
-
-    def action_cancel(self) -> None:
-        self.dismiss(False)
-
-
-class HelpScreen(ModalScreen):
-    """Full-app help overlay grouped by scope (ADR-017, task #42).
-
-    Mirrors the search modal layout so the two discoverability surfaces
-    feel consistent. Reads entirely from ``COMMAND_REGISTRY`` — anything
-    new added there appears here automatically.
-    """
-
-    BINDINGS = [
-        Binding("escape", "close", "Close", priority=True),
-        Binding("?", "close", "Close", priority=True),
-        Binding("q", "close", "Close", priority=True),
-    ]
-
-    # OpenCode-style command palette: no border, contrast comes from a
-    # 2-step luminance jump between the dimmed page and the panel
-    # background. Section headers are muted (not bright accent), and the
-    # only colored element is the keybinding column. This matches what
-    # makes OpenCode's palette feel "sleek" — one fill defines the
-    # surface, one accent highlights the focused row, and everything
-    # else is text/muted-text.
-    CSS = """
-    HelpScreen {
-        layout: vertical;
-        align: center middle;
-        background: $background 70%;
-    }
-
-    #help-container {
-        width: 70;
-        max-width: 90;
-        height: 70%;
-        background: $panel;
-        border: none;
-        padding: 1 2;
-        layout: vertical;
-    }
-
-    #help-title {
-        height: 1;
-        color: $text-muted;
-        text-style: none;
-    }
-
-    #help-body {
-        height: 1fr;
-        padding: 1 0;
-    }
-
-    #help-hint {
-        height: 1;
-        color: $text-muted;
-        text-style: none;
-    }
-
-    .help-scope {
-        margin-top: 1;
-        padding-right: 2;
-        color: $text-muted;
-        text-style: none;
-    }
-
-    .help-scope:first-of-type {
-        margin-top: 0;
-    }
-
-    /* Each row is a horizontal layout with the description filling
-       available width on the left and the keybinding pinned to the
-       right, so widths adapt to any container size and we don't have to
-       guess at scrollbar reservation. Avoiding Rich markup also
-       sidesteps escaping issues for keys that are literal brackets
-       (`[`, `]`). The row's right padding (2 cells) creates breathing
-       room between the rightmost keybinding and the scrollbar gutter. */
-    .help-row {
-        height: 1;
-        layout: horizontal;
-        padding-right: 2;
-    }
-    .help-row-desc {
-        width: 1fr;
-    }
-    .help-row-keys {
-        width: auto;
-        color: $text-muted;
-    }
-    """
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="help-container"):
-            yield Static("Commands", id="help-title")
-            yield VerticalScroll(id="help-body")
-            yield Static("esc to close", id="help-hint")
-
-    def on_mount(self) -> None:
-        body = self.query_one("#help-body", VerticalScroll)
-        for scope in SCOPE_ORDER:
-            commands = commands_for_scope(scope)
-            if not commands:
-                continue
-            body.mount(Static(SCOPE_LABELS[scope], classes="help-scope"))
-            for cmd in commands:
-                body.mount(
-                    Horizontal(
-                        Static(cmd.description, classes="help-row-desc"),
-                        Static(format_command_keys(cmd), classes="help-row-keys"),
-                        classes="help-row",
-                    )
-                )
-
-    def action_close(self) -> None:
-        self.dismiss(None)
+from threadhop_core.tui.screens.help import HelpScreen  # noqa: E402
 
 
 class ContextualFooter(Static):
@@ -3069,18 +2568,6 @@ class ContextualFooter(Static):
     those marked ``footer=True``.
     """
 
-    DEFAULT_CSS = """
-    ContextualFooter {
-        dock: bottom;
-        height: 1;
-        background: $boost;
-        color: $text-muted;
-        padding: 0 1;
-    }
-    ContextualFooter > .footer-sep {
-        color: $text-disabled;
-    }
-    """
 
     def __init__(self, *args, **kwargs):
         super().__init__("", *args, **kwargs)
@@ -3132,77 +2619,7 @@ class ContextualFooter(Static):
         self.update(sep.join(parts))
 
 
-class FindBar(Horizontal):
-    """Persistent Ctrl+F-style find bar shown above the transcript.
-
-    Stays open until the user dismisses it (Esc, ×, or Ctrl+F again), so
-    the active query remains editable and the match counter remains
-    visible across session switches. Unlike ``SearchScreen`` (which
-    issues FTS5 queries across ALL indexed sessions), this bar operates
-    purely on widgets already rendered in the current ``TranscriptView``
-    — it's a within-transcript "find in page", not a cross-session
-    search.
-
-    Hidden by default via ``display = False``; App.action_open_find
-    toggles it visible and focuses the input.
-    """
-
-    def compose(self) -> ComposeResult:
-        yield Input(
-            placeholder="Find in transcript… (Enter=next, ↑/↓ prev/next, Esc=close)",
-            id="find-input",
-        )
-        yield Static("", id="find-status")
-        yield Static("[×]", id="find-close")
-
-    def update_status(self, current: int, total: int, has_query: bool) -> None:
-        """Set the match counter. ``has_query=False`` blanks the status."""
-        status = self.query_one("#find-status", Static)
-        if not has_query:
-            status.update("")
-        elif total == 0:
-            status.update("No matches")
-        elif total == 1:
-            status.update("1 match")
-        else:
-            status.update(f"{current} of {total} matches")
-
-    def on_key(self, event) -> None:
-        """Arrow / Escape bubble up from the Input — keep them here.
-
-        Up/Down navigate matches without leaving the input. Escape
-        closes the bar and clears highlights. Enter is handled by the
-        app's ``on_input_submitted`` because Input fires Submitted on
-        Enter, not a raw key event here.
-        """
-        key = event.key
-        if key == "escape":
-            event.stop()
-            event.prevent_default()
-            self.app._close_find()
-        elif key == "down":
-            event.stop()
-            event.prevent_default()
-            self.app.action_find_next()
-        elif key == "up":
-            event.stop()
-            event.prevent_default()
-            self.app.action_find_prev()
-
-    def on_click(self, event) -> None:
-        """Click on the × static to dismiss.
-
-        Textual's Click event bubbles up the widget tree; checking the
-        event's widget id here lets the whole bar act as a click host
-        without extra message plumbing.
-        """
-        try:
-            target = getattr(event, "widget", None)
-            if target is not None and target.id == "find-close":
-                event.stop()
-                self.app._close_find()
-        except Exception:
-            pass
+from threadhop_core.tui.widgets.find_bar import FindBar  # noqa: E402
 
 
 def _kanban_card_title(session: dict, custom_name: str | None) -> str:
@@ -3331,94 +2748,6 @@ class KanbanScreen(ModalScreen):
     changed elsewhere pulls the cursor with it to the new column.
     """
 
-    CSS = """
-    KanbanScreen {
-        layout: vertical;
-        align: center middle;
-        background: $background 70%;
-    }
-    #kanban-container {
-        width: 95%;
-        height: 90%;
-        background: $panel;
-        border: round $panel-lighten-2;
-        padding: 1 2;
-        layout: vertical;
-    }
-    #kanban-title {
-        height: 1;
-        content-align: center middle;
-        text-style: bold;
-        color: $accent;
-    }
-    #kanban-columns {
-        height: 1fr;
-        layout: horizontal;
-    }
-    .kanban-column {
-        width: 1fr;
-        min-width: 18;
-        height: 100%;
-        margin: 0 1;
-        layout: vertical;
-    }
-    .kanban-column-header {
-        height: 2;
-        content-align: center middle;
-        text-style: bold;
-        background: $boost;
-        color: $accent;
-    }
-    .kanban-column-scroll {
-        height: 1fr;
-        border: round $primary-darken-2;
-        padding: 0 1;
-    }
-    .kanban-card {
-        height: 5;
-        padding: 0 1;
-        margin-top: 1;
-        border: tall $primary-darken-2;
-        layout: vertical;
-    }
-    /* Title fills any rows left over after the meta row; wrapping
-       is allowed but excess rows clip here, so a freakishly long
-       title can't push meta out of the card. */
-    .kanban-card-title {
-        height: 1fr;
-        overflow-y: hidden;
-    }
-    /* Meta is always exactly one row at the bottom — the guarantee
-       that turns / age / activity stay visible regardless of title
-       length. */
-    .kanban-card-meta {
-        height: 1;
-    }
-    /* Three-layer selection highlight mirrors the transcript
-       message-selected rule (tui.py:3470) so the selected state looks
-       like "selected" across every theme. $warning is reserved and
-       always contrasts strongly against $surface/$background, so the
-       cursor stays visible whether the user is on dracula, nord,
-       monokai, or one of the light variants. */
-    .kanban-card.-selected {
-        border: heavy $warning;
-        background: $warning 25%;
-        tint: $warning 8%;
-    }
-    .kanban-card:hover {
-        border: tall $accent;
-    }
-    .kanban-empty {
-        color: $text-muted;
-        text-style: italic;
-        padding: 1;
-    }
-    #kanban-hint {
-        height: 1;
-        content-align: center middle;
-        color: $text-muted;
-    }
-    """
 
     # priority=True is load-bearing for the arrow keys: without it the
     # focused VerticalScroll column consumes up/down to scroll itself
@@ -3739,285 +3068,7 @@ class ClaudeSessions(App):
     ALLOW_SELECT = True
     AUTO_COPY = True
 
-    CSS = """
-    Screen {
-        layout: grid;
-        grid-size: 2 2;
-        grid-columns: 36 1fr;
-        grid-rows: 1fr auto;
-        grid-gutter: 0;
-        /* Thin, muted scrollbars — Textual's default is 2 cells wide
-           with a $primary-tinted thumb that competes with the focus
-           accent. Reducing to 1 cell + $border-blurred thumb keeps the
-           scroll affordance present but recessive. The active thumb
-           still uses $accent so dragging is visible. */
-        scrollbar-size-vertical: 1;
-        scrollbar-size-horizontal: 1;
-        scrollbar-background: $panel;
-        scrollbar-background-hover: $panel;
-        scrollbar-background-active: $panel;
-        scrollbar-color: $border-blurred;
-        scrollbar-color-hover: $border;
-        scrollbar-color-active: $accent;
-    }
-
-    /* Idle panels all carry the same muted border so section boundaries
-       stay visible without competing. The focused panel is promoted to
-       $accent, giving the eye a single clear target — this is the TUI
-       analogue of focus-elevation via shadow on the web. The single-bar
-       OpenCode pattern was tried here but conflicted with per-message
-       role borders (UserMessage uses border-left: thick $accent,
-       AssistantMessage thick $success) — those role borders sit just
-       inside the panel boundary and overwhelmed the panel's own bar.
-       The four-sided box wraps around them cleanly. */
-    #session-list {
-        height: 100%;
-        border: solid $panel;
-        border-title-color: $text;
-        scrollbar-size-vertical: 1;
-    }
-
-    #session-list:focus-within {
-        border: solid $accent;
-    }
-
-    #transcript-column {
-        height: 100%;
-        layout: vertical;
-    }
-
-    #transcript-scroll {
-        height: 1fr;
-        border: solid $panel;
-        border-title-color: $text;
-        scrollbar-size-vertical: 1;
-    }
-
-    #transcript-scroll:focus-within {
-        border: solid $accent;
-    }
-
-    ObservationInfoHeader {
-        padding: 0 1;
-        margin: 0;
-        color: $text-muted;
-        background: $panel;
-    }
-
-    FindBar {
-        height: 1;
-        background: $boost;
-        layout: horizontal;
-    }
-
-    #find-input {
-        width: 1fr;
-        height: 1;
-        border: none;
-        padding: 0 1;
-        background: $boost;
-    }
-
-    #find-input:focus {
-        background: $surface;
-    }
-
-    #find-status {
-        width: auto;
-        height: 1;
-        padding: 0 2;
-        color: $text-muted;
-    }
-
-    /* 5 cells wide (was 3) so the mouse target is comfortable without
-       pushing the status counter. Visible glyph stays centered. */
-    #find-close {
-        width: 5;
-        height: 1;
-        content-align: center middle;
-        color: $error;
-        background: $error 15%;
-    }
-
-    #find-close:hover {
-        background: $error 30%;
-    }
-
-    /* OpenCode-style prompt: a single left-edge accent bar instead of a
-       four-sided border, sitting on a $surface fill so the input box
-       reads as one inset block. The keybind hints that previously lived
-       in border-title are already in ContextualFooter, so the input box
-       itself is title-less. Reference:
-       anomalyco/opencode packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx
-       — the outer box uses border={["left"]} with backgroundElement fill
-       and paddingLeft/Right=2 paddingTop=1, exactly mirrored here. */
-    #input-container {
-        column-span: 2;
-        border: none;
-        border-left: thick $border-blurred;
-        background: $surface;
-        height: auto;
-        min-height: 2;
-        max-height: 10;
-        padding: 1 2 0 2;
-    }
-
-    #input-container:focus-within {
-        border-left: thick $accent;
-    }
-
-    /* TextArea ships with ``border: tall transparent`` (focused: tall $accent),
-       which reserves 2 rows even when blurred and draws a second accent
-       rectangle on focus — visible as a purple frame layered on top of the
-       container's left-bar. Disabling the TextArea's border keeps the
-       OpenCode-style single left-bar as the only focus indicator and
-       collapses the empty-state height to two rows. */
-    #reply-input {
-        background: $surface;
-        border: none;
-        height: auto;
-        min-height: 1;
-        max-height: 8;
-        padding: 0;
-    }
-
-    #reply-input:focus {
-        background: $surface;
-        border: none;
-    }
-
-    UserMessage {
-        padding: 1 1;
-        margin: 1 0 0 0;
-        background: $primary-background 15%;
-        border-left: thick $accent;
-    }
-
-    AssistantMessage {
-        padding: 1 1;
-        margin: 1 0 0 0;
-        border-left: thick $success;
-    }
-
-    /* OpenCode-style tool block: round single-cell border one luminance
-       step from the panel so the widget reads as a contained unit
-       without competing with the message it belongs to. The left
-       padding (3 cells in the old version) is now spent on the border
-       + inner padding instead, so total horizontal weight is unchanged.
-       $panel-lighten-2 is portable across themes via Textual's color
-       algebra — works on built-in themes and OpenCode-derived ones
-       alike. */
-    ToolMessage {
-        padding: 0 1;
-        margin: 0 0 0 2;
-        border: round $panel-lighten-2;
-        background: $surface;
-    }
-
-    /* CommandPill: single-line summary for slash-command invocations
-       and skill-loads. No border-left accent (those are reserved for
-       human-vs-Claude turn boundaries) and no background fill, so the
-       pill recedes visually next to real conversation while still being
-       selectable in selection mode. The same vertical-margin rule as
-       UserMessage keeps stacking density consistent. */
-    CommandPill {
-        padding: 0 1;
-        margin: 1 0 0 2;
-        color: $text-muted;
-    }
-
-    .session-label {
-        padding: 0 1;
-    }
-
-    /* Status group dividers (Backlog / In Progress / Done / …). The
-       prior styling was muted+italic, which read as "barely there" —
-       sections didn't visually separate. The new look uses bold full-
-       contrast text on a darker recessed background and adds a 1-cell
-       top pad so each header occupies 2 rows: a clear section break
-       between groups instead of a near-invisible rule. */
-    .status-header {
-        padding: 1 1 0 1;
-        color: $text;
-        text-style: bold;
-    }
-
-    /* The outer ListItem carries the darker recessed background so the
-       full row width is shaded — including the cells the inner Static's
-       padding doesn't cover. ``$panel-darken-1`` is portable across
-       themes via Textual's color algebra, so OpenCode dark themes get a
-       genuine recess and lighter themes get a subtle inset. The
-       ``height: 2`` matches the inner Static's effective height (1 text
-       + 1 top padding). */
-    SessionStatusHeader, SessionStatusHeader:disabled {
-        background: $panel-darken-1;
-        height: 2;
-    }
-
-    ListView:focus > SessionStatusHeader.--highlight {
-        background: $panel-darken-1;
-    }
-
-    .session-label.unread {
-        color: $warning;
-        text-style: bold;
-    }
-
-    .session-label.active {
-        color: $accent;
-    }
-
-    .session-label.working {
-        color: $success;
-    }
-
-    .session-label.archived {
-        color: $text-muted;
-        text-style: italic;
-    }
-
-    ListView > ListItem.--highlight {
-        background: $boost;
-    }
-
-    ListView:focus > ListItem.--highlight {
-        background: $accent;
-    }
-
-    /* Selection highlight — must override per-type border-left */
-    UserMessage.message-selected,
-    AssistantMessage.message-selected,
-    ToolMessage.message-selected,
-    CommandPill.message-selected {
-        background: $warning 20%;
-        border-left: thick $warning;
-        tint: $warning 8%;
-    }
-
-    /* Range selection highlight — softer tint for non-cursor messages */
-    UserMessage.message-range-selected,
-    AssistantMessage.message-range-selected,
-    ToolMessage.message-range-selected,
-    CommandPill.message-range-selected {
-        background: $accent 15%;
-        border-left: thick $accent;
-        tint: $accent 5%;
-    }
-
-    /* Cursor within a range — keep the stronger warning highlight */
-    UserMessage.message-selected.message-range-selected,
-    AssistantMessage.message-selected.message-range-selected,
-    ToolMessage.message-selected.message-range-selected,
-    CommandPill.message-selected.message-range-selected {
-        background: $warning 20%;
-        border-left: thick $warning;
-        tint: $warning 8%;
-    }
-
-    ToastRack {
-        margin-bottom: 2;
-    }
-    """
+    CSS_PATH = _TUI_CSS_FILES
 
     # Bindings come from the shared command registry (ADR-017). Add new
     # App-level commands to COMMAND_REGISTRY above, not here — footer and

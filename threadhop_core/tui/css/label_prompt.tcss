@@ -1,0 +1,32 @@
+LabelPromptScreen {
+    layout: vertical;
+    align: center middle;
+    background: $background 70%;
+}
+
+#label-container {
+    width: 70;
+    max-width: 90%;
+    height: auto;
+    background: $panel;
+    border: none;
+    padding: 1 2;
+    layout: vertical;
+}
+
+#label-title {
+    height: 1;
+    text-style: bold;
+    color: $text;
+}
+
+#label-input {
+    margin-top: 1;
+}
+
+#label-hint {
+    height: 1;
+    margin-top: 1;
+    color: $text-muted;
+    text-style: italic;
+}

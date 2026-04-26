@@ -1,0 +1,63 @@
+/* Explicitly reset layout here — the app's top-level
+   `Screen { layout: grid; grid-columns: 36 1fr; ... }` rule cascades
+   to ModalScreen subclasses too, which would otherwise squeeze the
+   modal into the 36-col first grid cell. */
+SearchScreen {
+    layout: vertical;
+    align: center top;
+    background: $background 70%;
+}
+
+#search-container {
+    width: 90%;
+    max-width: 140;
+    height: 85%;
+    margin-top: 1;
+    background: $panel;
+    border: none;
+    padding: 1 2;
+    layout: vertical;
+}
+
+/* Inner widgets inherit the panel background so the modal reads as
+   one continuous surface (OpenCode palette pattern). The previous
+   $boost/$surface fills produced a visible color band where the
+   container's 1-cell padding sat between the panel and the inner
+   widgets. */
+#search-input {
+    margin: 0;
+    border: none;
+    background: transparent;
+}
+
+#search-input:focus {
+    background: transparent;
+}
+
+#search-results {
+    height: 1fr;
+    background: transparent;
+}
+
+#search-status {
+    height: 1;
+    padding: 0 1;
+    color: $text-muted;
+    background: transparent;
+}
+
+#search-help {
+    height: 1;
+    padding: 0 1;
+    color: $text-muted;
+    background: transparent;
+    text-style: italic;
+}
+
+.search-result {
+    padding: 0 1;
+}
+
+SearchResultItem {
+    padding: 0;
+}

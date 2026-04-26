@@ -1,0 +1,10 @@
+ContextualFooter {
+    dock: bottom;
+    height: 1;
+    background: $boost;
+    color: $text-muted;
+    padding: 0 1;
+}
+ContextualFooter > .footer-sep {
+    color: $text-disabled;
+}

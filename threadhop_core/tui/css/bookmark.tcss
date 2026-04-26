@@ -1,0 +1,56 @@
+BookmarkBrowserScreen {
+    layout: vertical;
+    align: center top;
+    background: $background 70%;
+}
+
+#bookmark-container {
+    width: 90%;
+    max-width: 140;
+    height: 85%;
+    margin-top: 1;
+    background: $panel;
+    border: none;
+    padding: 1 2;
+    layout: vertical;
+}
+
+/* Inner widgets inherit the panel background so the modal reads as
+   one continuous surface — same pattern as the search modal above. */
+#bookmark-input {
+    margin: 0;
+    border: none;
+    background: transparent;
+}
+
+#bookmark-input:focus {
+    background: transparent;
+}
+
+#bookmark-results {
+    height: 1fr;
+    background: transparent;
+}
+
+#bookmark-status {
+    height: 1;
+    padding: 0 1;
+    color: $text-muted;
+    background: transparent;
+}
+
+#bookmark-help {
+    height: 1;
+    padding: 0 1;
+    color: $text-muted;
+    background: transparent;
+    text-style: italic;
+}
+
+.bookmark-item {
+    padding: 0 1;
+}
+
+BookmarkItem {
+    padding: 0;
+}

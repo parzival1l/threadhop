@@ -14,6 +14,7 @@ import signal
 import sys
 
 from ...observation import observer
+from ...observation.observer_state import _refresh_observer_state
 from ...session.detection import (
     CLAUDE_PROJECTS,
     find_session_path,
@@ -23,18 +24,13 @@ from ...storage import db
 from ..bootstrap import cli_bootstrap
 from ..helpers import _resolve_cli_session
 
-
-def _refresh_observer_state(conn, session_id: str) -> dict | None:
-    """Return the observation_state row, correcting stale running PIDs."""
-    state = db.get_observation_state(conn, session_id)
-    if state is None:
-        return None
-    pid = state.get("observer_pid")
-    if state.get("status") == "running" and pid is not None:
-        if not observer._pid_is_alive(int(pid)):
-            db.set_observer_stopped(conn, session_id)
-            state = db.get_observation_state(conn, session_id)
-    return state
+__all__ = [
+    "_refresh_observer_state",
+    "_print_observer_result",
+    "_stop_observer_session",
+    "_stop_all_observers",
+    "cmd_observe",
+]
 
 
 def _print_observer_result(result: dict, *, prefix: str = "observer") -> None:

@@ -1,0 +1,63 @@
+HelpScreen {
+    layout: vertical;
+    align: center middle;
+    background: $background 70%;
+}
+
+#help-container {
+    width: 70;
+    max-width: 90;
+    height: 70%;
+    background: $panel;
+    border: none;
+    padding: 1 2;
+    layout: vertical;
+}
+
+#help-title {
+    height: 1;
+    color: $text-muted;
+    text-style: none;
+}
+
+#help-body {
+    height: 1fr;
+    padding: 1 0;
+}
+
+#help-hint {
+    height: 1;
+    color: $text-muted;
+    text-style: none;
+}
+
+.help-scope {
+    margin-top: 1;
+    padding-right: 2;
+    color: $text-muted;
+    text-style: none;
+}
+
+.help-scope:first-of-type {
+    margin-top: 0;
+}
+
+/* Each row is a horizontal layout with the description filling
+   available width on the left and the keybinding pinned to the
+   right, so widths adapt to any container size and we don't have to
+   guess at scrollbar reservation. Avoiding Rich markup also
+   sidesteps escaping issues for keys that are literal brackets
+   (`[`, `]`). The row's right padding (2 cells) creates breathing
+   room between the rightmost keybinding and the scrollbar gutter. */
+.help-row {
+    height: 1;
+    layout: horizontal;
+    padding-right: 2;
+}
+.help-row-desc {
+    width: 1fr;
+}
+.help-row-keys {
+    width: auto;
+    color: $text-muted;
+}
