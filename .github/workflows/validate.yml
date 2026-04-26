@@ -4,8 +4,8 @@ name: Validate
 # status check that branch protection can require before merge.
 #
 # Checks (fast — no real test runtime yet):
-#   1. Python syntax of threadhop + tui.py
-#   2. Version parity across threadhop / marketplace.json / plugin.json
+#   1. Python syntax of threadhop + the threadhop_core/ package
+#   2. Version parity across threadhop_core / marketplace.json / plugin.json
 #   3. CHANGELOG.md has a matching entry for the current __version__
 #   4. pytest, if tests/ exists
 #
@@ -23,18 +23,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Python syntax (threadhop, tui.py)
-        run: |
-          python3 -c "import ast; ast.parse(open('threadhop').read())"
-          python3 -c "import ast; ast.parse(open('tui.py').read())"
-
-      - name: Version parity (threadhop / marketplace.json / plugin.json)
+      - name: Python syntax (threadhop entrypoint + threadhop_core package)
         run: |
           set -euo pipefail
-          TH=$(grep -oE '^__version__ = "[^"]+"' threadhop | head -1 | cut -d'"' -f2)
+          # The entrypoint script has a PEP 723 metadata header but is
+          # otherwise plain Python — ast.parse handles both.
+          python3 -c "import ast; ast.parse(open('threadhop').read())"
+          # Compile every .py in the package; non-zero exit on any syntax error.
+          python3 -m compileall -q threadhop_core
+
+      - name: Version parity (threadhop_core / marketplace.json / plugin.json)
+        run: |
+          set -euo pipefail
+          TH=$(grep -oE '^__version__ = "[^"]+"' threadhop_core/__init__.py | head -1 | cut -d'"' -f2)
+          if [ -z "$TH" ]; then
+            echo "::error::Could not read __version__ from threadhop_core/__init__.py"
+            exit 1
+          fi
           MP=$(python3 -c "import json; print(json.load(open('.claude-plugin/marketplace.json'))['plugins'][0]['version'])")
           PL=$(python3 -c "import json; print(json.load(open('plugin/.claude-plugin/plugin.json'))['version'])")
-          echo "threadhop=$TH  marketplace.json=$MP  plugin.json=$PL"
+          echo "threadhop_core=$TH  marketplace.json=$MP  plugin.json=$PL"
           if [ "$TH" != "$MP" ] || [ "$TH" != "$PL" ]; then
             echo "::error::Version mismatch — all three must agree (see RELEASE.md)."
             exit 1
@@ -43,7 +51,11 @@ jobs:
       - name: CHANGELOG entry exists for current __version__
         run: |
           set -euo pipefail
-          V=$(grep -oE '^__version__ = "[^"]+"' threadhop | head -1 | cut -d'"' -f2)
+          V=$(grep -oE '^__version__ = "[^"]+"' threadhop_core/__init__.py | head -1 | cut -d'"' -f2)
+          if [ -z "$V" ]; then
+            echo "::error::Could not read __version__ from threadhop_core/__init__.py"
+            exit 1
+          fi
           if ! grep -qE "^## \[$V\]" CHANGELOG.md; then
             echo "::error::CHANGELOG.md is missing a '## [$V]' entry."
             exit 1

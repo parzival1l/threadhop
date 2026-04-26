@@ -30,13 +30,27 @@ jobs:
         id: ver
         run: |
           set -euo pipefail
-          NEW=$(grep -oE '^__version__ = "[^"]+"' threadhop | head -1 | cut -d'"' -f2)
-          OLD=$(git show HEAD~1:threadhop 2>/dev/null \
+          # __version__ moved from ./threadhop (script) to threadhop_core/__init__.py
+          # in the package refactor. Read the current value from the new location;
+          # for the previous commit, try the new path first and fall back to the old
+          # path so version detection works across the refactor boundary.
+          NEW=$(grep -oE '^__version__ = "[^"]+"' threadhop_core/__init__.py | head -1 | cut -d'"' -f2)
+          if [ -z "$NEW" ]; then
+            echo "::error::Could not read __version__ from threadhop_core/__init__.py"
+            exit 1
+          fi
+          OLD=$(git show HEAD~1:threadhop_core/__init__.py 2>/dev/null \
                 | grep -oE '^__version__ = "[^"]+"' | head -1 | cut -d'"' -f2 \
                 || echo "")
+          if [ -z "$OLD" ]; then
+            # Fallback: pre-refactor, __version__ lived in the entrypoint script.
+            OLD=$(git show HEAD~1:threadhop 2>/dev/null \
+                  | grep -oE '^__version__ = "[^"]+"' | head -1 | cut -d'"' -f2 \
+                  || echo "")
+          fi
           echo "new=$NEW" >> "$GITHUB_OUTPUT"
           echo "old=$OLD" >> "$GITHUB_OUTPUT"
-          if [ -n "$NEW" ] && [ "$NEW" != "$OLD" ]; then
+          if [ "$NEW" != "$OLD" ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
             echo "::notice::Version changed $OLD -> $NEW; proceeding to release."
           else
