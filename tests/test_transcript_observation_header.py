@@ -5,7 +5,7 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
-import db
+from threadhop_core.storage import db
 
 
 def _load_threadhop_module():

@@ -10,7 +10,7 @@ import re
 import sqlite3
 from typing import Any
 
-import db
+from . import db
 
 
 # Sentinel characters bracketing matched spans in snippet text. The TUI

@@ -18,8 +18,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
-import db
-import observer
+from ..storage import db
+from . import observer
 
 
 def _session_rows_for_filter(

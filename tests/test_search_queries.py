@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import db
-import search_queries
+from threadhop_core.storage import db
+from threadhop_core.storage import search_queries
 
 
 def _seed_message(

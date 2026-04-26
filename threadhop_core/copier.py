@@ -39,7 +39,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 
-import indexer
+from . import indexer
 
 
 # Claude Code surfaces several harness-tooling wrappers as plain-text

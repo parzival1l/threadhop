@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-import db
+from threadhop_core.storage import db
 
 
 # =========================================================================

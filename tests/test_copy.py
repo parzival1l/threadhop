@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-import copier as copy_mod
+from threadhop_core import copier as copy_mod
 
 
 # --- Fixture builders ----------------------------------------------------

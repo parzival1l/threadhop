@@ -8,7 +8,7 @@ import stat
 import subprocess
 from pathlib import Path
 
-import db
+from threadhop_core.storage import db
 
 
 ROOT = Path(__file__).resolve().parent.parent

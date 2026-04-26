@@ -41,10 +41,10 @@ import subprocess
 from pathlib import Path
 from typing import Any, Callable
 
-import db
-import indexer
-import observer
-import reflector
+from .storage import db
+from . import indexer
+from .observation import observer
+from .observation import reflector
 
 
 # --- Configuration --------------------------------------------------------
@@ -69,7 +69,7 @@ HANDOFF_BATCH_THRESHOLD = 1
 
 # Location of the polish prompt. Bundled with the app alongside
 # ``prompts/observer.md`` and ``prompts/reflector.md``.
-POLISH_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "handoff.md"
+POLISH_PROMPT_PATH = Path(__file__).resolve().parents[1] / "prompts" / "handoff.md"
 
 # Observation types in display order. Mirrors observer.py's ``_TYPE_ORDER``
 # but reorders for a reader: decisions/ADRs first (the "what was chosen"),

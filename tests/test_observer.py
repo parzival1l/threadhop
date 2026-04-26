@@ -25,8 +25,8 @@ from typing import Callable
 
 import pytest
 
-import db
-import observer
+from threadhop_core.storage import db
+from threadhop_core.observation import observer
 
 
 # --- Fixtures --------------------------------------------------------------
@@ -149,7 +149,7 @@ class TestTranscriptRendering:
     """
 
     def test_users_and_assistants_each_count_as_turns(self):
-        import indexer
+        from threadhop_core import indexer
         raw = (
             _user_line("u1", "hi") + "\n" +
             _assistant_line("a1", "m1", "hello") + "\n" +
@@ -158,7 +158,7 @@ class TestTranscriptRendering:
         assert len(indexer.parse_byte_range(raw)) == 3
 
     def test_assistant_streaming_chunks_collapse_to_one_turn(self):
-        import indexer
+        from threadhop_core import indexer
         raw = (
             _user_line("u1", "q") + "\n" +
             _assistant_line("a1", "m1", "part 1") + "\n" +
@@ -174,7 +174,7 @@ class TestTranscriptRendering:
         assert "part 3" in assistant_turn["text"]
 
     def test_tool_result_user_lines_are_not_turns(self):
-        import indexer
+        from threadhop_core import indexer
         raw = (
             _user_line("u1", "do a thing") + "\n" +
             _tool_result_user_line("tr1") + "\n" +

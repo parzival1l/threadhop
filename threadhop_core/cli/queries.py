@@ -8,8 +8,8 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 
-import db
-import observer
+from ..storage import db
+from ..observation import observer
 
 
 def sync_sessions_from_disk(

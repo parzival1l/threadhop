@@ -49,9 +49,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-import db
-import indexer
-import reflector
+from ..storage import db
+from .. import indexer
+from . import reflector
 
 
 # --- Configuration --------------------------------------------------------
@@ -64,7 +64,7 @@ BATCH_THRESHOLD = 3
 
 # Location of the shared observer prompt. Bundled with the app — the runtime
 # does not need anything in ``~/.config/threadhop/prompts/``.
-PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "observer.md"
+PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "observer.md"
 
 # Default subprocess timeout. Haiku usually responds in seconds, but the
 # first call of a session can pay an auth/warmup cost, and extremely large

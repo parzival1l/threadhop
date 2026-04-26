@@ -8,7 +8,7 @@ import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-import db
+from threadhop_core.storage import db
 
 
 ROOT = Path(__file__).resolve().parent.parent

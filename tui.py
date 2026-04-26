@@ -18,7 +18,7 @@ from time import perf_counter
 
 import threadhop as _core
 from threadhop import *  # noqa: F401,F403
-import indexer  # for classify_user_text — see _parse_messages
+from threadhop_core import indexer  # for classify_user_text — see _parse_messages
 
 globals().update({
     name: value
@@ -3963,7 +3963,7 @@ class ClaudeSessions(App):
         # lookup so a config that names "opencode-dark" resolves cleanly
         # on first launch.
         try:
-            from themes import load_opencode_themes
+            from threadhop_core.tui.theme import load_opencode_themes
             for theme in load_opencode_themes():
                 self.register_theme(theme)
         except Exception:

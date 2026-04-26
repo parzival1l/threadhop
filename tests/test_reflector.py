@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-import db
-import reflector
+from threadhop_core.storage import db
+from threadhop_core.observation import reflector
 
 
 @pytest.fixture

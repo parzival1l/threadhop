@@ -7,7 +7,7 @@ import importlib.util
 import sys
 from pathlib import Path
 
-import db
+from threadhop_core.storage import db
 
 
 def _load_threadhop_module():

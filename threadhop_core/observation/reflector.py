@@ -15,10 +15,10 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-import db
+from ..storage import db
 
 
-PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "reflector.md"
+PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "reflector.md"
 DEFAULT_TIMEOUT_SEC = 180.0
 
 

@@ -31,8 +31,8 @@ from typing import Callable
 
 import pytest
 
-import db
-import handoff
+from threadhop_core.storage import db
+from threadhop_core import handoff
 
 
 # --- Fixtures -------------------------------------------------------------
@@ -59,7 +59,7 @@ def _quiet_reflector(monkeypatch: pytest.MonkeyPatch):
     Reflector-specific tests pass their own callable via ``reflect_fn=<fake>``
     which takes precedence over this stub.
     """
-    import reflector as reflector_mod
+    from threadhop_core.observation import reflector as reflector_mod
 
     def _noop_reflect(conn, session_id, **_kwargs):
         return {"status": "up_to_date", "new_entries": 0, "entry_count": 0}

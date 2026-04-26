@@ -43,7 +43,7 @@ import sys
 from pathlib import Path
 from typing import Iterator
 
-import db
+from .storage import db
 
 # Root of Claude Code's per-project session directories.
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"

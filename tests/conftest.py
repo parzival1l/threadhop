@@ -44,7 +44,7 @@ def db_path(tmp_path: Path) -> Path:
 @pytest.fixture
 def conn(db_path: Path):
     """Initialized DB connection pointed at a temp DB, schema applied."""
-    import db as db_mod
+    from threadhop_core.storage import db as db_mod
 
     c = db_mod.init_db(db_path)
     try:

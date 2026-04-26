@@ -5,7 +5,7 @@ import sys
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-import db
+from threadhop_core.storage import db
 
 
 def _load_threadhop_module():

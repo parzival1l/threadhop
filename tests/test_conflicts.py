@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-import cli_queries
-import db
+from threadhop_core.cli import queries as cli_queries
+from threadhop_core.storage import db
 
 
 @pytest.fixture

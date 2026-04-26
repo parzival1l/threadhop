@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-import db
-import observation_queries
+from threadhop_core.storage import db
+from threadhop_core.observation import queries as observation_queries
 
 
 @pytest.fixture

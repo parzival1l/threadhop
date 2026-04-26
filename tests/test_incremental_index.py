@@ -14,8 +14,8 @@ from __future__ import annotations
 import json
 import time
 
-import db
-import indexer
+from threadhop_core.storage import db
+from threadhop_core import indexer
 
 
 # --- JSONL line builders ---------------------------------------------------
@@ -226,7 +226,7 @@ def test_skips_skill_load_banner_user_lines(conn, tmp_path):
 def test_classify_user_text_round_trip():
     """Pin the kinds returned by classify_user_text — TUI render branches
     in tui.py:load_transcript depend on these exact strings."""
-    import indexer
+    from threadhop_core import indexer
 
     assert indexer.classify_user_text(
         "<command-name>/foo</command-name>"

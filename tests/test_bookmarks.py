@@ -15,7 +15,7 @@ import sqlite3
 
 import pytest
 
-import db
+from threadhop_core.storage import db
 
 
 def _seed_session(conn: sqlite3.Connection, session_id: str, **over):

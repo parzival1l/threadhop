@@ -25,13 +25,13 @@ from pathlib import Path
 # Local package: SQLite DB module (init, migrations, session helpers).
 # Imported as a relative module because db.py sits next to this script.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import db  # noqa: E402
-import indexer  # noqa: E402
-import cli_queries  # noqa: E402
-import handoff as handoff_mod  # noqa: E402
-import observation_queries  # noqa: E402
-import observer  # noqa: E402
-import search_queries  # noqa: E402
+from threadhop_core.storage import db  # noqa: E402
+from threadhop_core import indexer  # noqa: E402
+from threadhop_core.cli import queries as cli_queries  # noqa: E402
+from threadhop_core import handoff as handoff_mod  # noqa: E402
+from threadhop_core.observation import queries as observation_queries  # noqa: E402
+from threadhop_core.observation import observer  # noqa: E402
+from threadhop_core.storage import search_queries  # noqa: E402
 
 # Lazy TUI extraction: expose the running script as `threadhop` so
 # `tui.py` can import shared helpers/constants from this module object
