@@ -4,6 +4,33 @@ All notable changes to ThreadHop are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions
 follow `major.minor.patch`.
 
+## [0.3.1] — 2026-04-26
+
+### Fixed
+- Sidebar and Kanban board now show the same set of sessions. Previously
+  with more than 50 sessions, the sidebar's global cap could slice
+  later-status buckets (`in_review`, `done`, `archived`) off the bottom
+  of the sorted list while the Kanban board still rendered them. The
+  symptom: clicking a card on the board that wasn't in the sidebar did
+  nothing — `_on_kanban_dismissed` walks the sidebar's `ListView` to
+  drive selection and silently bailed when the session was missing.
+- Both views now read from a single `_visible_sessions()` helper that
+  applies `MAX_SESSIONS` per status bucket (so each column gets its own
+  budget) and honors the `_show_archived` toggle uniformly. Manual
+  reorder (`shift+j`/`shift+k`) reuses the same helper so swap-with-
+  neighbor matches what's on screen.
+- `_on_kanban_dismissed` now flips `_show_archived` on and rebuilds when
+  an archived card is clicked from the board with the archived view
+  hidden, so the navigation always lands instead of silently failing.
+
+### Notes
+- Added `pyrightconfig.json` so basedpyright/pyright can resolve
+  third-party imports (`textual`, `rich`, `watchdog`, `pydantic`) from
+  a local `.venv/`. Editor-only — runtime still uses PEP 723 inline
+  metadata via `uv run --script`. Contributors who want red-squiggle-
+  free editor support should run `uv venv && uv pip install textual
+  watchdog pydantic pytest` once after cloning.
+
 ## [0.3.0] — 2026-04-26
 
 ### Added
