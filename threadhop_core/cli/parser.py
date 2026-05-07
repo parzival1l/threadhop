@@ -550,4 +550,38 @@ def build_parser():
         ),
     )
 
+    serve_p = subparsers.add_parser(
+        "serve",
+        help="Run the HTTP sidecar (FastAPI/uvicorn) for external UIs",
+        description=(
+            "Boot a localhost FastAPI sidecar that exposes the indexed "
+            "sessions DB as a read-only HTTP API. Designed for UI clients "
+            "like the t3code library route. Indexes once on startup."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  threadhop serve\n"
+            "  threadhop serve --port 8765\n"
+            "  threadhop serve --host 0.0.0.0 --log-level debug"
+        ),
+    )
+    serve_p.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Bind address (default: 127.0.0.1 — loopback only)",
+    )
+    serve_p.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="Bind port (default: 8765)",
+    )
+    serve_p.add_argument(
+        "--log-level",
+        default="info",
+        choices=["critical", "error", "warning", "info", "debug", "trace"],
+        help="uvicorn log level (default: info)",
+    )
+
     return parser

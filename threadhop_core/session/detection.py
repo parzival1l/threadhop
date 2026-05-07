@@ -75,10 +75,40 @@ def _resolve_session_id_by_cwd(cwd: str) -> str | None:
     return best
 
 
-def get_active_claude_session_ids() -> set[str]:
-    """Detect running interactive Claude session ids on macOS/Linux."""
-    active_ids: set[str] = set()
-    cwd_pids: dict[int, str | None] = {}  # pid -> cwd for processes without explicit session IDs
+def _resolve_cwds_for_pids(pids: list[int]) -> dict[int, str]:
+    """Resolve process working directories in one `lsof` call."""
+    if not pids:
+        return {}
+    cwd_by_pid: dict[int, str] = {}
+    try:
+        pid_list = ",".join(str(p) for p in pids)
+        result = subprocess.run(
+            ["lsof", "-a", "-d", "cwd", "-p", pid_list, "-Fn"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return cwd_by_pid
+
+    current_pid: int | None = None
+    for line in result.stdout.strip().split("\n"):
+        if line.startswith("p"):
+            try:
+                current_pid = int(line[1:])
+            except ValueError:
+                current_pid = None
+        elif line.startswith("n") and current_pid:
+            cwd_by_pid[current_pid] = line[1:]
+    return cwd_by_pid
+
+
+def get_active_claude_session_details() -> dict[str, list[dict]]:
+    """Detect active Claude sessions and return process evidence for each.
+
+    The TUI uses this richer shape to explain status badges without doing
+    another process scan. ``get_active_claude_session_ids`` keeps the older
+    set-only API for CLI callers that only need a yes/no answer.
+    """
+    process_rows: list[dict] = []
 
     try:
         result = subprocess.run(
@@ -97,37 +127,57 @@ def get_active_claude_session_ids() -> set[str]:
             if not is_interactive:
                 continue
 
-            if explicit_id:
-                active_ids.add(explicit_id)
-            else:
-                try:
-                    cwd_pids[int(pid_str)] = None
-                except ValueError:
-                    pass
-
-        if cwd_pids:
-            pid_list = ",".join(str(p) for p in cwd_pids)
-            result = subprocess.run(
-                ["lsof", "-a", "-d", "cwd", "-p", pid_list, "-Fn"],
-                capture_output=True, text=True, timeout=5,
+            try:
+                pid = int(pid_str)
+            except ValueError:
+                continue
+            process_rows.append(
+                {
+                    "pid": pid,
+                    "args": args,
+                    "explicit_session_id": explicit_id,
+                }
             )
-            current_pid: int | None = None
-            for line in result.stdout.strip().split("\n"):
-                if line.startswith("p"):
-                    current_pid = int(line[1:])
-                elif line.startswith("n") and current_pid:
-                    cwd_pids[current_pid] = line[1:]
-
-            for cwd in cwd_pids.values():
-                if not cwd:
-                    continue
-                sid = _resolve_session_id_by_cwd(cwd)
-                if sid:
-                    active_ids.add(sid)
     except Exception:
-        pass
+        return {}
 
-    return active_ids
+    cwd_by_pid = _resolve_cwds_for_pids([row["pid"] for row in process_rows])
+    active: dict[str, list[dict]] = {}
+    for row in process_rows:
+        pid = row["pid"]
+        cwd = cwd_by_pid.get(pid)
+        explicit_id = row.get("explicit_session_id")
+        if explicit_id:
+            sid = explicit_id
+            match_type = "resume-argument"
+            reason = f"process {pid} was launched with --resume/-r {sid}"
+        else:
+            if not cwd:
+                continue
+            sid = _resolve_session_id_by_cwd(cwd)
+            if not sid:
+                continue
+            match_type = "cwd-recent-transcript"
+            reason = (
+                f"process {pid} cwd matched the newest transcript "
+                "in that project"
+            )
+
+        active.setdefault(sid, []).append(
+            {
+                "pid": pid,
+                "cwd": cwd,
+                "match_type": match_type,
+                "reason": reason,
+            }
+        )
+
+    return active
+
+
+def get_active_claude_session_ids() -> set[str]:
+    """Detect running interactive Claude session ids on macOS/Linux."""
+    return set(get_active_claude_session_details())
 
 
 def _get_process_cwd(pid: int) -> str | None:

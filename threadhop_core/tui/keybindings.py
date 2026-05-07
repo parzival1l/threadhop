@@ -122,6 +122,10 @@ COMMAND_REGISTRY: list[Command] = [
         "start_reply_or_send", priority=True, footer=True,
     ),
     Command(("n",), "Rename session", SCOPE_SESSION_LIST, "rename_session", footer=True),
+    Command(
+        ("i",), "Inspect activity", SCOPE_SESSION_LIST,
+        "open_activity_inspector", footer=True,
+    ),
     Command(("g",), "Copy resume command", SCOPE_SESSION_LIST, "copy_session_id"),
     Command(("o",), "Copy observation path / start observing", SCOPE_SESSION_LIST, "observe_session"),
     Command(("O",), "Resume observation", SCOPE_SESSION_LIST, "resume_observation"),

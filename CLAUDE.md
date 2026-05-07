@@ -89,8 +89,9 @@ The script does sys.path setup and dispatches into
 
 ### Session State
 
-- **is_active**: A `claude` process is running for this session (matched by session ID in args or CWD)
-- **is_working**: Active + recently modified + has pending tool call or last message was from user
+- **is_active**: An interactive `claude` process is running for this session. `threadhop_core/session/detection.py` ignores Claude.app, IDE-embedded binaries, and non-interactive `-p/--print` calls. It matches by explicit `claude -r/--resume <session_id>` first; for `claude -c` or bare interactive `claude`, it resolves the process CWD with `lsof` and picks the newest non-`agent-*.jsonl` transcript in that project directory.
+- **is_working**: Active + transcript modified in the last 5 minutes + either the last real message was from the user or the latest assistant chunk contains a `tool_use` block that has not been followed by a `toolUseResult` line. Tool-result rows are `type=user`, but they do not count as human prompts.
+- **Activity inspector**: In the TUI session list, press `i` to open the lightweight activity inspector for the highlighted session. It shows the process evidence behind `is_active`, the `is_working` reason, last transcript update, transcript CWD/path, last event type, and recent tool-use evidence.
 
 ### Persistent Config
 

@@ -78,6 +78,9 @@ def main() -> int:
     if args.command == "future":
         from .commands.future import cmd_future  # noqa: PLC0415
         return cmd_future(args)
+    if args.command == "serve":
+        from .commands.serve import cmd_serve  # noqa: PLC0415
+        return cmd_serve(args)
 
     from .helpers import _cli_stub  # noqa: PLC0415
     return _cli_stub(args.command)

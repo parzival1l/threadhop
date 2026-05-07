@@ -43,6 +43,7 @@ from threadhop_core.observation.observer_state import _refresh_observer_state
 from threadhop_core.session.detection import (
     CLAUDE_PROJECTS,
     detect_project_from_cwd,
+    get_active_claude_session_details,
     get_active_claude_session_ids,
 )
 from threadhop_core.storage import db
@@ -70,6 +71,7 @@ from .keybindings import (
     SCOPE_SESSION_LIST,
     SCOPE_TRANSCRIPT,
 )
+from .screens.activity import ActivityInspectorScreen
 from .screens.bookmark import BookmarkBrowserScreen
 from .screens.confirm import ConfirmScreen
 from .screens.help import HelpScreen
@@ -100,6 +102,7 @@ _TUI_CSS_FILES = [
     str(_TUI_CSS_DIR / "help.tcss"),
     str(_TUI_CSS_DIR / "contextual_footer.tcss"),
     str(_TUI_CSS_DIR / "kanban.tcss"),
+    str(_TUI_CSS_DIR / "activity.tcss"),
 ]
 
 
@@ -330,13 +333,18 @@ class ClaudeSessions(App):
         """
         return get_active_claude_session_ids()
 
+    def _get_active_claude_session_details(self) -> dict[str, list[dict]]:
+        """Detect running claude processes with match evidence for the TUI."""
+        return get_active_claude_session_details()
+
     def _gather_session_data(self) -> dict:
         """Gather session data from JSONL files"""
         sessions = []
         cutoff = (
             datetime.now() - timedelta(days=self.days_filter)
         ).timestamp()
-        active_session_ids = self._get_active_claude_sessions()
+        active_session_details = self._get_active_claude_session_details()
+        active_session_ids = set(active_session_details)
 
         try:
             for project_dir in CLAUDE_PROJECTS.iterdir():
@@ -363,8 +371,14 @@ class ClaudeSessions(App):
                     first_user_msg = None
                     session_cwd = None
                     is_working = False
+                    has_process = False
+                    recently_modified = False
+                    working_reason = "transcript could not be inspected"
                     last_msg_type = None
+                    last_msg_timestamp = None
                     has_pending_tool = False
+                    pending_tool_calls: list[dict] = []
+                    recent_tool_events: list[dict] = []
                     user_turn_count = 0
 
                     try:
@@ -403,18 +417,47 @@ class ClaudeSessions(App):
                                         content = msg.get("message", {}).get(
                                             "content", []
                                         )
-                                        has_pending_tool = any(
-                                            b.get("type") == "tool_use"
-                                            for b in content
-                                            if isinstance(b, dict)
-                                        )
+                                        tool_calls: list[dict] = []
+                                        if isinstance(content, list):
+                                            for b in content:
+                                                if not isinstance(b, dict):
+                                                    continue
+                                                if b.get("type") != "tool_use":
+                                                    continue
+                                                tool_name = b.get("name", "Unknown")
+                                                tool_input = b.get("input", {})
+                                                if not isinstance(tool_input, dict):
+                                                    tool_input = {}
+                                                try:
+                                                    summary = indexer.abbreviate_tool_use(
+                                                        str(tool_name),
+                                                        tool_input,
+                                                    )
+                                                except Exception:
+                                                    summary = str(tool_name)
+                                                evidence = {
+                                                    "id": b.get("id") or "",
+                                                    "name": str(tool_name),
+                                                    "summary": summary,
+                                                    "timestamp": msg.get("timestamp"),
+                                                }
+                                                tool_calls.append(evidence)
+                                                recent_tool_events.append(evidence)
+                                                if len(recent_tool_events) > 5:
+                                                    del recent_tool_events[:-5]
+                                        has_pending_tool = bool(tool_calls)
+                                        pending_tool_calls = tool_calls
                                         last_msg_type = "assistant"
+                                        last_msg_timestamp = msg.get("timestamp")
                                     elif msg_type == "user":
                                         if msg.get("toolUseResult"):
                                             has_pending_tool = False
+                                            pending_tool_calls = []
                                             last_msg_type = "tool_result"
+                                            last_msg_timestamp = msg.get("timestamp")
                                         else:
                                             last_msg_type = "user"
+                                            last_msg_timestamp = msg.get("timestamp")
                                             # Count only genuine user prompts
                                             # (tool results also have type=user;
                                             # ADR-003 assistant chunks share a
@@ -434,6 +477,30 @@ class ClaudeSessions(App):
                             (has_pending_tool and last_msg_type == "assistant")
                             or last_msg_type == "user"
                         )
+                        modified_age = max(
+                            0,
+                            int(datetime.now().timestamp() - stat.st_mtime),
+                        )
+                        if not has_process:
+                            working_reason = "no matching interactive claude process"
+                        elif not recently_modified:
+                            working_reason = (
+                                f"active, but transcript last changed {modified_age}s ago"
+                            )
+                        elif last_msg_type == "user":
+                            working_reason = (
+                                "active + recent transcript update + last event is a user prompt"
+                            )
+                        elif has_pending_tool and last_msg_type == "assistant":
+                            working_reason = (
+                                "active + recent transcript update + "
+                                "latest assistant chunk has tool_use"
+                            )
+                        else:
+                            working_reason = (
+                                "active + recent transcript update, but "
+                                f"last event is {last_msg_type or 'unknown'}"
+                            )
                     except:
                         pass
 
@@ -478,6 +545,25 @@ class ClaudeSessions(App):
                             "first_user_msg": first_user_msg,
                             "is_active": has_process,
                             "is_working": is_working,
+                            "activity": {
+                                "active_processes": active_session_details.get(
+                                    jsonl.stem, []
+                                ),
+                                "last_transcript_update": stat.st_mtime,
+                                "modified_age_seconds": max(
+                                    0,
+                                    int(datetime.now().timestamp() - stat.st_mtime),
+                                ),
+                                "recently_modified": (
+                                    datetime.now().timestamp() - stat.st_mtime < 300
+                                ),
+                                "last_message_type": last_msg_type,
+                                "last_message_timestamp": last_msg_timestamp,
+                                "has_pending_tool": has_pending_tool,
+                                "pending_tool_calls": pending_tool_calls[-5:],
+                                "recent_tool_events": recent_tool_events[-5:],
+                                "working_reason": working_reason,
+                            },
                             # user prompts × 2 ≈ exchange count (one
                             # user msg + one assistant reply per turn);
                             # see KanbanScreen meta line.
@@ -974,6 +1060,15 @@ class ClaudeSessions(App):
         except Exception:
             # Fallback: just show the command
             self.notify(f"Resume: {cmd}", timeout=10)
+
+    def action_open_activity_inspector(self) -> None:
+        """Show why the highlighted session is active or working."""
+        if self._input_has_focus():
+            return
+        item = self._highlighted_session_item()
+        if item is None:
+            return
+        self.push_screen(ActivityInspectorScreen(dict(item.session_data)))
 
     def _highlighted_session_item(self) -> SessionItem | None:
         list_view = self.query_one("#session-list", ListView)

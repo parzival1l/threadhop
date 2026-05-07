@@ -1,0 +1,60 @@
+ActivityInspectorScreen {
+    layout: vertical;
+    align: center middle;
+    background: $background 70%;
+}
+
+#activity-container {
+    width: 84;
+    max-width: 92%;
+    height: 72%;
+    background: $panel;
+    border: none;
+    padding: 1 2;
+    layout: vertical;
+}
+
+#activity-title {
+    height: 1;
+    color: $text-muted;
+}
+
+#activity-body {
+    height: 1fr;
+    padding: 1 0;
+}
+
+#activity-hint {
+    height: 1;
+    color: $text-muted;
+}
+
+.activity-row {
+    height: auto;
+    layout: horizontal;
+    padding-right: 2;
+    margin-bottom: 1;
+}
+
+.activity-label {
+    width: 24;
+    color: $text-muted;
+}
+
+.activity-value {
+    width: 1fr;
+    color: $text;
+}
+
+.activity-section {
+    margin-top: 1;
+    color: $text-muted;
+    text-style: bold;
+}
+
+.activity-block {
+    margin: 1 0 0 2;
+    padding: 0 1;
+    border-left: thick $border-blurred;
+    color: $text;
+}

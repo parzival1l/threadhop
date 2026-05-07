@@ -1232,6 +1232,25 @@ This is checked during the existing 5s refresh cycle — no extra DB queries.
 If emoji rendering is unreliable across terminals, fall back to a Rich
 markup colored marker: `[dim]≡[/dim]` or `[dim cyan]obs[/dim cyan]`.
 
+**Activity inspector:**
+
+The process-state circles are intentionally compact, so the sidebar now has a
+lightweight inspector on `i` for the highlighted session. It does not change the
+state model; it exposes the evidence already collected during the 5-second
+refresh:
+
+- `is_active`: an interactive `claude` process matched either explicit
+  `-r/--resume <session_id>` args or, for bare/continue sessions, a CWD whose
+  Claude project directory's newest non-`agent-*.jsonl` transcript is this
+  session.
+- `is_working`: active + transcript mtime within 5 minutes + either the last
+  genuine user prompt is waiting for an assistant response, or the latest
+  assistant chunk contains `tool_use` and no following `toolUseResult` line has
+  cleared it.
+- The inspector shows process PID/CWD match evidence, the working reason, last
+  transcript update, transcript CWD/path, last event type, pending tool-use
+  blocks, and recent tool-use blocks.
+
 **Transcript header (Option B — subtle, non-interfering):**
 
 When viewing a transcript that has observations, show a one-line header
