@@ -1,0 +1,136 @@
+/* SessionDigestBar — right-hand passive context column.
+
+   The bar mirrors the muted-border idiom shared by #session-list
+   and #transcript-scroll so the three top-row panels read as a
+   matched set. Idle border is $panel (recessive); focus-within
+   uses $accent — but the bar isn't focusable, so it stays muted
+   and only acts as a visual anchor. */
+
+#session-digest {
+    height: 100%;
+    border: solid $panel;
+    border-title-color: $text;
+    padding: 0 1;
+    scrollbar-size-vertical: 1;
+}
+
+/* Sections share a common vertical-rhythm rule: 1-row top margin so
+   each block is clearly separated, no per-section border (boxes
+   would compete with the panel's own border). */
+.digest-block {
+    height: auto;
+    margin-top: 1;
+}
+
+/* The first block (identity) has no top margin — it sits flush at
+   the top of the panel, mirroring how the session-list label sits
+   flush. */
+#session-digest > Vertical:first-of-type {
+    margin-top: 0;
+}
+
+.digest-placeholder {
+    color: $text-muted;
+    padding: 1 0 0 0;
+}
+
+/* ------------------------------ Identity */
+
+.digest-title {
+    color: $text;
+    text-style: bold;
+}
+
+.digest-slug {
+    color: $text-muted;
+}
+
+.digest-chips {
+    color: $text-muted;
+    margin-top: 1;
+}
+
+/* ------------------------------ Section headers
+
+   Bold, color $text (not muted) so each section has a clear
+   anchor — the muted-italic version we use for the kanban
+   subheader was tried and read as "barely there" in the right
+   column where there's already a lot of dim content. */
+.digest-section-header {
+    color: $text;
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+/* ------------------------------ Recap bands
+
+   Each band is a label row + body text. The label gets a single
+   left-edge accent bar (OpenCode-style) so the timeline reads as
+   four ordered chunks without needing a divider between them. */
+.digest-recap-band {
+    height: auto;
+    margin-bottom: 1;
+    padding-left: 1;
+    border-left: thick $border-blurred;
+}
+
+.digest-band-label {
+    color: $text-muted;
+    text-style: italic;
+}
+
+.digest-band-body {
+    color: $text;
+    margin-top: 0;
+}
+
+/* ------------------------------ Outputs */
+
+.digest-output-row {
+    color: $text;
+}
+
+.digest-pr {
+    color: $accent;
+}
+
+/* ------------------------------ Context
+
+   Token rows are normal text; the model line is dimmed because
+   it's reference info (which models the session has used), not
+   primary content. */
+.digest-context-row {
+    color: $text;
+}
+
+/* The context-fill headline is the actionable single number on the
+   bar — promote it slightly via bold so the eye lands there first. */
+.digest-context-fill {
+    color: $text;
+    text-style: bold;
+}
+
+.digest-models {
+    color: $text-muted;
+}
+
+/* ------------------------------ Footer
+
+   The footer is dim by design — it's chrome, not content. The
+   resume command is a single dim line at the bottom of the bar;
+   no button, no border, just a copy-able string the user can
+   read off. */
+.digest-divider {
+    color: $border-blurred;
+    margin-top: 1;
+}
+
+.digest-footer-chips {
+    color: $text-muted;
+}
+
+.digest-footer-resume {
+    color: $text-muted;
+    text-style: italic;
+    margin-top: 1;
+}
