@@ -4,6 +4,20 @@ All notable changes to ThreadHop are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions
 follow `major.minor.patch`.
 
+## [0.3.2] — 2026-05-07
+
+### Added
+- Per-session digest bar pinned to the right of the transcript pane.
+  Surfaces the highlighted session's title, custom name, working
+  directory, recent activity, and turn count at a glance — no need
+  to open the transcript to see what a session is about. Refreshes
+  on highlight and on selection, and reads the same JSONL view the
+  transcript uses (`extract_digest`) so what you see in the bar
+  always matches what's about to render.
+- TUI grid widened from 2 columns to 3 to host the digest bar; the
+  reply input now spans all three columns so the existing input
+  experience is unchanged.
+
 ## [0.3.1] — 2026-04-26
 
 ### Fixed
