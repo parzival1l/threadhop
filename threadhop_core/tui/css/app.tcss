@@ -1,7 +1,7 @@
 Screen {
     layout: grid;
-    grid-size: 2 2;
-    grid-columns: 36 1fr;
+    grid-size: 3 2;
+    grid-columns: 36 1fr 36;
     grid-rows: 1fr auto;
     grid-gutter: 0;
     /* Thin, muted scrollbars — Textual's default is 2 cells wide
@@ -110,7 +110,7 @@ FindBar {
    — the outer box uses border={["left"]} with backgroundElement fill
    and paddingLeft/Right=2 paddingTop=1, exactly mirrored here. */
 #input-container {
-    column-span: 2;
+    column-span: 3;
     border: none;
     border-left: thick $border-blurred;
     background: $surface;

@@ -45,6 +45,7 @@ from threadhop_core.session.detection import (
     detect_project_from_cwd,
     get_active_claude_session_ids,
 )
+from threadhop_core.session.digest import extract_digest
 from threadhop_core.storage import db
 
 from .constants import (
@@ -84,6 +85,7 @@ from .utils import (
 )
 from .widgets.contextual_footer import ContextualFooter
 from .widgets.find_bar import FindBar
+from .widgets.session_digest_bar import SessionDigestBar
 from .widgets.session_list import SessionItem, SessionStatusHeader
 from .widgets.transcript import TranscriptView
 
@@ -100,6 +102,7 @@ _TUI_CSS_FILES = [
     str(_TUI_CSS_DIR / "help.tcss"),
     str(_TUI_CSS_DIR / "contextual_footer.tcss"),
     str(_TUI_CSS_DIR / "kanban.tcss"),
+    str(_TUI_CSS_DIR / "session_digest.tcss"),
 ]
 
 
@@ -202,6 +205,7 @@ class ClaudeSessions(App):
             TranscriptView(id="transcript-scroll"),
             id="transcript-column",
         )
+        yield SessionDigestBar(id="session-digest")
         yield Vertical(TextArea(id="reply-input"), id="input-container")
         yield ContextualFooter(id="contextual-footer")
 
@@ -802,6 +806,7 @@ class ClaudeSessions(App):
                 transcript._find_current = -1
 
             await transcript.load_transcript(event.item.session_data["path"])
+            self._refresh_digest(event.item.session_data)
 
     async def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
         if isinstance(event.item, SessionItem):
@@ -828,6 +833,7 @@ class ClaudeSessions(App):
                 transcript._find_current = -1
 
             await transcript.load_transcript(event.item.session_data["path"])
+            self._refresh_digest(event.item.session_data)
 
             if "last_viewed" not in self.config:
                 self.config["last_viewed"] = {}
@@ -981,6 +987,40 @@ class ClaudeSessions(App):
         if isinstance(item, SessionItem):
             return item
         return None
+
+    def _refresh_digest(self, session_data: dict | None) -> None:
+        """Recompute the per-session digest and push it to the right-hand bar.
+
+        Called from the highlight/select handlers and from the periodic
+        auto-refresh. JSONL extraction runs on the main thread today —
+        a 1MB transcript parses in ~30ms, well under the 5s refresh
+        cadence; if this ever shows up in profiles, move it to a worker
+        with ``self.run_worker``.
+        """
+        try:
+            bar = self.query_one("#session-digest", SessionDigestBar)
+        except Exception:
+            return
+        if not session_data:
+            bar.set_digest(None)
+            return
+        path_str = session_data.get("path")
+        sid = session_data.get("session_id")
+        if not path_str or not sid:
+            bar.set_digest(None)
+            return
+        try:
+            digest = extract_digest(Path(path_str), session_id=str(sid))
+        except Exception:
+            bar.set_digest(None)
+            return
+        # Prefer the title the App already computed (it knows about
+        # the SQLite custom_name column, which the JSONL doesn't see)
+        # by overlaying it on the digest's own title cascade.
+        custom_name = session_data.get("custom_name") or session_data.get("custom_title")
+        if custom_name and not digest.custom_title:
+            digest.custom_title = str(custom_name)
+        bar.set_digest(digest)
 
     def _spawn_observer(self, session_id: str) -> bool:
         try:
