@@ -1,0 +1,10 @@
+{"type":"adr","text":"Headless Claude invocations will use stdin-from-file with per-invocation permission flags.","context":"User-requested architectural decision.","ts":"2026-04-17T18:52:27.654Z"}
+{"type":"decision","text":"use SQLite","context":"chosen over flat files","ts":"2026-04-17T18:53:00.000Z"}
+{"type":"todo","text":"port observer","status":"open","ts":"2026-04-17T18:53:10.000Z"}
+{"type":"todo","text":"close that loop","status":"closed","ts":"2026-04-17T18:53:20.000Z"}
+{"type":"done","text":"wired up observer-state table","ts":"2026-04-17T18:54:00.000Z"}
+{"type":"conflict","refs":["s1","s2"],"topic":"storage-backend","text":"conflicting storage decisions","ts":"2026-04-17T18:55:00.000Z"}
+{"type":"note","text":"CWD is a silent trap inside prompt files.","ts":"2026-04-17T18:54:14.627Z"}
+
+{"type":"observation","text":"unknown variant should not abort the read","ts":"2026-04-17T18:54:30.000Z"}
+{"this":"is not a valid observation row"}
