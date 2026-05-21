@@ -200,6 +200,11 @@ pub struct App {
     /// Optional `--days` filter from CLI. When set, the App drops sidebar
     /// items older than `now - days * 86400 seconds`.
     pub days_filter: Option<u32>,
+
+    /// Monotonic render-tick counter — advanced by the event loop on each
+    /// terminal draw and used as the spinner frame index. `usize` so we
+    /// don't have to worry about overflow on hour-long sessions.
+    pub spinner_tick: usize,
 }
 
 impl App {
@@ -222,7 +227,15 @@ impl App {
         // surfaces the `[read-only]` indicator off this flag.
         let (db, status_message, read_only) =
             match threadhop_core::db::open(&threadhop_core::paths::db_path()) {
-                Ok(c) => (c, None, false),
+                Ok(c) => (
+                    c,
+                    // Phase 0 boot hint — keybindings changed in this
+                    // release, surface the `?` overlay so returning users
+                    // can find them. A real status (read-only / error)
+                    // overwrites this on the very next side-effect.
+                    Some("Press ? for keybindings".to_string()),
+                    false,
+                ),
                 Err(e) => {
                     tracing::warn!(
                         "opening sessions.db failed: {e} — falling back to in-memory (read-only)"
@@ -261,6 +274,7 @@ impl App {
             help: None,
             project_filter: None,
             days_filter: None,
+            spinner_tick: 0,
         }
     }
 
@@ -523,19 +537,59 @@ impl App {
             // Phase 5 Wave 2: open the kanban + conflict viewer modals.
             Command::OpenKanban => self.open_kanban(),
             Command::OpenConflictViewer => self.open_conflict_viewer(),
-            // CycleSessionStatus + Cancel still no-ops on MainScreen — Cancel
-            // is owned by the modal-first dispatch above, and
-            // CycleSessionStatus is reserved for a future quick-toggle bind.
-            // Kanban + conflict_viewer footer-only labels never fire on the
-            // main screen.
-            Command::CycleSessionStatus
-            | Command::Cancel
+            // Phase 0 no-op stubs: Python has these actions; Rust doesn't
+            // implement them yet. We register the bindings so muscle memory
+            // works, log a warn, and surface a status_message so the user
+            // sees the action was caught.
+            Command::CycleSessionStatus => self.stub_command("cycle status"),
+            Command::CycleSessionStatusBack => {
+                self.stub_command("cycle status backward")
+            }
+            Command::RefreshSessions => self.stub_command("refresh sessions"),
+            Command::ThemeNext => self.stub_command("next theme"),
+            Command::ThemePrev => self.stub_command("previous theme"),
+            Command::ShrinkSidebar => self.stub_command("shrink sidebar"),
+            Command::GrowSidebar => self.stub_command("grow sidebar"),
+            Command::RenameSession => self.stub_command("rename session"),
+            Command::CopyResumeCommand => self.stub_command("copy resume"),
+            Command::ObserveSession => self.stub_command("observe session"),
+            Command::ResumeObservation => {
+                self.stub_command("resume observation")
+            }
+            Command::ArchiveSession => self.stub_command("archive session"),
+            Command::ToggleArchivedView => {
+                self.stub_command("toggle archived view")
+            }
+            Command::MoveSessionDown => self.stub_command("reorder session ↓"),
+            Command::MoveSessionUp => self.stub_command("reorder session ↑"),
+            Command::FocusTranscript => self.stub_command("focus transcript"),
+            Command::FocusList => self.stub_command("focus list"),
+            Command::EnterSelectionMode => {
+                self.stub_command("enter selection mode")
+            }
+            Command::EditBookmarkNote => self.stub_command("edit bookmark note"),
+            // Cancel is owned by the modal-first dispatch; modal-only
+            // commands never fire on the main screen.
+            Command::Cancel
             | Command::MarkConflictResolved
             | Command::KanbanColumnLeft
             | Command::KanbanColumnRight
-            | Command::KanbanMoveItem => {}
+            | Command::KanbanMoveItem
+            | Command::KanbanMoveItemBack => {}
         }
         Some(cmd)
+    }
+
+    /// Phase 0 stub: emit a `tracing::warn!` and surface a status_message
+    /// for a Python-parity binding whose real handler hasn't shipped yet.
+    /// Keeping the binding live (instead of dropping the key) means muscle
+    /// memory works the moment the parity rebind lands.
+    fn stub_command(&mut self, name: &str) {
+        tracing::warn!(
+            target: "threadhop_tui::keys",
+            "not implemented yet: {name}"
+        );
+        self.status_message = Some(format!("Not implemented yet: {name}"));
     }
 
     /// Toggle the bookmark on the message currently under
@@ -1492,12 +1546,15 @@ mod tests {
     }
 
     #[test]
-    fn g_jumps_to_top_and_shift_g_to_bottom() {
+    fn home_jumps_to_top_and_end_to_bottom() {
+        // Phase 0 parity: Home/End drive ScrollTop/ScrollBottom (Python
+        // bindings). The old g/Shift+G have been reassigned —
+        // `g`=CopyResumeCommand (stub), `Shift+G` is unbound.
         let mut app = App::new();
         app.scroll = 100;
-        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
         assert_eq!(app.scroll, 0);
-        app.handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT));
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
         assert_eq!(app.scroll, u16::MAX);
     }
 
@@ -1580,8 +1637,10 @@ mod tests {
 
     #[test]
     fn f_opens_find_bar_and_changes_scope() {
+        // Phase 0 parity: Ctrl-f opens the find bar (Python binding); plain
+        // `f` is no longer bound on MainScreen.
         let mut app = App::new();
-        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
         assert!(app.find_state.is_some());
         assert_eq!(app.scope, Scope::FindBar);
     }
@@ -1589,7 +1648,7 @@ mod tests {
     #[test]
     fn esc_in_find_bar_closes_it() {
         let mut app = App::new();
-        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.find_state.is_none());
         assert_eq!(app.scope, Scope::MainScreen);
@@ -1599,7 +1658,7 @@ mod tests {
     fn typing_in_find_bar_routes_to_bar_input() {
         let mut app = App::new();
         app.transcript = vec![msg("u1", "user", "hello world")];
-        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
         for c in "hello".chars() {
             app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
@@ -1617,7 +1676,7 @@ mod tests {
             msg("u1", "user", "alpha"),
             msg("u2", "assistant", "target here"),
         ];
-        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
         for c in "target".chars() {
             app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
@@ -1728,7 +1787,8 @@ mod tests {
     }
 
     #[test]
-    fn pressing_shift_g_visibly_scrolls_transcript_to_bottom() {
+    fn pressing_end_visibly_scrolls_transcript_to_bottom() {
+        // Phase 0 parity: `End` is the new ScrollBottom (was `Shift+G`).
         // Long transcript: 50 messages, distinct markers per message so we
         // can assert that "TOP-MARKER" is visible before the keypress and
         // "BOTTOM-MARKER" is visible after.
@@ -1749,20 +1809,20 @@ mod tests {
             "TOPSENTINEL must be visible at scroll=0; got:\n{before}"
         );
 
-        // Simulate Shift+G.
-        app.handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT));
+        // Simulate End.
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
         let after = render_to_string(&app, 120, 30);
         assert_ne!(
             before, after,
-            "Shift+G did not visibly change the rendered transcript"
+            "End did not visibly change the rendered transcript"
         );
         assert!(
             after.contains("BOTTOMSENTINEL"),
-            "BOTTOMSENTINEL must be visible after Shift+G; got:\n{after}"
+            "BOTTOMSENTINEL must be visible after End; got:\n{after}"
         );
         assert!(
             !after.contains("TOPSENTINEL"),
-            "TOPSENTINEL must scroll off-screen after Shift+G; got:\n{after}"
+            "TOPSENTINEL must scroll off-screen after End; got:\n{after}"
         );
     }
 
@@ -1928,26 +1988,28 @@ mod tests {
     }
 
     #[test]
-    fn pressing_b_toggles_bookmark_in_db_and_updates_status_message() {
+    fn pressing_space_toggles_bookmark_in_db_and_updates_status_message() {
+        // Phase 0 parity: Space toggles bookmark on the message cursor
+        // (was `b`); `b` now opens the bookmark browser.
         let (mut app, _sid, _uuid) = seeded_app();
         assert_eq!(count_bookmarks(&app.db), 0, "starts empty");
-        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
-        assert_eq!(count_bookmarks(&app.db), 1, "row inserted on b");
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert_eq!(count_bookmarks(&app.db), 1, "row inserted on Space");
         assert_eq!(app.status_message.as_deref(), Some("★ bookmarked"));
         // Toggle again removes the bookmark.
-        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
-        assert_eq!(count_bookmarks(&app.db), 0, "row removed on second b");
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert_eq!(count_bookmarks(&app.db), 0, "row removed on second Space");
         assert_eq!(app.status_message.as_deref(), Some("removed bookmark"));
     }
 
     #[test]
-    fn pressing_capital_b_opens_bookmark_browser_modal() {
+    fn pressing_b_opens_bookmark_browser_modal() {
+        // Phase 0 parity: `b` opens the bookmark browser (Python binding;
+        // was Shift+B in pre-Phase-0 Rust).
         let (mut app, _sid, _uuid) = seeded_app();
-        // Render before; press; render after — assert buffer differs and
-        // contains the modal title.
         let before = render_to_string(&app, 100, 30);
         assert!(!before.contains("Bookmarks"), "title shouldn't appear pre-open");
-        app.handle_key(KeyEvent::new(KeyCode::Char('B'), KeyModifiers::SHIFT));
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
         assert!(app.bookmark_browser.is_some(), "browser state set");
         assert_eq!(app.scope, Scope::BookmarkBrowser);
         let after = render_to_string(&app, 100, 30);
@@ -1959,10 +2021,13 @@ mod tests {
     }
 
     #[test]
-    fn pressing_s_opens_label_prompt_modal() {
+    fn pressing_shift_l_opens_label_prompt_modal() {
+        // Phase 0: lowercase `s` now cycles status (Python parity); the
+        // label-prompt opener moved to `Shift+L` so the merged Rust modal
+        // stays reachable for the rename / custom-name path.
         let (mut app, _sid, _uuid) = seeded_app();
         let before = render_to_string(&app, 100, 30);
-        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT));
         assert!(app.label_prompt.is_some(), "label_prompt state set");
         assert_eq!(app.scope, Scope::LabelPrompt);
         let after = render_to_string(&app, 100, 30);
@@ -1971,6 +2036,26 @@ mod tests {
         assert!(
             after.contains("Label:"),
             "expected 'Label:' title in frame; got:\n{after}"
+        );
+    }
+
+    #[test]
+    fn pressing_s_now_cycles_status_stub_per_python_parity() {
+        // Phase 0 stub: `s` fires CycleSessionStatus, which is a no-op
+        // status_message stub until the real handler ships. Asserts the
+        // binding wires through (muscle memory works).
+        let (mut app, _sid, _uuid) = seeded_app();
+        let res = app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(res, Some(Command::CycleSessionStatus));
+        assert!(app.label_prompt.is_none(), "label_prompt must NOT open on s");
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap_or("")
+                .to_ascii_lowercase()
+                .contains("not implemented"),
+            "expected stub status; got {:?}",
+            app.status_message
         );
     }
 
@@ -1991,8 +2076,8 @@ mod tests {
         assert_eq!(count_bookmarks(&app.db), 1);
         let bookmark_id = bm.id.unwrap();
 
-        // Open the browser via Shift+B.
-        app.handle_key(KeyEvent::new(KeyCode::Char('B'), KeyModifiers::SHIFT));
+        // Open the browser via `b` (Python parity; was Shift+B pre-Phase 0).
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
         assert!(app.bookmark_browser.is_some());
         assert_eq!(
             app.bookmark_browser.as_ref().unwrap().bookmarks.len(),
@@ -2028,7 +2113,7 @@ mod tests {
             1.0,
         )
         .unwrap();
-        app.handle_key(KeyEvent::new(KeyCode::Char('B'), KeyModifiers::SHIFT));
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
         assert!(app.confirm.is_some());
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
@@ -2040,9 +2125,11 @@ mod tests {
 
     #[test]
     fn read_only_skips_writes() {
+        // Space (Phase 0 toggle-bookmark binding) must short-circuit on
+        // read_only and surface the friendly status.
         let (mut app, _sid, _uuid) = seeded_app();
         app.read_only = true;
-        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         assert_eq!(count_bookmarks(&app.db), 0, "no write while read-only");
         let s = app.status_message.as_deref().unwrap_or("");
         assert!(
@@ -2052,7 +2139,9 @@ mod tests {
     }
 
     #[test]
-    fn shift_j_and_shift_k_move_message_cursor() {
+    fn ctrl_j_and_ctrl_k_move_message_cursor() {
+        // Phase 0 parity: the msg cursor moved off Shift+J/K (Python uses
+        // those for session reorder) onto Ctrl+J/K.
         let (mut app, _sid, _uuid) = seeded_app();
         // Two messages so the cursor has somewhere to go.
         app.transcript = vec![
@@ -2060,19 +2149,20 @@ mod tests {
             msg("u2", "assistant", "beta"),
         ];
         app.message_cursor = 0;
-        app.handle_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT));
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
         assert_eq!(app.message_cursor, 1);
-        app.handle_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT));
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
         assert_eq!(app.message_cursor, 0);
         // Out-of-range moves saturate.
-        app.handle_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT));
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
         assert_eq!(app.message_cursor, 0);
     }
 
     #[test]
     fn esc_in_bookmark_browser_closes_modal() {
         let (mut app, _sid, _uuid) = seeded_app();
-        app.handle_key(KeyEvent::new(KeyCode::Char('B'), KeyModifiers::SHIFT));
+        // Phase 0: `b` (not Shift+B) opens the browser.
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
         assert!(app.bookmark_browser.is_some());
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.bookmark_browser.is_none());
@@ -2081,8 +2171,9 @@ mod tests {
 
     #[test]
     fn esc_in_label_prompt_closes_modal() {
+        // Phase 0: `Shift+L` opens the label modal (was `s` pre-Phase 0).
         let (mut app, _sid, _uuid) = seeded_app();
-        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT));
         assert!(app.label_prompt.is_some());
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.label_prompt.is_none());
@@ -2092,7 +2183,7 @@ mod tests {
     #[test]
     fn label_prompt_status_chosen_writes_to_db() {
         let (mut app, sid, _uuid) = seeded_app();
-        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT));
         // Status picker opens with cursor on the current status (Active —
         // index 0). Press `j` to move to InProgress (index 1) then Enter.
         app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
@@ -2107,11 +2198,11 @@ mod tests {
     // ---- Phase 5 Wave 2 frame-buffer + DB regression tests ---------------
 
     #[test]
-    fn pressing_t_opens_kanban_modal() {
+    fn pressing_shift_b_opens_kanban_modal() {
         let (mut app, _sid, _uuid) = seeded_app();
         let before = render_to_string(&app, 120, 30);
         assert!(!before.contains("Kanban"), "title shouldn't appear pre-open");
-        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('B'), KeyModifiers::SHIFT));
         assert!(app.kanban.is_some(), "kanban state set");
         assert_eq!(app.scope, Scope::Kanban);
         let after = render_to_string(&app, 120, 30);
@@ -2144,7 +2235,7 @@ mod tests {
         // Seed: session starts as Active. Open kanban → cursor is on the
         // (only) item in column 0; press m → cycles to InProgress and the
         // App should write that to the DB.
-        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('B'), KeyModifiers::SHIFT));
         assert!(app.kanban.is_some());
         app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
         let row = threadhop_core::db::session_by_id(&app.db, &sid)
@@ -2171,7 +2262,7 @@ mod tests {
     fn kanban_status_changed_reverts_on_db_error() {
         // Force the write path to fail by flipping read_only after open.
         let (mut app, sid, _uuid) = seeded_app();
-        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('B'), KeyModifiers::SHIFT));
         app.read_only = true;
         app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
         // DB row must NOT have changed (read_only blocks the write).
@@ -2311,7 +2402,8 @@ mod tests {
         app.read_only = false;
         app.transcript = vec![msg("not-in-db", "user", "ghost")];
         app.message_cursor = 0;
-        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        // Phase 0: Space toggles bookmark; `b` opens the browser modal.
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         // No bookmark should have been inserted.
         let cnt: i64 = app
             .db

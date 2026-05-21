@@ -82,10 +82,13 @@ pub fn draw(app: &App, frame: &mut Frame) {
         .split(outer[1]);
 
     // Sidebar — view-model already populated by the session_scanner worker.
+    // Divide the 60fps render-tick counter by 5 → ~12fps spinner motion,
+    // which feels fluid without being twitchy.
+    const SPINNER_DIVISOR: usize = 5;
     let sidebar = SessionListWidget {
         items: &app.sidebar,
         selected_session_id: app.selected_session_id.as_deref(),
-        spinner_frame: 0,
+        spinner_frame: app.spinner_tick / SPINNER_DIVISOR,
         now: now_epoch(),
         theme: Some(&app.theme),
     };
@@ -282,7 +285,10 @@ mod tests {
         // The bottom row must show the global `quit` hint so the user knows
         // how to exit. Sanity-checks the footer wiring without coupling to
         // specific column positions.
-        let app = App::new();
+        let mut app = App::new();
+        // Clear the Phase 0 boot status_message so the footer renders the
+        // binding hints (a non-empty status takes priority over hints).
+        app.status_message = None;
         let mut term = Terminal::new(TestBackend::new(80, 5)).unwrap();
         term.draw(|f| draw(&app, f)).unwrap();
         let buf = term.backend().buffer();
