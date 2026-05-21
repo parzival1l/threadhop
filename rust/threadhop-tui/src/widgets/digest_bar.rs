@@ -111,6 +111,12 @@ impl<'a> DigestBarWidget<'a> {
 
         // Empty-state: no summary at all → still render name + status glyph
         // + age + a muted hint so the row is visibly informative.
+        //
+        // Phase A.5: the session name now renders in `accent + bold` (not the
+        // muted foreground) so the row always pops regardless of the panel
+        // bg's contrast with the canvas. The trailing hint ("run threadhop
+        // observe to populate") doubles as a CTA so the empty state earns its
+        // pixels instead of just whispering "nothing here".
         let Some(summary) = self.summary else {
             let mut spans = Vec::new();
             spans.push(Span::styled(
@@ -120,12 +126,12 @@ impl<'a> DigestBarWidget<'a> {
             if let Some(name) = self.session_display_name {
                 spans.push(Span::styled(
                     name.to_string(),
-                    Style::default().fg(fg).add_modifier(Modifier::BOLD),
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
                 ));
             } else {
                 spans.push(Span::styled(
                     "no session selected",
-                    Style::default().fg(muted).add_modifier(Modifier::DIM),
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
                 ));
             }
             // Age suffix from context, if available.
@@ -148,6 +154,11 @@ impl<'a> DigestBarWidget<'a> {
             spans.push(separator(muted));
             spans.push(Span::styled(
                 "no observations yet",
+                Style::default().fg(muted),
+            ));
+            spans.push(separator(muted));
+            spans.push(Span::styled(
+                "run threadhop observe to populate",
                 Style::default().fg(muted).add_modifier(Modifier::DIM),
             ));
             return Line::from(spans);
@@ -156,6 +167,12 @@ impl<'a> DigestBarWidget<'a> {
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(16);
 
         // 1. Status glyph + session name.
+        //
+        // Phase A.5: the session-name span uses `accent + bold` so row 0
+        // always carries at least one high-contrast cell regardless of the
+        // panel-bg luminance. (Previously this read in plain foreground,
+        // which sits flush against the canvas on terminals that overrode
+        // the panel bg to true black.)
         spans.push(Span::styled(
             format!(" {glyph} "),
             Style::default().fg(glyph_color).add_modifier(Modifier::BOLD),
@@ -163,7 +180,7 @@ impl<'a> DigestBarWidget<'a> {
         if let Some(name) = self.session_display_name {
             spans.push(Span::styled(
                 name.to_string(),
-                Style::default().fg(fg).add_modifier(Modifier::BOLD),
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
             ));
         }
 
@@ -669,6 +686,136 @@ mod tests {
 
         // Garbage returns None.
         assert!(parse_iso8601_to_epoch("not a date").is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Phase A.5 visibility tests
+    //
+    // Prior frame-buffer tests asserted that *text* reached the buffer.
+    // That's a false positive: the content was always there; the user
+    // couldn't *see* it because the empty-state used `text_muted` against a
+    // panel bg that barely differs from the canvas bg.
+    //
+    // These tests assert a per-cell visibility property — at least one
+    // cell in row 0 carries the accent (or warning / error) foreground.
+    // That correlates with the row actually popping in the live binary.
+    // ------------------------------------------------------------------
+
+    fn draw_bar(widget: DigestBarWidget<'_>) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(120, 1)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = Rect {
+                    x: 0,
+                    y: 0,
+                    width: 120,
+                    height: 1,
+                };
+                f.render_widget(widget, area);
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn row_has_fg(buf: &ratatui::buffer::Buffer, color: Color) -> bool {
+        (0..buf.area.width)
+            .any(|x| buf.cell((x, 0)).map(|c| c.fg == color).unwrap_or(false))
+    }
+
+    #[test]
+    fn empty_state_emits_accent_fg_cell_on_row_zero() {
+        // Visibility test #1: with no observation summary at all the
+        // session-name span must render in the theme accent color so the
+        // row pops even if the panel bg barely contrasts with the canvas.
+        let t = theme();
+        let w = DigestBarWidget {
+            theme: &t,
+            summary: None,
+            session_display_name: Some("my-session"),
+            has_bookmarks: false,
+            context: None,
+        };
+        let buf = draw_bar(w);
+        let accent = hex_to_color(&t.accent).unwrap();
+        assert!(
+            row_has_fg(&buf, accent),
+            "digest bar row 0 has no accent-color cell — empty state invisible"
+        );
+    }
+
+    #[test]
+    fn populated_summary_emits_accent_and_warning_fg_cells() {
+        // Visibility test #2: with todos present, row 0 must carry the
+        // accent fg (for the session name) AND the warning fg (for the
+        // todo count). Both colors are required for the row to read as
+        // "active" instead of just "present".
+        let t = theme();
+        let summary = ObservationSummary {
+            open_todo_count: 3,
+            ..Default::default()
+        };
+        let w = DigestBarWidget {
+            theme: &t,
+            summary: Some(&summary),
+            session_display_name: Some("sess"),
+            has_bookmarks: false,
+            context: None,
+        };
+        let buf = draw_bar(w);
+        let accent = hex_to_color(&t.accent).unwrap();
+        let warn = hex_to_color(&t.warning).unwrap();
+        assert!(
+            row_has_fg(&buf, accent),
+            "populated digest bar row 0 missing accent cell (session name)"
+        );
+        assert!(
+            row_has_fg(&buf, warn),
+            "populated digest bar row 0 missing warning cell (open todos)"
+        );
+    }
+
+    #[test]
+    fn unresolved_conflicts_emit_error_fg_cell() {
+        // Visibility test #3: unresolved conflicts must render in the
+        // theme error color so the row carries an urgent visual signal.
+        let t = theme();
+        let summary = ObservationSummary {
+            unresolved_conflict_count: 1,
+            ..Default::default()
+        };
+        let w = DigestBarWidget {
+            theme: &t,
+            summary: Some(&summary),
+            session_display_name: Some("sess"),
+            has_bookmarks: false,
+            context: None,
+        };
+        let buf = draw_bar(w);
+        let err = hex_to_color(&t.error).unwrap();
+        assert!(
+            row_has_fg(&buf, err),
+            "conflict count missing from row 0 with error fg"
+        );
+    }
+
+    #[test]
+    fn empty_state_includes_observe_cta_hint() {
+        // The empty-state placeholder should mention `threadhop observe`
+        // so the row earns its pixels as a CTA rather than a whisper.
+        let t = theme();
+        let w = DigestBarWidget {
+            theme: &t,
+            summary: None,
+            session_display_name: Some("sess"),
+            has_bookmarks: false,
+            context: None,
+        };
+        let line = w.build_line();
+        let text = joined(&line);
+        assert!(
+            text.contains("threadhop observe"),
+            "expected CTA hint, got {text:?}"
+        );
     }
 
     #[test]

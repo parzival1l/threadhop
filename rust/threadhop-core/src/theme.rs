@@ -243,7 +243,11 @@ impl Theme {
             foreground: "#eeeeee".into(),
             text_muted: "#808080".into(),
             background: "#0a0a0a".into(),
-            background_panel: "#141414".into(),
+            // Phase A.5: lifted from #141414 → #1c1c1c so panel rows
+            // (digest bar, sidebar tints) sit clearly above the canvas
+            // background on most terminals. ~11% luminance bump puts the
+            // delta past the just-noticeable-difference threshold.
+            background_panel: "#1c1c1c".into(),
             background_element: "#1e1e1e".into(),
             border: "#484848".into(),
             border_active: "#606060".into(),
