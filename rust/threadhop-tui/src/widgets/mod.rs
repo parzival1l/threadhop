@@ -6,6 +6,5 @@
 //! widget concern.
 
 pub mod contextual_footer;
+pub mod session_list;
 pub mod transcript;
-// session_list lands in a parallel Wave B agent; declared here once that file
-// exists.

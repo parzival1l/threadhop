@@ -8,6 +8,7 @@
 mod app;
 mod event;
 mod keys;
+mod widgets;
 
 use std::io::{stdout, Stdout};
 

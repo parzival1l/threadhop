@@ -9,7 +9,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
 };
-use threadhop_core::{models::Session, theme::Theme};
+use threadhop_core::{jsonl::CleanedMessage, models::Session, theme::Theme};
 
 use crate::keys::{self, Command, Scope};
 
@@ -40,6 +40,12 @@ pub struct App {
     /// switch by later waves.
     pub scroll: u16,
 
+    /// Cleaned messages for the currently selected session. Populated by the
+    /// Wave C/E worker via `threadhop_core::jsonl::parse_byte_range` — the
+    /// transcript widget consumes this slice directly (ADR-003: already
+    /// cleaned, never re-parsed at render time).
+    pub transcript: Vec<CleanedMessage>,
+
     /// Theme for widget styling. Loaded once at startup; reload is a future
     /// feature.
     pub theme: Theme,
@@ -65,6 +71,7 @@ impl App {
             sessions: Vec::new(),
             selected_session_id: None,
             scroll: 0,
+            transcript: Vec::new(),
             theme: Theme::default_dark(),
             status_message: None,
             read_only: false,
