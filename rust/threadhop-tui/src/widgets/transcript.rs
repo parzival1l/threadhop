@@ -319,16 +319,38 @@ fn push_message<'a>(out: &mut Vec<Line<'a>>, msg: &CleanedMessage, theme: &Theme
     }
     out.push(header_line);
 
-    // Body rows: split on '\n' so the gutter renders on every wrapped line
-    // (ratatui `Wrap { trim: false }` will still soft-wrap long lines, but
-    // the gutter only fires on hard newlines — same trade-off as the Python
-    // widget's per-line mounting).
+    // Body rows: prefer the markdown renderer for prose roles (user /
+    // assistant) so the user sees `**bold**`, `# headers`, fenced code, etc.
+    // as styled output. Tool / tool_result bodies skip markdown — they're
+    // usually structured output (paths, command excerpts) where literal
+    // formatting would corrupt the content.
     if msg.text.is_empty() {
         let mut l = Line::from(vec![gutter_span_bg(role_style, row_bg)]);
         if let Some(bg) = row_bg {
             l = l.style(Style::default().bg(bg));
         }
         out.push(l);
+        return;
+    }
+    let use_md = matches!(msg.role.as_str(), "user" | "assistant");
+    if use_md {
+        let base_text = base_row_style(row_bg);
+        let md_lines = md::render(&msg.text, theme, base_text, row_bg);
+        for ml in md_lines {
+            // Prepend the role gutter to every body row so the colored
+            // accent reads all the way down the message — matching the
+            // Python `border-left: thick` styling on the message widget,
+            // not just on the first row.
+            let mut spans: Vec<Span<'a>> = Vec::with_capacity(ml.spans.len() + 2);
+            spans.push(gutter_span_bg(role_style, row_bg));
+            spans.push(Span::styled(" ", base_row_style(row_bg)));
+            spans.extend(ml.spans);
+            let mut line = Line::from(spans);
+            if let Some(bg) = row_bg {
+                line = line.style(Style::default().bg(bg));
+            }
+            out.push(line);
+        }
     } else {
         for body_line in msg.text.split('\n') {
             let mut line = Line::from(vec![
@@ -385,11 +407,16 @@ pub fn message_to_line_index(messages: &[CleanedMessage], uuid: &str) -> Option<
 /// so future tool / system rows render gracefully without a code change.
 pub fn style_for_role(role: &str, theme: &Theme) -> Style {
     let color = match role {
-        "user" => theme_color(&theme.primary, Color::Cyan),
-        "assistant" => theme_color(&theme.accent, Color::Green),
+        // Mirror the Python TCSS: `UserMessage { border-left: thick $accent }`
+        // and `AssistantMessage { border-left: thick $success }`. The user
+        // turn gets the violet/accent gutter, the assistant gets the green
+        // success gutter, so the two roles read as different turn boundaries
+        // at a glance even without color (the labels also differ).
+        "user" => theme_color(&theme.accent, Color::Cyan),
+        "assistant" => theme_color(&theme.success, Color::Green),
         // tool / tool_result / anything else — muted gutter so they read as
-        // secondary even though `parse_byte_range` doesn't currently emit
-        // them as standalone rows.
+        // secondary, matching the Python `ToolMessage { border: round
+        // $panel-lighten-2 }` recessed surface.
         _ => theme_color(&theme.text_muted, Color::Gray),
     };
     Style::default().fg(color)
@@ -429,8 +456,16 @@ fn base_row_style(bg: Option<Color>) -> Style {
 ///   * tool/other → `background_element` (darker, dimmer secondary surface)
 pub fn role_bg(role: &str, theme: &Theme) -> Option<Color> {
     let hex = match role {
+        // User turn sits on the elevated panel surface — same elevation as
+        // the session-list card, so the user's input reads as "what I said"
+        // rather than blending into the canvas.
         "user" => &theme.background_panel,
+        // Assistant uses the open canvas. Keeps the chat-like feel and lets
+        // long bodies (which dominate the pane) breathe.
         "assistant" => return None,
+        // Tool / tool_result / unknown roles recede on the darker element
+        // surface — matches the Python `ToolMessage { background: $surface }`
+        // styling: secondary content visually retreats.
         _ => &theme.background_element,
     };
     hex_to_rgb(hex).map(|(r, g, b)| Color::Rgb(r, g, b))
@@ -455,6 +490,345 @@ fn theme_color(hex: &str, fallback: Color) -> Color {
     match hex_to_rgb(hex) {
         Some((r, g, b)) => Color::Rgb(r, g, b),
         None => fallback,
+    }
+}
+
+// ---- markdown --------------------------------------------------------------
+
+/// Hand-rolled minimal markdown renderer.
+///
+/// We intentionally do NOT depend on `pulldown-cmark` or `tui-markdown`. The
+/// surface we need is small (bold, italic, inline code, fenced code blocks,
+/// h1-h3 headers, bullets, numbered lists, links) and the trade-off is
+/// favourable: a focused ~150-line parser that fits the rest of the
+/// transcript pipeline (per-line `Vec<Line>` output styled with the role's
+/// row background) beats wiring an external renderer's `Text` shape to our
+/// row-bg invariant.
+///
+/// The contract: `render` returns one `Line` per visible row, with `row_bg`
+/// applied to the line style so soft-wrapped continuations inherit the same
+/// card tint. Spans inside each line carry their own foreground styling
+/// (bold/italic/code/etc.) layered on top of `base_text` — which itself
+/// already carries `row_bg` so partial spans don't reset the background.
+///
+/// Limitations (intentional MVP cut):
+///   * Nested emphasis is not parsed — `**foo *bar* baz**` is rendered as a
+///     single bold span with literal `*bar*` inside. A dedicated test
+///     documents this.
+///   * No tables, blockquotes, horizontal rules, footnotes, images, or
+///     nested lists beyond a single level.
+///   * Inline code wins over emphasis: the contents of a backtick span are
+///     emitted verbatim even if they look like `**bold**`.
+pub mod md {
+    use super::{theme_color, Theme};
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
+
+    /// Render `body` into a `Vec<Line>` styled for the transcript pane.
+    ///
+    /// * `base_text` — the row's "plain text" style (already carries any
+    ///   role-tinted background). Inline spans layer modifiers on top.
+    /// * `row_bg` — applied via `Line::style` so soft-wraps inherit the bg.
+    pub fn render<'a>(
+        body: &str,
+        theme: &Theme,
+        base_text: Style,
+        row_bg: Option<Color>,
+    ) -> Vec<Line<'a>> {
+        let mut out: Vec<Line<'a>> = Vec::new();
+        let mut in_fence = false;
+        let code_bg = theme_color(&theme.background_element, Color::DarkGray);
+        let code_fg = theme_color(&theme.foreground, Color::White);
+        let header_color = theme_color(&theme.accent, Color::Magenta);
+        let bullet_color = theme_color(&theme.text_muted, Color::Gray);
+        let info_color = theme_color(&theme.info, Color::Blue);
+
+        for raw_line in body.split('\n') {
+            // Fence open/close: a line whose trimmed start is ``` toggles
+            // the state. We don't bother parsing the language tag.
+            let trimmed = raw_line.trim_start();
+            if trimmed.starts_with("```") {
+                in_fence = !in_fence;
+                // Render the fence line itself as an empty code-styled row so
+                // the user sees the block boundary visually (rather than the
+                // literal backticks bleeding through).
+                let span = Span::styled(
+                    " ".repeat(raw_line.len().max(1)),
+                    base_text.bg(code_bg).fg(code_fg).add_modifier(Modifier::DIM),
+                );
+                out.push(apply_bg(Line::from(vec![span]), row_bg));
+                continue;
+            }
+            if in_fence {
+                // Inside a fence: emit verbatim with the code background.
+                let span = Span::styled(
+                    raw_line.to_string(),
+                    base_text.bg(code_bg).fg(code_fg),
+                );
+                out.push(apply_bg(Line::from(vec![span]), row_bg));
+                continue;
+            }
+
+            // Headers (h1..h3): `# foo`, `## foo`, `### foo`. Lower levels
+            // collapse to h3 styling (still bold + accent).
+            if let Some(rest) = header_body(raw_line) {
+                let line = Line::from(vec![Span::styled(
+                    rest.to_string(),
+                    base_text
+                        .fg(header_color)
+                        .add_modifier(Modifier::BOLD),
+                )]);
+                out.push(apply_bg(line, row_bg));
+                continue;
+            }
+
+            // Bullet: `- ` or `* ` (with optional leading whitespace).
+            if let Some((indent, rest)) = bullet_body(raw_line) {
+                let mut spans = Vec::with_capacity(4);
+                if !indent.is_empty() {
+                    spans.push(Span::styled(indent.to_string(), base_text));
+                }
+                spans.push(Span::styled(
+                    "• ".to_string(),
+                    base_text.fg(bullet_color).add_modifier(Modifier::BOLD),
+                ));
+                spans.extend(render_inline(rest, theme, base_text, info_color, code_bg, code_fg));
+                out.push(apply_bg(Line::from(spans), row_bg));
+                continue;
+            }
+
+            // Numbered list: `1. text`, `12. text`, etc.
+            if let Some((indent, marker, rest)) = numbered_body(raw_line) {
+                let mut spans = Vec::with_capacity(4);
+                if !indent.is_empty() {
+                    spans.push(Span::styled(indent.to_string(), base_text));
+                }
+                spans.push(Span::styled(
+                    format!("{marker} "),
+                    base_text.add_modifier(Modifier::BOLD),
+                ));
+                spans.extend(render_inline(rest, theme, base_text, info_color, code_bg, code_fg));
+                out.push(apply_bg(Line::from(spans), row_bg));
+                continue;
+            }
+
+            // Plain paragraph line — inline processing only.
+            let spans = render_inline(raw_line, theme, base_text, info_color, code_bg, code_fg);
+            let line = if spans.is_empty() {
+                Line::from(vec![Span::styled(String::new(), base_text)])
+            } else {
+                Line::from(spans)
+            };
+            out.push(apply_bg(line, row_bg));
+        }
+
+        out
+    }
+
+    fn apply_bg<'a>(line: Line<'a>, row_bg: Option<Color>) -> Line<'a> {
+        match row_bg {
+            Some(bg) => line.style(Style::default().bg(bg)),
+            None => line,
+        }
+    }
+
+    /// If `line` starts with one or more `#` followed by a space, return the
+    /// post-prefix body. Up to 3 `#`s recognised; anything deeper falls back
+    /// to the h3 path (still styled, since the user clearly meant a heading).
+    fn header_body(line: &str) -> Option<&str> {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with('#') {
+            return None;
+        }
+        let mut chars = trimmed.chars();
+        let mut hashes = 0;
+        for c in chars.by_ref() {
+            if c == '#' {
+                hashes += 1;
+                if hashes > 6 {
+                    return None;
+                }
+            } else if c == ' ' {
+                let rest_start = hashes + 1;
+                return Some(&trimmed[rest_start..]);
+            } else {
+                return None;
+            }
+        }
+        None
+    }
+
+    fn bullet_body(line: &str) -> Option<(&str, &str)> {
+        let leading = line.len() - line.trim_start().len();
+        let indent = &line[..leading];
+        let after = &line[leading..];
+        if let Some(rest) = after.strip_prefix("- ") {
+            return Some((indent, rest));
+        }
+        if let Some(rest) = after.strip_prefix("* ") {
+            // Disambiguate from `*italic*` paragraphs: an italic span starts
+            // with `*` immediately followed by a non-space char, so the `* `
+            // prefix is unambiguous.
+            return Some((indent, rest));
+        }
+        None
+    }
+
+    fn numbered_body(line: &str) -> Option<(&str, String, &str)> {
+        let leading = line.len() - line.trim_start().len();
+        let indent = &line[..leading];
+        let after = &line[leading..];
+        let bytes = after.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == 0 || i >= bytes.len() {
+            return None;
+        }
+        if bytes[i] != b'.' {
+            return None;
+        }
+        if i + 1 >= bytes.len() || bytes[i + 1] != b' ' {
+            return None;
+        }
+        let marker = format!("{}.", &after[..i]);
+        let rest = &after[i + 2..];
+        Some((indent, marker, rest))
+    }
+
+    /// Scan a single paragraph fragment for inline markdown. Recognises:
+    ///   * `` `code` `` — emitted verbatim with the code background.
+    ///   * `**bold**` / `__bold__` — `Modifier::BOLD`.
+    ///   * `*italic*` / `_italic_` — `Modifier::ITALIC`.
+    ///   * `[label](url)` — `label` underlined in `info` color; url dropped.
+    ///
+    /// Unclosed delimiters fall back to literal text — robustness over
+    /// strictness, since transcript bodies frequently contain stray
+    /// asterisks (e.g. shell glob patterns, prose emphasis the user didn't
+    /// intend to close).
+    fn render_inline<'a>(
+        s: &str,
+        _theme: &Theme,
+        base: Style,
+        link_color: Color,
+        code_bg: Color,
+        code_fg: Color,
+    ) -> Vec<Span<'a>> {
+        let mut out: Vec<Span<'a>> = Vec::new();
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        let mut buf = String::new();
+        while i < bytes.len() {
+            let c = bytes[i];
+            // Inline code — highest precedence.
+            if c == b'`' {
+                if let Some(end) = find_byte(bytes, i + 1, b'`') {
+                    flush_buf(&mut out, &mut buf, base);
+                    let inner = &s[i + 1..end];
+                    out.push(Span::styled(
+                        inner.to_string(),
+                        base.bg(code_bg).fg(code_fg),
+                    ));
+                    i = end + 1;
+                    continue;
+                }
+            }
+            // Bold via `**...**` or `__...__`.
+            if (c == b'*' || c == b'_')
+                && i + 1 < bytes.len()
+                && bytes[i + 1] == c
+            {
+                let delim = [c, c];
+                if let Some(end) = find_subsequence(bytes, i + 2, &delim) {
+                    flush_buf(&mut out, &mut buf, base);
+                    let inner = &s[i + 2..end];
+                    out.push(Span::styled(
+                        inner.to_string(),
+                        base.add_modifier(Modifier::BOLD),
+                    ));
+                    i = end + 2;
+                    continue;
+                }
+            }
+            // Italic via single `*` or `_`. Don't fire on a bare `*` followed
+            // by whitespace (that's almost always literal text).
+            if (c == b'*' || c == b'_')
+                && i + 1 < bytes.len()
+                && bytes[i + 1] != b' '
+                && bytes[i + 1] != c
+            {
+                if let Some(end) = find_byte(bytes, i + 1, c) {
+                    let inner = &s[i + 1..end];
+                    if !inner.is_empty() && !inner.starts_with(' ') {
+                        flush_buf(&mut out, &mut buf, base);
+                        out.push(Span::styled(
+                            inner.to_string(),
+                            base.add_modifier(Modifier::ITALIC),
+                        ));
+                        i = end + 1;
+                        continue;
+                    }
+                }
+            }
+            // Link `[label](url)`.
+            if c == b'[' {
+                if let Some(close_bracket) = find_byte(bytes, i + 1, b']') {
+                    if close_bracket + 1 < bytes.len()
+                        && bytes[close_bracket + 1] == b'('
+                    {
+                        if let Some(close_paren) =
+                            find_byte(bytes, close_bracket + 2, b')')
+                        {
+                            flush_buf(&mut out, &mut buf, base);
+                            let label = &s[i + 1..close_bracket];
+                            out.push(Span::styled(
+                                label.to_string(),
+                                base.fg(link_color).add_modifier(Modifier::UNDERLINED),
+                            ));
+                            i = close_paren + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+            // Default: accumulate into the plain-text buffer.
+            buf.push(c as char);
+            i += 1;
+        }
+        flush_buf(&mut out, &mut buf, base);
+        out
+    }
+
+    fn flush_buf<'a>(out: &mut Vec<Span<'a>>, buf: &mut String, base: Style) {
+        if !buf.is_empty() {
+            out.push(Span::styled(std::mem::take(buf), base));
+        }
+    }
+
+    fn find_byte(bytes: &[u8], from: usize, needle: u8) -> Option<usize> {
+        let mut i = from;
+        while i < bytes.len() {
+            if bytes[i] == needle {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    fn find_subsequence(bytes: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+        if needle.is_empty() || from + needle.len() > bytes.len() {
+            return None;
+        }
+        let mut i = from;
+        while i + needle.len() <= bytes.len() {
+            if &bytes[i..i + needle.len()] == needle {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
     }
 }
 
@@ -645,5 +1019,267 @@ mod tests {
             f.render_widget(w, f.area());
         })
         .unwrap();
+    }
+
+    // ---- markdown -------------------------------------------------------
+
+    /// Helper: collect a single rendered span line into (text, modifiers per
+    /// span) tuples. Drops bg/fg colors since those vary by theme; the tests
+    /// care about modifier presence (bold/italic/underline) and text content.
+    fn span_shapes(line: &Line<'_>) -> Vec<(String, Modifier)> {
+        line.spans
+            .iter()
+            .map(|s| (s.content.to_string(), s.style.add_modifier))
+            .collect()
+    }
+
+    #[test]
+    fn md_bold_wraps_simple_text() {
+        let theme = Theme::default_dark();
+        let lines = md::render("hello **world** end", &theme, Style::default(), None);
+        assert_eq!(lines.len(), 1);
+        let shapes = span_shapes(&lines[0]);
+        // `hello `, `world` (bold), ` end`.
+        let bolded: Vec<_> = shapes
+            .iter()
+            .filter(|(_, m)| m.contains(Modifier::BOLD))
+            .map(|(t, _)| t.as_str())
+            .collect();
+        assert_eq!(bolded, vec!["world"]);
+    }
+
+    #[test]
+    fn md_italic_in_middle_of_paragraph() {
+        let theme = Theme::default_dark();
+        let lines = md::render("a *quick* fox", &theme, Style::default(), None);
+        let shapes = span_shapes(&lines[0]);
+        let italic: Vec<_> = shapes
+            .iter()
+            .filter(|(_, m)| m.contains(Modifier::ITALIC))
+            .map(|(t, _)| t.as_str())
+            .collect();
+        assert_eq!(italic, vec!["quick"]);
+    }
+
+    #[test]
+    fn md_inline_code_takes_precedence_over_emphasis() {
+        // The contents of an inline-code span should be emitted verbatim,
+        // even when they look like emphasis. `**foo**` stays literal inside
+        // the backticks.
+        let theme = Theme::default_dark();
+        let lines = md::render("`**foo**` rest", &theme, Style::default(), None);
+        let shapes = span_shapes(&lines[0]);
+        let code: Vec<_> = shapes
+            .iter()
+            .filter(|(t, _)| t == "**foo**")
+            .collect();
+        assert_eq!(code.len(), 1, "expected verbatim code span, got {shapes:?}");
+        // And nothing should be flagged BOLD in this line.
+        let bolded: Vec<_> = shapes
+            .iter()
+            .filter(|(_, m)| m.contains(Modifier::BOLD))
+            .collect();
+        assert!(bolded.is_empty(), "code body must not be bolded: {shapes:?}");
+    }
+
+    #[test]
+    fn md_unclosed_bold_falls_back_to_literal() {
+        // `**foo` (no closing `**`) → render the asterisks as plain text,
+        // not as a broken bold span. Robustness over strictness.
+        let theme = Theme::default_dark();
+        let lines = md::render("hello **world", &theme, Style::default(), None);
+        let shapes = span_shapes(&lines[0]);
+        let bolded: Vec<_> = shapes
+            .iter()
+            .filter(|(_, m)| m.contains(Modifier::BOLD))
+            .collect();
+        assert!(
+            bolded.is_empty(),
+            "unclosed ** must not produce a bold span: {shapes:?}"
+        );
+        let joined: String = shapes.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(joined.contains("**world"), "literal text preserved: {joined:?}");
+    }
+
+    #[test]
+    fn md_code_fence_preserves_content_verbatim() {
+        let theme = Theme::default_dark();
+        let body = "before\n```\nlet x = **not bold**;\n```\nafter";
+        let lines = md::render(body, &theme, Style::default(), None);
+        // 5 source lines → 5 rendered lines (fence markers occupy a row each).
+        assert_eq!(lines.len(), 5, "got {} lines", lines.len());
+        // The code-block content line should contain the raw text including
+        // the `**` markers (not turned into a bold span).
+        let code_row = &lines[2];
+        let joined: String = code_row.spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(
+            joined.contains("**not bold**"),
+            "verbatim fence content expected, got {joined:?}"
+        );
+        for span in &code_row.spans {
+            assert!(
+                !span.style.add_modifier.contains(Modifier::BOLD),
+                "fence body must not bold inline `**`: {:?}",
+                span
+            );
+        }
+    }
+
+    #[test]
+    fn md_header_h1_is_bold() {
+        let theme = Theme::default_dark();
+        let lines = md::render("# A Header", &theme, Style::default(), None);
+        assert_eq!(lines.len(), 1);
+        let shapes = span_shapes(&lines[0]);
+        assert!(shapes.iter().all(|(_, m)| m.contains(Modifier::BOLD)));
+        // The `# ` prefix should be stripped from the rendered text.
+        let joined: String = shapes.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(joined, "A Header");
+    }
+
+    #[test]
+    fn md_bullet_replaces_dash_with_bullet_glyph() {
+        let theme = Theme::default_dark();
+        let lines = md::render("- one\n- two", &theme, Style::default(), None);
+        assert_eq!(lines.len(), 2);
+        let joined: String = lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(joined.starts_with("• "), "got {joined:?}");
+        assert!(joined.contains("one"));
+        // Original `- ` prefix must be gone.
+        assert!(!joined.contains("- one"), "raw `-` leaked through: {joined:?}");
+    }
+
+    #[test]
+    fn md_numbered_list_bolds_number() {
+        let theme = Theme::default_dark();
+        let lines = md::render("1. first\n2. second", &theme, Style::default(), None);
+        assert_eq!(lines.len(), 2);
+        let marker_span = &lines[0].spans[0];
+        assert_eq!(marker_span.content, "1. ");
+        assert!(
+            marker_span.style.add_modifier.contains(Modifier::BOLD),
+            "marker should be bold: {marker_span:?}"
+        );
+    }
+
+    #[test]
+    fn md_link_drops_url_and_underlines_text() {
+        let theme = Theme::default_dark();
+        let lines = md::render(
+            "see [docs](https://example.com) please",
+            &theme,
+            Style::default(),
+            None,
+        );
+        let shapes = span_shapes(&lines[0]);
+        let underlined: Vec<_> = shapes
+            .iter()
+            .filter(|(_, m)| m.contains(Modifier::UNDERLINED))
+            .map(|(t, _)| t.as_str())
+            .collect();
+        assert_eq!(underlined, vec!["docs"]);
+        // URL must not be rendered.
+        let joined: String = shapes.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(
+            !joined.contains("https://example.com"),
+            "url leaked through: {joined:?}"
+        );
+        assert!(
+            !joined.contains("("),
+            "link parens leaked through: {joined:?}"
+        );
+    }
+
+    #[test]
+    fn md_empty_body_returns_empty_lines() {
+        let theme = Theme::default_dark();
+        let lines = md::render("", &theme, Style::default(), None);
+        // `"".split('\n')` yields one empty fragment → one (empty) line.
+        // The renderer still emits a Line so the cursor math stays simple.
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn md_nested_emphasis_not_supported() {
+        // Documented limitation: `**foo *bar* baz**` is parsed as a single
+        // bold span containing literal `*bar*`. We choose this so the
+        // parser stays a one-pass scan rather than a recursive descent.
+        let theme = Theme::default_dark();
+        let lines = md::render("**foo *bar* baz**", &theme, Style::default(), None);
+        let shapes = span_shapes(&lines[0]);
+        // Exactly one bold span, and its body still contains the inner `*bar*`.
+        let bold_bodies: Vec<_> = shapes
+            .iter()
+            .filter(|(_, m)| m.contains(Modifier::BOLD))
+            .map(|(t, _)| t.as_str())
+            .collect();
+        assert_eq!(bold_bodies, vec!["foo *bar* baz"]);
+        // No ITALIC modifier was applied — the inner emphasis is literal.
+        assert!(
+            shapes
+                .iter()
+                .all(|(_, m)| !m.contains(Modifier::ITALIC)),
+            "nested italic was unexpectedly parsed: {shapes:?}"
+        );
+    }
+
+    #[test]
+    fn widget_buffer_contains_bold_modifier_for_markdown_body() {
+        // Frame-buffer test: render a message whose body has `**bold**` and
+        // assert at least one cell in the body region carries the BOLD
+        // modifier. Sanity-checks the wiring from `md::render` through
+        // `push_message` into the `Buffer`.
+        let theme = Theme::default_dark();
+        let msgs = vec![cm("assistant", "say **hi** there")];
+        let mut term = Terminal::new(TestBackend::new(40, 4)).unwrap();
+        term.draw(|f| {
+            let w = TranscriptWidget::new(&msgs, 0, &theme);
+            f.render_widget(w, f.area());
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        // Scan the body row (y=1) for any bold cell whose symbol is one of
+        // the letters of `hi`.
+        let mut found_bold_h = false;
+        for x in 0..buf.area().width {
+            let cell = &buf[(x, 1)];
+            if cell.symbol() == "h" && cell.modifier.contains(Modifier::BOLD) {
+                found_bold_h = true;
+                break;
+            }
+        }
+        assert!(
+            found_bold_h,
+            "expected at least one BOLD `h` cell in the body row of the buffer"
+        );
+    }
+
+    #[test]
+    fn widget_body_keeps_gutter_on_every_line() {
+        // Phase 4 Wave 2 deferred item: gutter on every body row, not just
+        // hard newlines. With markdown rendering preserving line count 1:1
+        // for plain paragraphs, every body row should start with the
+        // GUTTER_GLYPH.
+        let theme = Theme::default_dark();
+        let msgs = vec![cm("user", "line one\nline two\nline three")];
+        let mut term = Terminal::new(TestBackend::new(40, 6)).unwrap();
+        term.draw(|f| {
+            let w = TranscriptWidget::new(&msgs, 0, &theme);
+            f.render_widget(w, f.area());
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        // Rows 0 (header), 1, 2, 3 (body) all start with the gutter.
+        for y in 0..4u16 {
+            assert_eq!(
+                buf[(0, y)].symbol(),
+                GUTTER_GLYPH,
+                "missing gutter at row {y}"
+            );
+        }
     }
 }
