@@ -304,7 +304,12 @@ impl App {
             // Ignore send errors — `watch::Sender::send` only fails when all
             // receivers have been dropped, in which case the fs_watcher is
             // already gone and the App is shutting down.
-            let _ = self.active_session_tx.send(Some(next_id));
+            let send_result = self.active_session_tx.send(Some(next_id.clone()));
+            tracing::debug!(
+                target: "threadhop_tui",
+                "selection change session={next_id} delta={delta} send_ok={}",
+                send_result.is_ok()
+            );
             self.scroll = 0;
         }
     }

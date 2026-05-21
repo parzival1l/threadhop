@@ -159,6 +159,12 @@ async fn check_and_emit(
     if new_sig == prev_sig {
         return;
     }
+    tracing::debug!(
+        target: "threadhop_tui",
+        "fs_watcher: file changed session={session_id} path={} size={:?}",
+        path.display(),
+        new_sig.size
+    );
 
     // Read the whole file. JSONL transcripts top out in the low MBs; a 1 Hz
     // full read keeps the parser path identical to the TUI's load path
@@ -175,6 +181,7 @@ async fn check_and_emit(
     };
 
     let messages = parse_byte_range(&raw, Some(session_id));
+    let msg_count = messages.len();
 
     // Only commit the new signature *after* a successful parse+emit attempt
     // so that a transient read error doesn't make us "forget" the old size and
@@ -187,6 +194,10 @@ async fn check_and_emit(
         .await
         .is_ok()
     {
+        tracing::debug!(
+            target: "threadhop_tui",
+            "fs_watcher: TranscriptRefreshed session={session_id} count={msg_count}"
+        );
         sig_cache.insert(session_id.to_string(), new_sig);
     }
 }

@@ -84,11 +84,21 @@ impl<'a> Widget for TranscriptWidget<'a> {
             }
             _ => build_lines(self.messages, self.theme),
         };
+        // Clamp the requested scroll so that scrolling past the end (notably
+        // `G` setting scroll to `u16::MAX`) doesn't blank the pane —
+        // `Paragraph::scroll` does NOT clamp on its own. The cap is
+        // `lines.len().saturating_sub(1)` rather than `lines.len() - height`
+        // because we don't know the post-wrap line count (depends on terminal
+        // width). Overshoot for soft-wrapped content is preferable to
+        // undershoot — the user can still see the last source line.
+        let line_count = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+        let max_scroll = line_count.saturating_sub(1);
+        let clamped = self.scroll.min(max_scroll);
         // Empty-state: keep the pane blank rather than dumping an "(empty)"
         // placeholder — Wave C will render a "no session selected" banner in
         // the screen itself, not the widget.
         let paragraph = Paragraph::new(lines)
-            .scroll((self.scroll, 0))
+            .scroll((clamped, 0))
             .wrap(Wrap { trim: false });
         paragraph.render(area, buf);
     }
@@ -480,6 +490,35 @@ mod tests {
         assert!(
             row0.contains("alpha"),
             "scroll=1 should reveal body row, got {row0:?}"
+        );
+    }
+
+    #[test]
+    fn widget_clamps_oversized_scroll_so_pane_does_not_blank() {
+        // Regression for "transcript stuck on first page": when `G` set
+        // `scroll = u16::MAX` the unclamped `Paragraph::scroll` would render
+        // nothing — the user saw a blank pane and read it as "nothing
+        // happened." The widget must clamp so the last source line stays
+        // visible.
+        let theme = Theme::default_dark();
+        let msgs = vec![cm("user", "alpha"), cm("assistant", "omega")];
+        let mut term = Terminal::new(TestBackend::new(40, 6)).unwrap();
+        term.draw(|f| {
+            let w = TranscriptWidget::new(&msgs, u16::MAX, &theme);
+            f.render_widget(w, f.area());
+        })
+        .unwrap();
+        // Collect the buffer; *something* from the message bodies must render.
+        let buf = term.backend().buffer();
+        let mut whole = String::new();
+        for y in 0..buf.area().height {
+            for x in 0..buf.area().width {
+                whole.push_str(buf[(x, y)].symbol());
+            }
+        }
+        assert!(
+            whole.contains("alpha") || whole.contains("omega"),
+            "scroll=u16::MAX must not blank the pane, got {whole:?}"
         );
     }
 

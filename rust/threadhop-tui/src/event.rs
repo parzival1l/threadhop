@@ -136,10 +136,16 @@ fn handle_worker_event(app: &mut App, event: WorkerEvent) {
             }
         }
         WorkerEvent::TranscriptRefreshed { session_id, messages } => {
+            let count = messages.len();
+            let matches = app.selected_session_id.as_deref() == Some(session_id.as_str());
+            tracing::debug!(
+                target: "threadhop_tui",
+                "event: TranscriptRefreshed session={session_id} count={count} adopted={matches}"
+            );
             // Stale loads (the user moved on before the worker finished) are
             // dropped. The fs_watcher will emit the right transcript on the
             // next tick anyway.
-            if app.selected_session_id.as_deref() == Some(session_id.as_str()) {
+            if matches {
                 app.transcript = messages;
                 // If a find bar is open, its match positions reference the
                 // *previous* transcript. Recompute now that the transcript

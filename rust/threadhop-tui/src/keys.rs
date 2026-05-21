@@ -285,9 +285,11 @@ pub fn commands_for_scope(scope: Scope) -> &'static [CommandBinding] {
 /// Look up a key in the given scope, falling back to Global. Returns the
 /// matched command, or None if no binding applies.
 pub fn lookup(scope: Scope, ev: KeyEvent) -> Option<Command> {
-    // Normalise to Press — crossterm reports Release/Repeat events too on
-    // some terminals, and we don't want to fire bindings on Release.
-    if ev.kind != crossterm::event::KeyEventKind::Press {
+    // Filter only Release — terminals (and PTYs like `expect`) sometimes deliver
+    // typed characters as `Repeat` instead of `Press`, and dropping those
+    // breaks both navigation and scroll bindings. Mirrors the same fix already
+    // applied to the search modal (commit 5f365a5).
+    if ev.kind == crossterm::event::KeyEventKind::Release {
         return None;
     }
     let matches = |b: &&CommandBinding| {
@@ -332,6 +334,32 @@ mod tests {
             state: crossterm::event::KeyEventState::NONE,
         };
         assert!(lookup(Scope::MainScreen, ev).is_none());
+    }
+
+    #[test]
+    fn repeat_events_are_dispatched() {
+        // Regression: some terminals/PTYs (notably `expect`) deliver typed
+        // characters as `Repeat` rather than `Press`. The lookup must accept
+        // them or scroll/navigation bindings silently break.
+        let ev = KeyEvent {
+            code: KeyCode::Char('G'),
+            modifiers: KeyModifiers::SHIFT,
+            kind: crossterm::event::KeyEventKind::Repeat,
+            state: crossterm::event::KeyEventState::NONE,
+        };
+        assert_eq!(lookup(Scope::MainScreen, ev), Some(Command::ScrollBottom));
+    }
+
+    #[test]
+    fn repeat_j_moves_to_next_session() {
+        // Sibling regression: sidebar nav must also survive Repeat-kind events.
+        let ev = KeyEvent {
+            code: KeyCode::Char('j'),
+            modifiers: KeyModifiers::NONE,
+            kind: crossterm::event::KeyEventKind::Repeat,
+            state: crossterm::event::KeyEventState::NONE,
+        };
+        assert_eq!(lookup(Scope::MainScreen, ev), Some(Command::SelectNextSession));
     }
 
     #[test]
