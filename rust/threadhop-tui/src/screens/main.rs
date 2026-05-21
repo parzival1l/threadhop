@@ -5,13 +5,9 @@
 //! - Vertical: content area (fills) + 1-line footer (fixed).
 //! - Within content: horizontal 36-char sidebar + remaining transcript pane.
 //!
-//! Wave C wiring: the App holds `Vec<Session>` today, but `SessionListWidget`
-//! expects a `&[SessionListItem]` view-model that carries the runtime fields
-//! (is_active / is_working / has_observations / last_active_at). Wave C/E
-//! workers will populate that view-model directly via
-//! `SessionsRefreshed(Vec<SessionListItem>)`. For now we derive a minimal
-//! `SessionListItem` per `Session` inline so the binary renders the real
-//! layout instead of the boot banner.
+//! Wave E wiring: the App holds `Vec<SessionListItem>` populated by the
+//! `session_scanner` worker via `SessionsRefreshed`. The screen renders it
+//! straight through — no derivation.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -50,11 +46,9 @@ pub fn draw(app: &App, frame: &mut Frame) {
         .constraints([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(1)])
         .split(outer[0]);
 
-    // Sidebar — convert App's `Vec<Session>` to the widget's view-model
-    // per the Wave C contract.
-    let sidebar_items = app.sidebar_items();
+    // Sidebar — view-model already populated by the session_scanner worker.
     let sidebar = SessionListWidget {
-        items: &sidebar_items,
+        items: &app.sidebar,
         selected_session_id: app.selected_session_id.as_deref(),
         spinner_frame: 0,
         now: now_epoch(),

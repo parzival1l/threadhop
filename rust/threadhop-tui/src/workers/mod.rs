@@ -1,9 +1,10 @@
 //! Background workers feed the App via mpsc.
-
-// Wave C/D scaffolding — variants and worker `run` fns aren't wired into the
-// event loop yet (only `Error` is matched today). Same pattern as
-// `widgets/session_list.rs`.
-#![allow(dead_code)]
+//!
+//! Wave E wires `spawn_all` to actually launch all three workers. Each
+//! `tokio::spawn`ed task owns its `Sender` clone; the `JoinHandle`s are
+//! dropped intentionally — the event loop signals shutdown by dropping the
+//! `Receiver` (and, for the fs_watcher, the `watch::Sender`), which causes
+//! every worker to exit cleanly on its next `send`.
 
 pub mod session_scanner;
 pub mod active_detector;
@@ -26,13 +27,42 @@ pub enum WorkerEvent {
 }
 
 use tokio::sync::mpsc::Sender;
+use tokio::sync::watch;
 
 /// Spawn all 3 background workers. Each takes a sender clone and runs forever
 /// until the app exits and the channel closes.
-pub fn spawn_all(_tx: Sender<WorkerEvent>) {
-    // Wave D parallel agents will fill these in. Today this is a no-op so the
-    // event loop compiles.
-    // tokio::spawn(session_scanner::run(_tx.clone()));
-    // tokio::spawn(active_detector::run(_tx.clone()));
-    // tokio::spawn(fs_watcher::run(_tx));
+///
+/// `fs_watcher_rx` is the receiver half of the active-session watch channel —
+/// the `Sender` lives on `App` so key handlers can retarget the watcher when
+/// the user changes selection.
+pub fn spawn_all(
+    tx: Sender<WorkerEvent>,
+    fs_watcher_rx: watch::Receiver<Option<String>>,
+) {
+    let scanner_tx = tx.clone();
+    tokio::spawn(async move {
+        if let Err(err) = session_scanner::run(scanner_tx.clone()).await {
+            let _ = scanner_tx
+                .send(WorkerEvent::Error(format!("session_scanner exited: {err}")))
+                .await;
+        }
+    });
+
+    let detector_tx = tx.clone();
+    tokio::spawn(async move {
+        if let Err(err) = active_detector::run(detector_tx.clone()).await {
+            let _ = detector_tx
+                .send(WorkerEvent::Error(format!("active_detector exited: {err}")))
+                .await;
+        }
+    });
+
+    let watcher_tx = tx;
+    tokio::spawn(async move {
+        if let Err(err) = fs_watcher::run(watcher_tx.clone(), fs_watcher_rx).await {
+            let _ = watcher_tx
+                .send(WorkerEvent::Error(format!("fs_watcher exited: {err}")))
+                .await;
+        }
+    });
 }
