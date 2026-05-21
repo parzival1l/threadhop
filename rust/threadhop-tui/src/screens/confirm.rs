@@ -25,7 +25,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Widget},
+    widgets::{block::Padding, Block, BorderType, Borders, Clear, Paragraph, Widget},
 };
 use threadhop_core::theme::{hex_to_rgb, Theme};
 
@@ -140,7 +140,10 @@ pub fn draw(state: &State, theme: &Theme, area: Rect, buf: &mut Buffer) {
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(border_style(theme))
+        .padding(Padding::new(2, 2, 1, 1))
+        .style(modal_bg_style(theme))
         .title(Span::styled(" Confirm ", title_style(theme)));
     let inner = block.inner(area);
     block.render(area, buf);
@@ -224,8 +227,12 @@ fn border_style(theme: &Theme) -> Style {
 
 fn title_style(theme: &Theme) -> Style {
     Style::default()
-        .fg(theme_color(&theme.primary, Color::Yellow))
+        .fg(theme_color(&theme.accent, Color::Magenta))
         .add_modifier(Modifier::BOLD)
+}
+
+fn modal_bg_style(theme: &Theme) -> Style {
+    Style::default().bg(theme_color(&theme.background_panel, Color::Reset))
 }
 
 fn question_style(theme: &Theme) -> Style {

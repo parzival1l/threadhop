@@ -185,20 +185,31 @@ fn push_message_highlighted<'a>(
 ) {
     let role_style = style_for_role(&msg.role, theme);
     let muted = muted_style(theme);
+    let row_bg = role_bg(&msg.role, theme);
+    let style_with_bg = |s: Style| -> Style {
+        match row_bg {
+            Some(bg) => s.bg(bg),
+            None => s,
+        }
+    };
 
     // Header (identical to push_message — highlights don't apply here).
     let mut header_spans: Vec<Span<'a>> = Vec::with_capacity(4);
-    header_spans.push(gutter_span(role_style));
-    header_spans.push(Span::raw(" "));
+    header_spans.push(gutter_span_bg(role_style, row_bg));
+    header_spans.push(Span::styled(" ", base_row_style(row_bg)));
     header_spans.push(Span::styled(
         role_label(&msg.role).to_string(),
-        role_style.add_modifier(Modifier::BOLD),
+        style_with_bg(role_style.add_modifier(Modifier::BOLD)),
     ));
     if let Some(ts) = &msg.timestamp {
-        header_spans.push(Span::raw("  "));
-        header_spans.push(Span::styled(ts.clone(), muted));
+        header_spans.push(Span::styled("  ", base_row_style(row_bg)));
+        header_spans.push(Span::styled(ts.clone(), style_with_bg(muted)));
     }
-    out.push(Line::from(header_spans));
+    let mut header_line = Line::from(header_spans);
+    if let Some(bg) = row_bg {
+        header_line = header_line.style(Style::default().bg(bg));
+    }
+    out.push(header_line);
 
     // Pre-collect match byte ranges for this message, in document order.
     let matches: Vec<(usize, usize)> = find_state
@@ -210,7 +221,11 @@ fn push_message_highlighted<'a>(
     let current = find_state.current_match();
 
     if msg.text.is_empty() {
-        out.push(Line::from(vec![gutter_span(role_style)]));
+        let mut l = Line::from(vec![gutter_span_bg(role_style, row_bg)]);
+        if let Some(bg) = row_bg {
+            l = l.style(Style::default().bg(bg));
+        }
+        out.push(l);
         return;
     }
 
@@ -219,7 +234,10 @@ fn push_message_highlighted<'a>(
     let mut line_start: usize = 0;
     for (line_no, body_line) in msg.text.split('\n').enumerate() {
         let line_end = line_start + body_line.len();
-        let mut spans: Vec<Span<'a>> = vec![gutter_span(role_style), Span::raw(" ")];
+        let mut spans: Vec<Span<'a>> = vec![
+            gutter_span_bg(role_style, row_bg),
+            Span::styled(" ", base_row_style(row_bg)),
+        ];
         // Find matches that intersect [line_start, line_end].
         let mut cursor = line_start;
         for (ms, me) in matches.iter().copied() {
@@ -231,7 +249,7 @@ fn push_message_highlighted<'a>(
             // Pre-match plain text.
             if cursor < clamped_start {
                 let s = &msg.text[cursor..clamped_start];
-                spans.push(Span::raw(s.to_string()));
+                spans.push(Span::styled(s.to_string(), base_row_style(row_bg)));
             }
             // Match span. Bold + reversed if it's the current match
             // (matched on absolute byte offset + message index).
@@ -259,9 +277,13 @@ fn push_message_highlighted<'a>(
         // Trailing plain text after the last match on this line.
         if cursor < line_end {
             let s = &msg.text[cursor..line_end];
-            spans.push(Span::raw(s.to_string()));
+            spans.push(Span::styled(s.to_string(), base_row_style(row_bg)));
         }
-        out.push(Line::from(spans));
+        let mut line = Line::from(spans);
+        if let Some(bg) = row_bg {
+            line = line.style(Style::default().bg(bg));
+        }
+        out.push(line);
         // +1 for the consumed '\n', except after the last fragment.
         line_start = line_end + 1;
         let _ = line_no; // suppress unused on debug builds
@@ -271,34 +293,53 @@ fn push_message_highlighted<'a>(
 fn push_message<'a>(out: &mut Vec<Line<'a>>, msg: &CleanedMessage, theme: &Theme) {
     let role_style = style_for_role(&msg.role, theme);
     let muted = muted_style(theme);
+    let row_bg = role_bg(&msg.role, theme);
+    let style_with_bg = |s: Style| -> Style {
+        match row_bg {
+            Some(bg) => s.bg(bg),
+            None => s,
+        }
+    };
 
     // Header row: gutter + role label + timestamp (if present).
     let mut header_spans: Vec<Span<'a>> = Vec::with_capacity(4);
-    header_spans.push(gutter_span(role_style));
-    header_spans.push(Span::raw(" "));
+    header_spans.push(gutter_span_bg(role_style, row_bg));
+    header_spans.push(Span::styled(" ", base_row_style(row_bg)));
     header_spans.push(Span::styled(
         role_label(&msg.role).to_string(),
-        role_style.add_modifier(Modifier::BOLD),
+        style_with_bg(role_style.add_modifier(Modifier::BOLD)),
     ));
     if let Some(ts) = &msg.timestamp {
-        header_spans.push(Span::raw("  "));
-        header_spans.push(Span::styled(ts.clone(), muted));
+        header_spans.push(Span::styled("  ", base_row_style(row_bg)));
+        header_spans.push(Span::styled(ts.clone(), style_with_bg(muted)));
     }
-    out.push(Line::from(header_spans));
+    let mut header_line = Line::from(header_spans);
+    if let Some(bg) = row_bg {
+        header_line = header_line.style(Style::default().bg(bg));
+    }
+    out.push(header_line);
 
     // Body rows: split on '\n' so the gutter renders on every wrapped line
     // (ratatui `Wrap { trim: false }` will still soft-wrap long lines, but
     // the gutter only fires on hard newlines — same trade-off as the Python
     // widget's per-line mounting).
     if msg.text.is_empty() {
-        out.push(Line::from(vec![gutter_span(role_style)]));
+        let mut l = Line::from(vec![gutter_span_bg(role_style, row_bg)]);
+        if let Some(bg) = row_bg {
+            l = l.style(Style::default().bg(bg));
+        }
+        out.push(l);
     } else {
         for body_line in msg.text.split('\n') {
-            out.push(Line::from(vec![
-                gutter_span(role_style),
-                Span::raw(" "),
-                Span::raw(body_line.to_string()),
-            ]));
+            let mut line = Line::from(vec![
+                gutter_span_bg(role_style, row_bg),
+                Span::styled(" ", base_row_style(row_bg)),
+                Span::styled(body_line.to_string(), base_row_style(row_bg)),
+            ]);
+            if let Some(bg) = row_bg {
+                line = line.style(Style::default().bg(bg));
+            }
+            out.push(line);
         }
     }
 }
@@ -358,8 +399,41 @@ fn muted_style(theme: &Theme) -> Style {
     Style::default().fg(theme_color(&theme.text_muted, Color::DarkGray))
 }
 
-fn gutter_span<'a>(style: Style) -> Span<'a> {
-    Span::styled(GUTTER_GLYPH.to_string(), style)
+/// Gutter span variant that paints the role-tinted row background as well as
+/// the foreground accent. When `bg` is `None` (no tint configured for the
+/// role) we fall back to the unaltered foreground-only span.
+fn gutter_span_bg<'a>(style: Style, bg: Option<Color>) -> Span<'a> {
+    let s = match bg {
+        Some(b) => style.bg(b),
+        None => style,
+    };
+    Span::styled(GUTTER_GLYPH.to_string(), s)
+}
+
+/// Base style for a row's plain text — carries only the row's background
+/// tint (if any) so paragraphs land on the same card surface as the gutter
+/// and header. Foreground is left at default so wrapping respects the user's
+/// terminal palette.
+fn base_row_style(bg: Option<Color>) -> Style {
+    match bg {
+        Some(b) => Style::default().bg(b),
+        None => Style::default(),
+    }
+}
+
+/// Per-role background tint. `None` means "no tint — let the terminal bg
+/// show through." Mirrors the Python TCSS:
+///   * user → `background_panel` (one step lighter than the canvas, reads
+///     as a card)
+///   * assistant → no tint (the open canvas — keeps the conversation feel)
+///   * tool/other → `background_element` (darker, dimmer secondary surface)
+pub fn role_bg(role: &str, theme: &Theme) -> Option<Color> {
+    let hex = match role {
+        "user" => &theme.background_panel,
+        "assistant" => return None,
+        _ => &theme.background_element,
+    };
+    hex_to_rgb(hex).map(|(r, g, b)| Color::Rgb(r, g, b))
 }
 
 /// Pure helper — exposed for tests. Maps a role string to the user-facing

@@ -20,7 +20,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Widget},
+    widgets::{block::Padding, Block, BorderType, Borders, Clear, Paragraph, Widget},
 };
 use threadhop_core::theme::{hex_to_rgb, Theme};
 
@@ -87,9 +87,13 @@ pub fn draw(state: &State, theme: &Theme, area: Rect, buf: &mut Buffer) {
     let label_color = theme_color(&theme.foreground, Color::White);
     let muted = theme_color(&theme.text_muted, Color::Gray);
 
+    let panel_bg = theme_color(&theme.background_panel, Color::Reset);
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color))
+        .padding(Padding::new(2, 2, 1, 1))
+        .style(Style::default().bg(panel_bg))
         .title(Span::styled(
             " Help ",
             Style::default()

@@ -30,7 +30,10 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, StatefulWidget, Widget},
+    widgets::{
+        block::Padding, Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph,
+        StatefulWidget, Widget,
+    },
 };
 use threadhop_core::{
     models::BookmarkKind,
@@ -188,7 +191,10 @@ pub fn draw(state: &State, theme: &Theme, area: Rect, buf: &mut Buffer) {
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(border_style(theme))
+        .padding(Padding::new(2, 2, 1, 1))
+        .style(modal_bg_style(theme))
         .title(Span::styled(" Bookmarks ", title_style(theme)));
     let inner = block.inner(area);
     block.render(area, buf);
@@ -267,7 +273,8 @@ fn render_list(state: &State, theme: &Theme, area: Rect, buf: &mut Buffer) {
 
     let list = List::new(items).highlight_style(
         Style::default()
-            .bg(theme_color(&theme.background_element, Color::DarkGray))
+            .bg(theme_color(&theme.accent, Color::Magenta))
+            .fg(theme_color(&theme.background, Color::Black))
             .add_modifier(Modifier::BOLD),
     );
     StatefulWidget::render(list, area, buf, &mut list_state);
@@ -385,8 +392,12 @@ fn border_style(theme: &Theme) -> Style {
 
 fn title_style(theme: &Theme) -> Style {
     Style::default()
-        .fg(theme_color(&theme.primary, Color::Yellow))
+        .fg(theme_color(&theme.accent, Color::Magenta))
         .add_modifier(Modifier::BOLD)
+}
+
+fn modal_bg_style(theme: &Theme) -> Style {
+    Style::default().bg(theme_color(&theme.background_panel, Color::Reset))
 }
 
 /// Centered popup rect — exposed so the App can place the modal over the

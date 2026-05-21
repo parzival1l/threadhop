@@ -29,7 +29,17 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, StatefulWidget, Widget},
 };
-use threadhop_core::{models::SessionStatus, theme::hex_to_rgb};
+use threadhop_core::{
+    models::SessionStatus,
+    theme::{hex_to_rgb, Theme},
+};
+
+fn theme_color(hex: &str, fallback: Color) -> Color {
+    match hex_to_rgb(hex) {
+        Some((r, g, b)) => Color::Rgb(r, g, b),
+        None => fallback,
+    }
+}
 
 /// Width reserved for the display name column. Mirrors
 /// `threadhop_core.tui.constants.DISPLAY_NAME_WIDTH`.
@@ -128,12 +138,13 @@ impl<'a> Widget for SessionListWidget<'a> {
             .items
             .iter()
             .map(|it| {
-                ListItem::new(render_session_label_line_themed(
+                ListItem::new(render_session_label_line_full(
                     it,
                     self.spinner_frame,
                     self.now,
                     supports_emoji,
                     error_color,
+                    self.theme,
                 ))
             })
             .collect();
@@ -141,9 +152,36 @@ impl<'a> Widget for SessionListWidget<'a> {
         let mut state = ListState::default();
         state.select(selected);
 
+        // Modern selection: accent background with the canvas color as
+        // foreground. REVERSED was visually loud (full inversion); this
+        // reads as a single, deliberate accent pill on the sidebar.
+        let (sel_bg, sel_fg) = self
+            .theme
+            .map(|t| {
+                (
+                    theme_color(&t.accent, Color::Magenta),
+                    theme_color(&t.background, Color::Black),
+                )
+            })
+            .unwrap_or((Color::Magenta, Color::Black));
+
+        let border_color = self
+            .theme
+            .map(|t| theme_color(&t.border_subtle, Color::DarkGray))
+            .unwrap_or(Color::DarkGray);
+
         let list = List::new(list_items)
-            .block(Block::default().borders(Borders::RIGHT))
-            .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+            .block(
+                Block::default()
+                    .borders(Borders::RIGHT)
+                    .border_style(Style::default().fg(border_color)),
+            )
+            .highlight_style(
+                Style::default()
+                    .bg(sel_bg)
+                    .fg(sel_fg)
+                    .add_modifier(Modifier::BOLD),
+            );
 
         StatefulWidget::render(list, area, buf, &mut state);
     }
@@ -272,6 +310,20 @@ pub fn render_session_label_line_themed<'a>(
     supports_emoji: bool,
     error_color: Option<Color>,
 ) -> Line<'a> {
+    render_session_label_line_full(item, spinner_frame, now, supports_emoji, error_color, None)
+}
+
+/// Full-fat themed variant that also colors the leading status glyph
+/// (success / warning / muted) when a theme is supplied. The earlier
+/// `_themed` entrypoint still works — it just doesn't color the icon.
+pub fn render_session_label_line_full<'a>(
+    item: &SessionListItem,
+    spinner_frame: usize,
+    now: f64,
+    supports_emoji: bool,
+    error_color: Option<Color>,
+    theme: Option<&Theme>,
+) -> Line<'a> {
     let icon = status_icon(item, spinner_frame);
     let middle = render_display_segment(item, supports_emoji);
     let age = item
@@ -281,10 +333,25 @@ pub fn render_session_label_line_themed<'a>(
     // Right-align age to 4 cols, matching the Python `f" {age_str:>4}"`.
     let age_padded = format!("{age:>4}");
 
+    let icon_style = match theme {
+        Some(t) if item.is_working => Style::default()
+            .fg(theme_color(&t.warning, Color::Yellow))
+            .add_modifier(Modifier::BOLD),
+        Some(t) if item.is_active => Style::default()
+            .fg(theme_color(&t.success, Color::Green))
+            .add_modifier(Modifier::BOLD),
+        Some(t) => Style::default().fg(theme_color(&t.text_muted, Color::DarkGray)),
+        None => Style::default(),
+    };
+    let age_style = match theme {
+        Some(t) => Style::default().fg(theme_color(&t.text_muted, Color::DarkGray)),
+        None => Style::default(),
+    };
+
     let mut spans = vec![
-        Span::raw(format!("{icon} ")),
+        Span::styled(format!("{icon} "), icon_style),
         Span::raw(middle),
-        Span::raw(format!(" {age_padded}")),
+        Span::styled(format!(" {age_padded}"), age_style),
     ];
     if item.unresolved_conflict_count > 0 {
         let marker = " !";

@@ -70,9 +70,14 @@ impl<'a> ContextualFooterWidget<'a> {
     /// Build the styled `Line` the widget will render. Split out so unit
     /// tests can assert on span shape without going through a `Buffer`.
     fn build_line(&self) -> Line<'static> {
-        let key_color = hex_to_color(&self.theme.text_muted).unwrap_or(Color::Gray);
-        let label_color = hex_to_color(&self.theme.foreground).unwrap_or(Color::White);
-        let dim_color = hex_to_color(&self.theme.text_muted).unwrap_or(Color::DarkGray);
+        // Key gets full foreground + bold so the binding letter pops; the
+        // label sits in muted text so it reads as supporting copy. This
+        // is the same hierarchy Atuin/Lazygit use on their hint bars.
+        let key_color = hex_to_color(&self.theme.foreground).unwrap_or(Color::White);
+        let label_color = hex_to_color(&self.theme.text_muted).unwrap_or(Color::Gray);
+        let dim_color = hex_to_color(&self.theme.border_subtle)
+            .or_else(|| hex_to_color(&self.theme.text_muted))
+            .unwrap_or(Color::DarkGray);
 
         // Status message takes priority — when something needs the user's
         // attention, the hints can wait. Match the Python widget's `[dim]`

@@ -185,8 +185,17 @@ impl<'a> DigestBarWidget<'a> {
 
 impl<'a> Widget for DigestBarWidget<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        // Give the bar its own panel background so it reads as a distinct
+        // status stripe — the Python session-digest panel sits on
+        // `$panel`, mirrored here via `background_panel`. Falls back to
+        // the canvas background when the theme is missing the field.
+        let panel_bg = hex_to_color(&self.theme.background_panel);
         let line = self.build_line();
-        Paragraph::new(line).render(area, buf);
+        let mut p = Paragraph::new(line);
+        if let Some(bg) = panel_bg {
+            p = p.style(Style::default().bg(bg));
+        }
+        p.render(area, buf);
     }
 }
 
