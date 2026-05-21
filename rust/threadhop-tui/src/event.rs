@@ -67,7 +67,18 @@ pub async fn run(
             // Render tick. The redraw at the bottom of the loop handles
             // anything time-driven; we still consume the tick so the
             // interval doesn't backlog.
-            _ = tick.tick() => {}
+            //
+            // Phase 3 Wave 2: also drives the search-modal debounce —
+            // `should_execute` returns true once the user's typing has gone
+            // quiet for `DEBOUNCE`, and we run the FTS query against the
+            // App-owned DB connection.
+            _ = tick.tick() => {
+                if let Some(state) = app.search.as_mut() {
+                    if crate::screens::search::should_execute(state) {
+                        crate::screens::search::execute_query(state, &app.db);
+                    }
+                }
+            }
             Some(event) = worker_rx.recv() => {
                 handle_worker_event(&mut app, event);
             }
@@ -130,6 +141,14 @@ fn handle_worker_event(app: &mut App, event: WorkerEvent) {
             // next tick anyway.
             if app.selected_session_id.as_deref() == Some(session_id.as_str()) {
                 app.transcript = messages;
+                // If a find bar is open, its match positions reference the
+                // *previous* transcript. Recompute now that the transcript
+                // changed so highlights stay in sync.
+                if let Some(fs) = app.find_state.as_mut() {
+                    fs.recompute_matches(&app.transcript);
+                }
+                // Phase 3 Wave 2: resolve any pending search-modal jump.
+                app.try_resolve_pending_jump();
             }
         }
         WorkerEvent::Error(msg) => {

@@ -19,6 +19,7 @@ use ratatui::{
 use crate::app::App;
 use crate::widgets::{
     contextual_footer::ContextualFooterWidget,
+    find_bar::FindBarWidget,
     session_list::SessionListWidget,
     transcript::TranscriptWidget,
 };
@@ -55,15 +56,51 @@ pub fn draw(app: &App, frame: &mut Frame) {
     };
     frame.render_widget(sidebar, content[0]);
 
-    // Transcript pane — already-cleaned messages from the worker.
-    let transcript = TranscriptWidget::new(&app.transcript, app.scroll, &app.theme);
-    frame.render_widget(transcript, content[1]);
+    // Transcript pane. When the find bar is open, reserve the bottom row of
+    // the transcript pane for it so the bar sits flush with the footer.
+    let has_find = app.find_state.is_some();
+    let transcript_area = if has_find && content[1].height > 1 {
+        ratatui::layout::Rect {
+            x: content[1].x,
+            y: content[1].y,
+            width: content[1].width,
+            height: content[1].height - 1,
+        }
+    } else {
+        content[1]
+    };
+    let transcript = TranscriptWidget::new(&app.transcript, app.scroll, &app.theme)
+        .find_state(app.find_state.as_ref());
+    frame.render_widget(transcript, transcript_area);
+
+    if has_find && content[1].height > 1 {
+        let bar_area = ratatui::layout::Rect {
+            x: content[1].x,
+            y: content[1].y + content[1].height - 1,
+            width: content[1].width,
+            height: 1,
+        };
+        let bar = FindBarWidget::new(app.find_state.as_ref().unwrap(), &app.theme);
+        frame.render_widget(bar, bar_area);
+    }
 
     // Footer — scope-aware, surfaces read-only and status banner.
     let footer = ContextualFooterWidget::new(app.scope, &app.theme)
         .read_only(app.read_only)
         .status(app.status_message.as_deref());
     frame.render_widget(footer, outer[1]);
+
+    // Search modal — drawn last so it overlays everything else.
+    if let Some(search_state) = app.search.as_ref() {
+        let modal_area =
+            crate::screens::search::centered_rect(70, 60, frame.area());
+        crate::screens::search::draw(
+            search_state,
+            &app.theme,
+            modal_area,
+            frame.buffer_mut(),
+        );
+    }
 }
 
 /// Current unix timestamp in seconds. Defined here (not in the widget) so

@@ -18,6 +18,10 @@ pub enum Scope {
     Global,
     MainScreen,
     SearchModal,
+    /// Find-in-transcript bar overlay. Sits on top of `MainScreen` but takes
+    /// over key dispatch while open so `n`/`N`/`Esc`/`Enter` map to find-bar
+    /// actions and the footer reflects the right hints.
+    FindBar,
     BookmarkModal,
     KanbanModal,
     HelpOverlay,
@@ -50,6 +54,21 @@ pub enum Command {
     /// Confirm/activate current selection. Wave E binds it for label coverage;
     /// selection happens immediately on j/k, so the handler is a no-op.
     Confirm,
+    /// Open the FTS search modal (Phase 3 Wave 2). App swaps to
+    /// `Scope::SearchModal` and modal-first dispatch takes over.
+    OpenSearchModal,
+    /// Open the in-transcript find bar (Phase 3 Wave 2). App swaps to
+    /// `Scope::FindBar`; the find_bar widget handles its own keys.
+    OpenFindBar,
+    /// Close the find bar (footer hint while `Scope::FindBar` is active).
+    /// Actual dispatch goes through `widgets::find_bar::handle_key`.
+    CloseFindBar,
+    /// Jump to the currently-highlighted find-bar match (footer hint only).
+    JumpToCurrentMatch,
+    /// Step to the next find-bar match (footer hint only).
+    NextMatch,
+    /// Step to the previous find-bar match (footer hint only).
+    PrevMatch,
 }
 
 /// Single binding row. `label` drives the contextual footer + help overlay.
@@ -171,6 +190,83 @@ const MAIN_SCREEN_BINDINGS: &[CommandBinding] = &[
         command: Command::OpenHelp,
         label: "help",
     },
+    // Phase 3 Wave 2: open the FTS search modal. `/` matches the Python
+    // TUI's binding so muscle memory ports over cleanly.
+    CommandBinding {
+        key: key(KeyCode::Char('/'), KeyModifiers::NONE),
+        scope: Scope::MainScreen,
+        command: Command::OpenSearchModal,
+        label: "search",
+    },
+    // Open the in-transcript find bar. Plain `f` (not Ctrl-F) — Ctrl-F is
+    // commonly intercepted by terminal multiplexers, and plain `f` is free
+    // on the main screen.
+    CommandBinding {
+        key: key(KeyCode::Char('f'), KeyModifiers::NONE),
+        scope: Scope::MainScreen,
+        command: Command::OpenFindBar,
+        label: "find",
+    },
+];
+
+/// Footer hints shown while the search modal is open. The actual key
+/// dispatch is handled directly by `screens::search::handle_key` in
+/// modal-first routing — these entries exist purely so the footer shows the
+/// right labels.
+const SEARCH_MODAL_BINDINGS: &[CommandBinding] = &[
+    CommandBinding {
+        key: key(KeyCode::Esc, KeyModifiers::NONE),
+        scope: Scope::SearchModal,
+        command: Command::CloseFindBar,
+        label: "close",
+    },
+    CommandBinding {
+        key: key(KeyCode::Enter, KeyModifiers::NONE),
+        scope: Scope::SearchModal,
+        command: Command::Confirm,
+        label: "jump",
+    },
+    CommandBinding {
+        key: key(KeyCode::Down, KeyModifiers::NONE),
+        scope: Scope::SearchModal,
+        command: Command::SelectNextSession,
+        label: "next hit",
+    },
+    CommandBinding {
+        key: key(KeyCode::Up, KeyModifiers::NONE),
+        scope: Scope::SearchModal,
+        command: Command::SelectPrevSession,
+        label: "prev hit",
+    },
+];
+
+/// Footer hints shown while the find bar is focused. As with the search
+/// modal, key dispatch is delegated to `widgets::find_bar::handle_key`.
+const FIND_BAR_BINDINGS: &[CommandBinding] = &[
+    CommandBinding {
+        key: key(KeyCode::Esc, KeyModifiers::NONE),
+        scope: Scope::FindBar,
+        command: Command::CloseFindBar,
+        label: "close",
+    },
+    CommandBinding {
+        key: key(KeyCode::Enter, KeyModifiers::NONE),
+        scope: Scope::FindBar,
+        command: Command::JumpToCurrentMatch,
+        label: "jump",
+    },
+    CommandBinding {
+        key: key(KeyCode::Char('n'), KeyModifiers::NONE),
+        scope: Scope::FindBar,
+        command: Command::NextMatch,
+        label: "next",
+    },
+    CommandBinding {
+        key: key(KeyCode::Char('N'), KeyModifiers::SHIFT),
+        scope: Scope::FindBar,
+        command: Command::PrevMatch,
+        label: "prev",
+    },
 ];
 
 /// Returns the bindings registered for a given scope. Modal scopes return
@@ -180,6 +276,8 @@ pub fn commands_for_scope(scope: Scope) -> &'static [CommandBinding] {
     match scope {
         Scope::Global => GLOBAL_BINDINGS,
         Scope::MainScreen => MAIN_SCREEN_BINDINGS,
+        Scope::SearchModal => SEARCH_MODAL_BINDINGS,
+        Scope::FindBar => FIND_BAR_BINDINGS,
         _ => &[],
     }
 }

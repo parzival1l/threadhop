@@ -1,14 +1,23 @@
-//! Application state. Wave E adds the worker-fed `sidebar` snapshot, the
-//! `active_session_tx` watch sender that retargets the fs_watcher, and
-//! sidebar/transcript key-handler dispatch.
+//! Application state. Phase 3 Wave 2 adds:
+//!   - the [`screens::search::SearchState`] modal handle,
+//!   - the [`widgets::find_bar::FindState`] overlay handle,
+//!   - a `rusqlite::Connection` owned by the App for FTS queries,
+//!   - a `pending_jump_message_uuid` resolved by the event loop after
+//!     `WorkerEvent::TranscriptRefreshed` arrives.
+//!
+//! Wave E (the previous wave) wired the worker-fed `sidebar` snapshot, the
+//! `active_session_tx` watch sender, and sidebar/transcript key handling.
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use threadhop_core::{jsonl::CleanedMessage, models::Session, theme::Theme};
 use tokio::sync::watch;
 
 use crate::keys::{self, Command, Scope};
+use crate::screens::search::{SearchResult, SearchState};
+use crate::widgets::find_bar::{FindResult, FindState};
 use crate::widgets::session_list::SessionListItem;
+use crate::widgets::transcript::message_to_line_index;
 
 /// Half-page step size for `ScrollDownHalf` / `ScrollUpHalf`. A constant
 /// rather than a function of terminal height because the App doesn't know
@@ -74,6 +83,27 @@ pub struct App {
 
     /// Active UI scope, used to look up key bindings + render the footer.
     pub scope: Scope,
+
+    /// FTS search modal handle. `Some` while the modal is open. Phase 3
+    /// Wave 2.
+    pub search: Option<SearchState>,
+
+    /// In-transcript find bar handle. `Some` while the bar is open. Phase 3
+    /// Wave 2.
+    pub find_state: Option<FindState>,
+
+    /// SQLite connection used by `screens::search::execute_query`. Opened in
+    /// [`App::new`] against `threadhop_core::paths::db_path()`. On open
+    /// failure we surface the error via `status_message` and fall back to an
+    /// in-memory connection so the TUI still boots — the search modal will
+    /// just return zero hits in that degraded state.
+    pub db: rusqlite::Connection,
+
+    /// Pending jump after `fs_watcher` reloads the transcript. When the user
+    /// hits Enter in the search modal, we set this and switch sessions; once
+    /// `WorkerEvent::TranscriptRefreshed` arrives, the event loop resolves
+    /// the UUID to a scroll position and clears this back to `None`.
+    pub pending_jump_message_uuid: Option<String>,
 }
 
 impl App {
@@ -83,8 +113,26 @@ impl App {
     /// Creates the active-session watch channel. The caller must take
     /// `active_session_rx()` and hand it to `workers::spawn_all` before the
     /// fs_watcher can fire.
+    ///
+    /// Opens the SQLite DB used by the search modal. On error we fall back to
+    /// an in-memory connection — the modal still works (returns zero hits)
+    /// but the rest of the TUI stays usable. The failure is surfaced via
+    /// `status_message`.
     pub fn new() -> Self {
         let (active_session_tx, _initial_rx) = watch::channel::<Option<String>>(None);
+        let (db, status_message) = match threadhop_core::db::open(&threadhop_core::paths::db_path())
+        {
+            Ok(c) => (c, None),
+            Err(e) => {
+                tracing::warn!("opening sessions.db failed: {e} — falling back to in-memory");
+                // open_in_memory cannot realistically fail in a healthy
+                // process; expect() is fine here because if it did, the
+                // process couldn't continue anyway.
+                let c = rusqlite::Connection::open_in_memory()
+                    .expect("in-memory sqlite open should always succeed");
+                (c, Some(format!("DB unavailable: {e}")))
+            }
+        };
         Self {
             should_quit: false,
             sessions: Vec::new(),
@@ -94,9 +142,13 @@ impl App {
             scroll: 0,
             transcript: Vec::new(),
             theme: Theme::default_dark(),
-            status_message: None,
+            status_message,
             read_only: false,
             scope: Scope::MainScreen,
+            search: None,
+            find_state: None,
+            db,
+            pending_jump_message_uuid: None,
         }
     }
 
@@ -113,10 +165,86 @@ impl App {
         crate::screens::main::draw(self, frame);
     }
 
-    /// Dispatch a key event through the keys registry. Returns the matched
-    /// command for tests; the event loop ignores the return value and just
-    /// re-checks `self.should_quit`.
+    /// Dispatch a key event. Modal-first: if the search modal or find bar is
+    /// open, route the event there before consulting the main-screen
+    /// registry. Returns the matched [`Command`] when the event was handled
+    /// by the main-screen registry (used by tests); modal keypresses return
+    /// `None` because the modal owns its own result type.
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Command> {
+        // 1. Search modal — exclusive focus.
+        if self.search.is_some() {
+            // SAFETY: just checked is_some().
+            let state = self.search.as_mut().unwrap();
+            let result = crate::screens::search::handle_key(state, key);
+            match result {
+                Some(SearchResult::Cancelled) => {
+                    self.search = None;
+                    self.scope = Scope::MainScreen;
+                }
+                Some(SearchResult::JumpToMessage {
+                    session_id,
+                    message_uuid,
+                }) => {
+                    // Capture committed_query for the recent_searches push
+                    // *before* we drop the modal. The Esc-without-jump path
+                    // intentionally does NOT save — only successful jumps go
+                    // to the MRU list, matching the Python TUI's contract.
+                    let committed = std::mem::take(&mut state.committed_query);
+                    self.search = None;
+                    self.scope = Scope::MainScreen;
+                    self.pending_jump_message_uuid = Some(message_uuid);
+                    if self.selected_session_id.as_deref() != Some(session_id.as_str()) {
+                        self.selected_session_id = Some(session_id.clone());
+                        let _ = self.active_session_tx.send(Some(session_id));
+                        self.scroll = 0;
+                    } else {
+                        // Same session — no fs_watcher reload will fire, so
+                        // resolve the jump immediately against the current
+                        // transcript.
+                        self.try_resolve_pending_jump();
+                    }
+                    if !committed.trim().is_empty() {
+                        if let Err(e) = threadhop_core::recent_searches::save_recent_search(
+                            &committed,
+                        ) {
+                            tracing::warn!("save_recent_search failed: {e}");
+                        }
+                    }
+                }
+                None => { /* modal stays open */ }
+            }
+            return None;
+        }
+
+        // 2. Find bar — overlay on top of MainScreen.
+        if self.find_state.is_some() {
+            let transcript_clone = &self.transcript; // borrow split
+            let result = {
+                let state = self.find_state.as_mut().unwrap();
+                crate::widgets::find_bar::handle_key(state, key, transcript_clone)
+            };
+            match result {
+                Some(FindResult::Closed) => {
+                    self.find_state = None;
+                    self.scope = Scope::MainScreen;
+                }
+                Some(FindResult::JumpedToMatch { message_index }) => {
+                    if let Some(msg) = self.transcript.get(message_index) {
+                        if let Some(line) =
+                            message_to_line_index(&self.transcript, &msg.uuid)
+                        {
+                            self.scroll = line;
+                        }
+                    }
+                    self.find_state = None;
+                    self.scope = Scope::MainScreen;
+                }
+                None => { /* find bar stays open */ }
+            }
+            return None;
+        }
+
+        // 3. Normal main-screen dispatch.
         let cmd = keys::lookup(self.scope, key)?;
         match cmd {
             Command::Quit => self.should_quit = true,
@@ -126,8 +254,30 @@ impl App {
             Command::ScrollBottom => self.scroll = u16::MAX,
             Command::ScrollDownHalf => self.scroll = self.scroll.saturating_add(HALF_PAGE),
             Command::ScrollUpHalf => self.scroll = self.scroll.saturating_sub(HALF_PAGE),
-            // Wave E no-ops — labels are advertised on the footer; the
-            // overlay + open-on-enter handlers land in later phases.
+            Command::OpenSearchModal => {
+                let mut state = SearchState::new();
+                // Pre-populate recents so the empty-input fallback list has
+                // something to show. Failure here is non-fatal — the modal
+                // just opens with an empty recents list.
+                if let Ok(recents) = threadhop_core::recent_searches::get_recent_searches() {
+                    state.recents = recents;
+                }
+                self.search = Some(state);
+                self.scope = Scope::SearchModal;
+            }
+            Command::OpenFindBar => {
+                let mut state = FindState::default();
+                state.recompute_matches(&self.transcript);
+                self.find_state = Some(state);
+                self.scope = Scope::FindBar;
+            }
+            // No-ops on the main screen; these labels show up in the footer
+            // when the modals are open (they're handled by modal-first
+            // dispatch above).
+            Command::CloseFindBar
+            | Command::JumpToCurrentMatch
+            | Command::NextMatch
+            | Command::PrevMatch => {}
             Command::OpenHelp => {}
             Command::Confirm => {}
         }
@@ -158,7 +308,30 @@ impl App {
             self.scroll = 0;
         }
     }
+
+    /// If [`Self::pending_jump_message_uuid`] points at a message currently in
+    /// `transcript`, scroll to it and clear the pending state. Called from
+    /// the event loop after `TranscriptRefreshed` (and synchronously from
+    /// `handle_key` when the jump target is the same session — no reload
+    /// will arrive in that case).
+    pub fn try_resolve_pending_jump(&mut self) {
+        let Some(uuid) = self.pending_jump_message_uuid.clone() else {
+            return;
+        };
+        if let Some(line) = message_to_line_index(&self.transcript, &uuid) {
+            self.scroll = line;
+            self.pending_jump_message_uuid = None;
+        }
+        // Otherwise: leave pending_jump set; a later TranscriptRefreshed may
+        // contain the message (e.g. partial reload).
+    }
 }
+
+// `KeyModifiers` is referenced via crossterm re-export only when the
+// modifier-aware paths need it. Keep the import here so future edits don't
+// have to re-add it.
+#[allow(dead_code)]
+const _USED_KEYMODIFIERS: KeyModifiers = KeyModifiers::NONE;
 
 impl Default for App {
     fn default() -> Self {
@@ -182,6 +355,20 @@ mod tests {
         }
     }
 
+    fn msg(uuid: &str, role: &str, text: &str) -> CleanedMessage {
+        CleanedMessage {
+            uuid: uuid.into(),
+            session_id: None,
+            role: role.into(),
+            text: text.into(),
+            timestamp: None,
+            cwd: None,
+            parent_uuid: None,
+            is_sidechain: 0,
+            message_id: None,
+        }
+    }
+
     #[test]
     fn new_app_is_not_quitting() {
         let app = App::new();
@@ -189,6 +376,9 @@ mod tests {
         assert!(app.sessions.is_empty());
         assert!(app.sidebar.is_empty());
         assert_eq!(app.scope, Scope::MainScreen);
+        assert!(app.search.is_none());
+        assert!(app.find_state.is_none());
+        assert!(app.pending_jump_message_uuid.is_none());
     }
 
     #[test]
@@ -227,8 +417,6 @@ mod tests {
         app.sidebar = vec![item("a"), item("b"), item("c")];
         app.selected_session_id = Some("a".into());
         let mut rx = app.active_session_rx();
-        // Mark current value as seen so `has_changed` reflects only the j
-        // press.
         let _ = rx.borrow_and_update();
 
         app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
@@ -243,7 +431,6 @@ mod tests {
         app.sidebar = vec![item("a"), item("b"), item("c")];
         app.selected_session_id = Some("a".into());
         app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
-        // Wrapping up from index 0 lands on the last entry.
         assert_eq!(app.selected_session_id.as_deref(), Some("c"));
     }
 
@@ -310,5 +497,143 @@ mod tests {
         let r2 = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(r2, Some(Command::Confirm));
         assert!(!app.should_quit);
+    }
+
+    // ---- Phase 3 Wave 2 -----------------------------------------------------
+
+    #[test]
+    fn slash_opens_search_modal_and_changes_scope() {
+        let mut app = App::new();
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert!(app.search.is_some());
+        assert_eq!(app.scope, Scope::SearchModal);
+    }
+
+    #[test]
+    fn esc_in_search_modal_closes_it() {
+        let mut app = App::new();
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.search.is_none());
+        assert_eq!(app.scope, Scope::MainScreen);
+    }
+
+    #[test]
+    fn typing_in_search_modal_routes_to_modal_input() {
+        let mut app = App::new();
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        for c in "abc".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(app.search.as_ref().unwrap().query_input, "abc");
+        // Should NOT have triggered j-selection.
+        assert!(app.selected_session_id.is_none());
+    }
+
+    #[test]
+    fn f_opens_find_bar_and_changes_scope() {
+        let mut app = App::new();
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        assert!(app.find_state.is_some());
+        assert_eq!(app.scope, Scope::FindBar);
+    }
+
+    #[test]
+    fn esc_in_find_bar_closes_it() {
+        let mut app = App::new();
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.find_state.is_none());
+        assert_eq!(app.scope, Scope::MainScreen);
+    }
+
+    #[test]
+    fn typing_in_find_bar_routes_to_bar_input() {
+        let mut app = App::new();
+        app.transcript = vec![msg("u1", "user", "hello world")];
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        for c in "hello".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let fs = app.find_state.as_ref().unwrap();
+        assert_eq!(fs.query, "hello");
+        assert_eq!(fs.matches.len(), 1);
+    }
+
+    #[test]
+    fn find_bar_enter_scrolls_to_message_and_closes() {
+        let mut app = App::new();
+        // 2 messages — match is in #2. Avoid 'n' in the query because the
+        // find bar treats `n` as "next match" before "type a literal n".
+        app.transcript = vec![
+            msg("u1", "user", "alpha"),
+            msg("u2", "assistant", "target here"),
+        ];
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        for c in "target".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        // Sanity: the query made it to the bar and matched the second message.
+        {
+            let fs = app.find_state.as_ref().unwrap();
+            assert_eq!(fs.query, "target");
+            assert_eq!(fs.matches.len(), 1);
+            assert_eq!(fs.matches[0].message_index, 1);
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.find_state.is_none());
+        // Expected scroll: message 0 header(1) + body(1) + sep(1) = 3.
+        assert_eq!(app.scroll, 3);
+    }
+
+    #[test]
+    fn search_modal_jump_sets_pending_uuid_and_session() {
+        let mut app = App::new();
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        // Force a hit + Enter without exercising FTS.
+        {
+            let state = app.search.as_mut().unwrap();
+            state.hits.push(threadhop_core::fts::Hit {
+                message_uuid: "msg-42".into(),
+                session_id: "sess-xyz".into(),
+                snippet: "snip".into(),
+                score: -1.0,
+            });
+            state.committed_query = "needle".into();
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.search.is_none());
+        assert_eq!(
+            app.pending_jump_message_uuid.as_deref(),
+            Some("msg-42")
+        );
+        assert_eq!(app.selected_session_id.as_deref(), Some("sess-xyz"));
+        assert_eq!(app.scope, Scope::MainScreen);
+    }
+
+    #[test]
+    fn try_resolve_pending_jump_sets_scroll_when_uuid_present() {
+        let mut app = App::new();
+        app.transcript = vec![
+            msg("a", "user", "alpha"),
+            msg("b", "assistant", "beta line"),
+        ];
+        app.pending_jump_message_uuid = Some("b".into());
+        app.try_resolve_pending_jump();
+        // Message "b" starts after message "a" (1 header + 1 body) + 1 sep = 3.
+        assert_eq!(app.scroll, 3);
+        assert!(app.pending_jump_message_uuid.is_none());
+    }
+
+    #[test]
+    fn try_resolve_pending_jump_is_noop_when_uuid_missing() {
+        let mut app = App::new();
+        app.transcript = vec![msg("a", "user", "alpha")];
+        app.pending_jump_message_uuid = Some("does-not-exist".into());
+        app.scroll = 7;
+        app.try_resolve_pending_jump();
+        // No-op: keep scroll, keep pending so a later refresh can pick it up.
+        assert_eq!(app.scroll, 7);
+        assert!(app.pending_jump_message_uuid.is_some());
     }
 }

@@ -83,6 +83,12 @@ pub struct SearchState {
     /// Set on every keystroke. [`should_execute`] uses this plus
     /// [`DEBOUNCE`] to gate the next FTS run.
     pub last_keystroke_at: Instant,
+
+    /// MRU recent-search list, populated by the App from
+    /// [`threadhop_core::recent_searches::get_recent_searches`] when the modal
+    /// opens. Surfaced in [`draw`] when the input is empty so the user has a
+    /// fallback list to choose from before typing anything.
+    pub recents: Vec<String>,
 }
 
 impl SearchState {
@@ -97,6 +103,7 @@ impl SearchState {
             selected_index: 0,
             error: None,
             last_keystroke_at: Instant::now(),
+            recents: Vec::new(),
         }
     }
 
@@ -389,6 +396,31 @@ fn render_input(query: &str, theme: &Theme, area: Rect, buf: &mut Buffer) {
 /// match stands out. We don't parse them out — the brackets are visual, and
 /// any escaping would be lossy.
 fn render_hits(state: &SearchState, theme: &Theme, area: Rect, buf: &mut Buffer) {
+    // Empty input + no committed query → surface the MRU recents list as a
+    // pre-search fallback. Phase 3 task 3.5: the only way to *use* a recent
+    // entry is to read it and re-type it; we don't bind Enter to "load a
+    // recent" today because the modal doesn't track a separate "in recents
+    // vs in hits" selection. Future enhancement.
+    if state.hits.is_empty() && state.query_input.is_empty() && !state.recents.is_empty() {
+        let header_style = Style::default()
+            .fg(theme_color(&theme.text_muted, Color::DarkGray))
+            .add_modifier(Modifier::DIM);
+        let muted = Style::default().fg(theme_color(&theme.text_muted, Color::DarkGray));
+        let mut items: Vec<ListItem> = Vec::with_capacity(state.recents.len() + 1);
+        items.push(ListItem::new(Line::from(Span::styled(
+            " recent searches ".to_string(),
+            header_style,
+        ))));
+        for r in &state.recents {
+            items.push(ListItem::new(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(r.clone(), muted),
+            ])));
+        }
+        Widget::render(List::new(items), area, buf);
+        return;
+    }
+
     if state.hits.is_empty() {
         let msg = if state.committed_query.is_empty() {
             "Type to search..."

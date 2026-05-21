@@ -46,6 +46,11 @@ pub struct TranscriptWidget<'a> {
     pub messages: &'a [CleanedMessage],
     pub scroll: u16,
     pub theme: &'a Theme,
+    /// Optional find-bar state. When set, the renderer splices yellow/black
+    /// highlight spans into the body lines for every recorded match, with the
+    /// current match rendered bold + reversed. None means "no highlights" —
+    /// the widget renders exactly as it did before Wave 2.
+    pub find_state: Option<&'a crate::widgets::find_bar::FindState>,
 }
 
 impl<'a> TranscriptWidget<'a> {
@@ -56,13 +61,29 @@ impl<'a> TranscriptWidget<'a> {
             messages,
             scroll,
             theme,
+            find_state: None,
         }
+    }
+
+    /// Attach an optional find-bar overlay. Builder-style so `screens::main`
+    /// can pipe `.find_state(app.find_state.as_ref())` at the call site.
+    pub fn find_state(
+        mut self,
+        find_state: Option<&'a crate::widgets::find_bar::FindState>,
+    ) -> Self {
+        self.find_state = find_state;
+        self
     }
 }
 
 impl<'a> Widget for TranscriptWidget<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let lines = build_lines(self.messages, self.theme);
+        let lines = match self.find_state {
+            Some(fs) if !fs.matches.is_empty() => {
+                build_lines_with_highlights(self.messages, self.theme, fs)
+            }
+            _ => build_lines(self.messages, self.theme),
+        };
         // Empty-state: keep the pane blank rather than dumping an "(empty)"
         // placeholder — Wave C will render a "no session selected" banner in
         // the screen itself, not the widget.
@@ -91,6 +112,112 @@ pub fn build_lines<'a>(messages: &[CleanedMessage], theme: &Theme) -> Vec<Line<'
         }
     }
     lines
+}
+
+/// Like `build_lines` but splices find-bar highlight spans into each body
+/// line. Kept as a separate function (rather than a parameter on
+/// `build_lines`) so the hot non-highlighted path stays branch-free.
+pub fn build_lines_with_highlights<'a>(
+    messages: &[CleanedMessage],
+    theme: &Theme,
+    find_state: &crate::widgets::find_bar::FindState,
+) -> Vec<Line<'a>> {
+    let mut lines: Vec<Line<'a>> = Vec::new();
+    for (idx, msg) in messages.iter().enumerate() {
+        push_message_highlighted(&mut lines, msg, idx, theme, find_state);
+        if idx + 1 < messages.len() {
+            lines.push(Line::from(""));
+        }
+    }
+    lines
+}
+
+fn push_message_highlighted<'a>(
+    out: &mut Vec<Line<'a>>,
+    msg: &CleanedMessage,
+    msg_index: usize,
+    theme: &Theme,
+    find_state: &crate::widgets::find_bar::FindState,
+) {
+    let role_style = style_for_role(&msg.role, theme);
+    let muted = muted_style(theme);
+
+    // Header (identical to push_message — highlights don't apply here).
+    let mut header_spans: Vec<Span<'a>> = Vec::with_capacity(4);
+    header_spans.push(gutter_span(role_style));
+    header_spans.push(Span::raw(" "));
+    header_spans.push(Span::styled(
+        role_label(&msg.role).to_string(),
+        role_style.add_modifier(Modifier::BOLD),
+    ));
+    if let Some(ts) = &msg.timestamp {
+        header_spans.push(Span::raw("  "));
+        header_spans.push(Span::styled(ts.clone(), muted));
+    }
+    out.push(Line::from(header_spans));
+
+    // Pre-collect match byte ranges for this message, in document order.
+    let matches: Vec<(usize, usize)> = find_state
+        .matches
+        .iter()
+        .filter(|m| m.message_index == msg_index)
+        .map(|m| (m.char_offset, m.char_offset + m.length))
+        .collect();
+    let current = find_state.current_match();
+
+    if msg.text.is_empty() {
+        out.push(Line::from(vec![gutter_span(role_style)]));
+        return;
+    }
+
+    // Walk byte offsets per body line so highlight ranges land on the right
+    // line. CleanedMessage.text is a single String split on '\n'.
+    let mut line_start: usize = 0;
+    for (line_no, body_line) in msg.text.split('\n').enumerate() {
+        let line_end = line_start + body_line.len();
+        let mut spans: Vec<Span<'a>> = vec![gutter_span(role_style), Span::raw(" ")];
+        // Find matches that intersect [line_start, line_end].
+        let mut cursor = line_start;
+        for (ms, me) in matches.iter().copied() {
+            if me <= line_start || ms >= line_end {
+                continue;
+            }
+            let clamped_start = ms.max(line_start);
+            let clamped_end = me.min(line_end);
+            // Pre-match plain text.
+            if cursor < clamped_start {
+                let s = &msg.text[cursor..clamped_start];
+                spans.push(Span::raw(s.to_string()));
+            }
+            // Match span. Bold + reversed if it's the current match
+            // (matched on absolute byte offset + message index).
+            let is_current = current
+                .map(|c| {
+                    c.message_index == msg_index
+                        && c.char_offset == ms
+                        && c.length == me - ms
+                })
+                .unwrap_or(false);
+            let mut style = Style::default()
+                .bg(Color::Yellow)
+                .fg(Color::Black);
+            if is_current {
+                style = style.add_modifier(Modifier::BOLD | Modifier::REVERSED);
+            }
+            let s = &msg.text[clamped_start..clamped_end];
+            spans.push(Span::styled(s.to_string(), style));
+            cursor = clamped_end;
+        }
+        // Trailing plain text after the last match on this line.
+        if cursor < line_end {
+            let s = &msg.text[cursor..line_end];
+            spans.push(Span::raw(s.to_string()));
+        }
+        out.push(Line::from(spans));
+        // +1 for the consumed '\n', except after the last fragment.
+        line_start = line_end + 1;
+        let _ = line_no; // suppress unused on debug builds
+    }
 }
 
 fn push_message<'a>(out: &mut Vec<Line<'a>>, msg: &CleanedMessage, theme: &Theme) {
@@ -126,6 +253,41 @@ fn push_message<'a>(out: &mut Vec<Line<'a>>, msg: &CleanedMessage, theme: &Theme
             ]));
         }
     }
+}
+
+/// Estimate the rendered line index for the message at `target_index`. Used
+/// by the App's pending-jump resolution path (Phase 3 Wave 2) to translate a
+/// message index into a `scroll` value the transcript renderer can consume.
+///
+/// The estimate sums:
+///   * 1 header row per message,
+///   * `max(1, text.split('\n').count())` body rows per message,
+///   * 1 blank separator between messages (so we don't count it after the
+///     last message — matches what `build_lines` emits).
+///
+/// Soft-wraps from `Wrap { trim: false }` aren't counted — the renderer will
+/// clamp `u16::MAX` to the last line on overshoot, and undershooting by a
+/// soft-wrap is preferable to the alternative of needing the terminal width
+/// at the time we compute the scroll target.
+pub fn message_to_line_index(messages: &[CleanedMessage], uuid: &str) -> Option<u16> {
+    let mut acc: u32 = 0;
+    for (idx, msg) in messages.iter().enumerate() {
+        if msg.uuid == uuid {
+            return Some(acc.min(u16::MAX as u32) as u16);
+        }
+        // 1 header + N body rows (1 for empty text, else line count).
+        let body_rows = if msg.text.is_empty() {
+            1
+        } else {
+            msg.text.split('\n').count() as u32
+        };
+        acc += 1 + body_rows;
+        // Blank separator between messages.
+        if idx + 1 < messages.len() {
+            acc += 1;
+        }
+    }
+    None
 }
 
 /// Pure helper — exposed for tests. Maps `CleanedMessage.role` (always
