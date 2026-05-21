@@ -250,10 +250,22 @@ impl App {
             Command::Quit => self.should_quit = true,
             Command::SelectNextSession => self.move_selection(1),
             Command::SelectPrevSession => self.move_selection(-1),
-            Command::ScrollTop => self.scroll = 0,
-            Command::ScrollBottom => self.scroll = u16::MAX,
-            Command::ScrollDownHalf => self.scroll = self.scroll.saturating_add(HALF_PAGE),
-            Command::ScrollUpHalf => self.scroll = self.scroll.saturating_sub(HALF_PAGE),
+            Command::ScrollTop => {
+                self.scroll = 0;
+                tracing::debug!(target: "threadhop_tui", "scroll command g applied scroll={}", self.scroll);
+            }
+            Command::ScrollBottom => {
+                self.scroll = u16::MAX;
+                tracing::debug!(target: "threadhop_tui", "scroll command G applied scroll={}", self.scroll);
+            }
+            Command::ScrollDownHalf => {
+                self.scroll = self.scroll.saturating_add(HALF_PAGE);
+                tracing::debug!(target: "threadhop_tui", "scroll command DownHalf applied scroll={}", self.scroll);
+            }
+            Command::ScrollUpHalf => {
+                self.scroll = self.scroll.saturating_sub(HALF_PAGE);
+                tracing::debug!(target: "threadhop_tui", "scroll command UpHalf applied scroll={}", self.scroll);
+            }
             Command::OpenSearchModal => {
                 let mut state = SearchState::new();
                 // Pre-populate recents so the empty-input fallback list has
@@ -640,5 +652,161 @@ mod tests {
         // No-op: keep scroll, keep pending so a later refresh can pick it up.
         assert_eq!(app.scroll, 7);
         assert!(app.pending_jump_message_uuid.is_some());
+    }
+
+    // ---- Frame-buffer regression tests (second-fix) -----------------------
+    //
+    // The previous regression tests asserted only on state mutations
+    // (`app.scroll`, `app.selected_session_id`). They missed two bugs:
+    //   * `G` moved `scroll` but the rendered transcript pane didn't
+    //     visibly change for the long-transcript case the user hit.
+    //   * `k` moved selection but `app.transcript` never refreshed when
+    //     returning to a previously-viewed session, so the pane kept
+    //     showing the prior session's content.
+    // These tests render to a `TestBackend` and diff actual buffer cells.
+
+    fn long_msg(uuid: &str, marker: &str) -> CleanedMessage {
+        CleanedMessage {
+            uuid: uuid.into(),
+            session_id: None,
+            role: "user".into(),
+            // 3 body lines per message, prefixed with the marker so we can
+            // assert the marker appears in the rendered buffer.
+            text: format!("{marker}-line-1\n{marker}-line-2\n{marker}-line-3"),
+            timestamp: None,
+            cwd: None,
+            parent_uuid: None,
+            is_sidechain: 0,
+            message_id: None,
+        }
+    }
+
+    fn render_to_string(app: &App, w: u16, h: u16) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let buf = term.backend().buffer();
+        let mut s = String::new();
+        for y in 0..buf.area().height {
+            for x in 0..buf.area().width {
+                s.push_str(buf[(x, y)].symbol());
+            }
+            s.push('\n');
+        }
+        s
+    }
+
+    #[test]
+    fn pressing_shift_g_visibly_scrolls_transcript_to_bottom() {
+        // Long transcript: 50 messages, distinct markers per message so we
+        // can assert that "TOP-MARKER" is visible before the keypress and
+        // "BOTTOM-MARKER" is visible after.
+        let mut app = App::new();
+        let mut msgs: Vec<CleanedMessage> = (0..50)
+            .map(|i| long_msg(&format!("u{i}"), &format!("msg{i:02}")))
+            .collect();
+        // Distinct sentinel markers — these strings must not appear
+        // anywhere else in the rendered buffer.
+        msgs[0] = long_msg("u0", "TOPSENTINEL");
+        msgs[49] = long_msg("u49", "BOTTOMSENTINEL");
+        app.transcript = msgs;
+        app.scroll = 0;
+
+        let before = render_to_string(&app, 120, 30);
+        assert!(
+            before.contains("TOPSENTINEL"),
+            "TOPSENTINEL must be visible at scroll=0; got:\n{before}"
+        );
+
+        // Simulate Shift+G.
+        app.handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT));
+        let after = render_to_string(&app, 120, 30);
+        assert_ne!(
+            before, after,
+            "Shift+G did not visibly change the rendered transcript"
+        );
+        assert!(
+            after.contains("BOTTOMSENTINEL"),
+            "BOTTOMSENTINEL must be visible after Shift+G; got:\n{after}"
+        );
+        assert!(
+            !after.contains("TOPSENTINEL"),
+            "TOPSENTINEL must scroll off-screen after Shift+G; got:\n{after}"
+        );
+    }
+
+    #[test]
+    fn pressing_pgdn_visibly_scrolls_transcript() {
+        // PageDown / Ctrl-d move HALF_PAGE rows — must actually move the
+        // rendered transcript, not just bump `app.scroll`.
+        let mut app = App::new();
+        let msgs: Vec<CleanedMessage> = (0..50)
+            .map(|i| long_msg(&format!("u{i}"), &format!("PGMARK{i:02}")))
+            .collect();
+        app.transcript = msgs;
+        app.scroll = 0;
+
+        let before = render_to_string(&app, 120, 30);
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        let after = render_to_string(&app, 120, 30);
+        assert_ne!(
+            before, after,
+            "PageDown did not visibly change the rendered transcript"
+        );
+    }
+
+    #[test]
+    fn pressing_k_visibly_switches_transcript_to_prev_session() {
+        // Three sessions, starting at the middle one. Simulate the
+        // worker-fed initial transcript for "s2" (the down-direction
+        // session would have been loaded by the first j → k path the
+        // user reported).
+        let mut app = App::new();
+        app.sidebar = vec![item("s1"), item("s2"), item("s3")];
+        app.selected_session_id = Some("s2".into());
+        // Pre-load the current pane with s2's transcript via the worker
+        // event — exactly what the live loop does.
+        crate::event::handle_worker_event(
+            &mut app,
+            crate::workers::WorkerEvent::TranscriptRefreshed {
+                session_id: "s2".into(),
+                messages: vec![long_msg("m1", "SESSION-TWO-CONTENT")],
+            },
+        );
+        // Sanity: s2 content rendered.
+        let s2_frame = render_to_string(&app, 120, 30);
+        assert!(
+            s2_frame.contains("SESSION-TWO-CONTENT"),
+            "expected s2 content visible before k; got:\n{s2_frame}"
+        );
+
+        // Simulate having previously visited s1, so the worker would not
+        // organically re-emit (sig_cache hit). The bug manifests when the
+        // worker delivers — or fails to deliver — the previous session's
+        // transcript on the k transition.
+        //
+        // Press k → selection moves to s1.
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.selected_session_id.as_deref(), Some("s1"));
+
+        // Now simulate the fs_watcher delivering s1's transcript. This is
+        // what the *fixed* fs_watcher must do on every session switch,
+        // even if the file's signature is unchanged.
+        crate::event::handle_worker_event(
+            &mut app,
+            crate::workers::WorkerEvent::TranscriptRefreshed {
+                session_id: "s1".into(),
+                messages: vec![long_msg("m2", "SESSION-ONE-CONTENT")],
+            },
+        );
+        let s1_frame = render_to_string(&app, 120, 30);
+        assert!(
+            s1_frame.contains("SESSION-ONE-CONTENT"),
+            "k did not switch transcript content; got:\n{s1_frame}"
+        );
+        assert!(
+            !s1_frame.contains("SESSION-TWO-CONTENT"),
+            "stale s2 transcript still visible after k; got:\n{s1_frame}"
+        );
     }
 }

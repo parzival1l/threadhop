@@ -106,8 +106,10 @@ fn handle_terminal_event(app: &mut App, event: CtEvent) {
 }
 
 /// Apply one worker event to App state. Pulled out of the `select!` so it's
-/// unit-testable without standing up an async runtime.
-fn handle_worker_event(app: &mut App, event: WorkerEvent) {
+/// unit-testable without standing up an async runtime. Public-in-crate so the
+/// frame-buffer regression tests in `app.rs` can drive the same code path the
+/// live loop exercises.
+pub(crate) fn handle_worker_event(app: &mut App, event: WorkerEvent) {
     match event {
         WorkerEvent::SessionsRefreshed(items) => {
             app.sidebar = items;
