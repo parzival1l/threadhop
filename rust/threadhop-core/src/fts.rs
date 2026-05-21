@@ -26,24 +26,17 @@
 use rusqlite::{Connection, ToSql};
 
 use crate::error::FtsError;
+use crate::models::MessageRole;
 
-/// Role filter for [`search`] / [`prefix_search`].
+/// Map a [`MessageRole`] to the on-disk string value `messages.role` stores.
 ///
-/// Mirrors the `MessageRole` enum that will land in `crate::models` once
-/// Task 1.3 implements it; the variants and the on-disk string values
-/// (`"user"`, `"assistant"`) match what `messages.role` stores.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Role {
-    User,
-    Assistant,
-}
-
-impl Role {
-    fn as_sql_str(self) -> &'static str {
-        match self {
-            Role::User => "user",
-            Role::Assistant => "assistant",
-        }
+/// Mirrors the wire form produced by `#[serde(rename_all = "snake_case")]` on
+/// `MessageRole` — kept as a tiny helper so the SQL binding stays a `&'static
+/// str` rather than allocating via `serde_json::to_string`.
+fn role_as_sql_str(role: MessageRole) -> &'static str {
+    match role {
+        MessageRole::User => "user",
+        MessageRole::Assistant => "assistant",
     }
 }
 
@@ -52,7 +45,7 @@ impl Role {
 #[derive(Default, Debug, Clone)]
 pub struct Filters {
     pub project: Option<String>,
-    pub role: Option<Role>,
+    pub role: Option<MessageRole>,
 }
 
 /// Canonical Phase 7 search hit.
@@ -87,9 +80,9 @@ pub fn parse_query(raw: &str) -> (Filters, String) {
                 filters.project = Some(p.to_string());
             }
         } else if tok == "user:" {
-            filters.role = Some(Role::User);
+            filters.role = Some(MessageRole::User);
         } else if tok == "assistant:" {
-            filters.role = Some(Role::Assistant);
+            filters.role = Some(MessageRole::Assistant);
         } else {
             remainder.push(tok);
         }
@@ -141,7 +134,7 @@ pub fn prefix_search(
     }
     if let Some(r) = filters.role {
         sql.push_str(" AND m.role = ?");
-        params.push(Box::new(r.as_sql_str()));
+        params.push(Box::new(role_as_sql_str(r)));
     }
     sql.push_str(" ORDER BY score ASC, m.timestamp DESC LIMIT 200");
 
@@ -262,14 +255,14 @@ mod tests {
     #[test]
     fn parse_query_extracts_user_role() {
         let (filters, rest) = parse_query("user: questions about migrations");
-        assert_eq!(filters.role, Some(Role::User));
+        assert_eq!(filters.role, Some(MessageRole::User));
         assert_eq!(rest, "questions about migrations");
     }
 
     #[test]
     fn parse_query_extracts_assistant_role() {
         let (filters, rest) = parse_query("assistant: explanation");
-        assert_eq!(filters.role, Some(Role::Assistant));
+        assert_eq!(filters.role, Some(MessageRole::Assistant));
         assert_eq!(rest, "explanation");
     }
 
@@ -277,7 +270,7 @@ mod tests {
     fn parse_query_combines_filters() {
         let (filters, rest) = parse_query("project:foo user: hello");
         assert_eq!(filters.project.as_deref(), Some("foo"));
-        assert_eq!(filters.role, Some(Role::User));
+        assert_eq!(filters.role, Some(MessageRole::User));
         assert_eq!(rest, "hello");
     }
 
@@ -411,7 +404,7 @@ mod tests {
         );
         let filters = Filters {
             project: None,
-            role: Some(Role::User),
+            role: Some(MessageRole::User),
         };
         let hits = prefix_search(&c, "shared", &filters).unwrap();
         assert_eq!(hits.len(), 1);
@@ -433,7 +426,7 @@ mod tests {
         );
         let filters = Filters {
             project: None,
-            role: Some(Role::Assistant),
+            role: Some(MessageRole::Assistant),
         };
         let hits = prefix_search(&c, "shared", &filters).unwrap();
         assert_eq!(hits.len(), 1);
