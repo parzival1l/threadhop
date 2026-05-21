@@ -233,7 +233,13 @@ pub fn execute_query(state: &mut SearchState, conn: &rusqlite::Connection) {
 /// Every text-mutating branch updates `last_keystroke_at` and reparses
 /// filters so the pill row stays in lockstep.
 pub fn handle_key(state: &mut SearchState, key: KeyEvent) -> Option<SearchResult> {
-    if key.kind != crossterm::event::KeyEventKind::Press {
+    // Accept Press and Repeat — some terminals only send Repeat for held keys,
+    // and unit tests synthesize Press. Skip Release so we don't double-fire
+    // on up-edges. Matches the find_bar widget's permissive handling.
+    if matches!(
+        key.kind,
+        crossterm::event::KeyEventKind::Release
+    ) {
         return None;
     }
     match (key.code, key.modifiers) {
