@@ -2,16 +2,11 @@
 //! route Quit; widgets, screens, and workers land in later waves.
 
 use crossterm::event::KeyEvent;
-use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout},
-    style::{Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
-    Frame,
-};
+use ratatui::Frame;
 use threadhop_core::{jsonl::CleanedMessage, models::Session, theme::Theme};
 
 use crate::keys::{self, Command, Scope};
+use crate::widgets::session_list::SessionListItem;
 
 /// Top-level application state.
 ///
@@ -79,43 +74,37 @@ impl App {
         }
     }
 
-    /// Draw one frame. Wave A renders a centered boot banner so we can verify
-    /// the binary actually enters ratatui without crashing.
+    /// Draw one frame. Delegates to `screens::main` — Wave A's centered
+    /// boot banner has been replaced by the real sidebar + transcript +
+    /// footer layout.
     pub fn draw(&self, frame: &mut Frame) {
-        let area = frame.area();
-        let layout = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(1)])
-            .split(area);
+        crate::screens::main::draw(self, frame);
+    }
 
-        let body = vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                "ThreadHop (Rust)",
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from("Phase 2 Wave A boot."),
-            Line::from("Widgets land in Wave B."),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Press q to quit.",
-                Style::default().add_modifier(Modifier::DIM),
-            )),
-        ];
-
-        let paragraph = Paragraph::new(body)
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: true })
-            .block(Block::default().borders(Borders::ALL).title(" threadhop-tui "));
-        frame.render_widget(paragraph, layout[0]);
-
-        // Minimal footer hint — full contextual_footer arrives in Wave B.
-        let footer = Paragraph::new(Line::from(Span::styled(
-            " q  quit ",
-            Style::default().add_modifier(Modifier::REVERSED),
-        )));
-        frame.render_widget(footer, layout[1]);
+    /// Derive the sidebar view-model from the App's `Vec<Session>`.
+    ///
+    /// Pure (clones strings — no I/O, no time access). Used by
+    /// `screens::main` until the session_scanner worker emits
+    /// `SessionsRefreshed(Vec<SessionListItem>)` directly. Runtime fields
+    /// (is_active / is_working / has_observations) default to `false`
+    /// because the active-detector worker isn't wired in yet; the
+    /// last-active timestamp falls back to `modified_at`.
+    pub fn sidebar_items(&self) -> Vec<SessionListItem> {
+        self.sessions
+            .iter()
+            .map(|s| SessionListItem {
+                session_id: s.session_id.clone(),
+                display_name: s
+                    .custom_name
+                    .clone()
+                    .or_else(|| s.project.clone())
+                    .unwrap_or_else(|| s.session_id.clone()),
+                is_active: false,
+                is_working: false,
+                has_observations: false,
+                last_active_at: s.modified_at,
+            })
+            .collect()
     }
 
     /// Dispatch a key event through the keys registry. Returns the matched
