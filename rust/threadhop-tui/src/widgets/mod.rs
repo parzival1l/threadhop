@@ -8,5 +8,6 @@
 pub mod contextual_footer;
 pub mod digest_bar;
 pub mod find_bar;
+pub mod session_digest_panel;
 pub mod session_list;
 pub mod transcript;

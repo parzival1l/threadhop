@@ -21,12 +21,23 @@ use crate::widgets::{
     contextual_footer::ContextualFooterWidget,
     digest_bar::{DigestBarContext, DigestBarWidget},
     find_bar::FindBarWidget,
+    session_digest_panel::SessionDigestPanel,
     session_list::SessionListWidget,
     transcript::TranscriptWidget,
 };
 
 /// Sidebar width in cells. Matches the Python TUI's fixed column.
 const SIDEBAR_WIDTH: u16 = 36;
+
+/// Right-column digest panel width. Same fixed value as the Python grid
+/// (`grid-columns: 36 1fr 36` in `app.tcss`).
+const DIGEST_PANEL_WIDTH: u16 = 36;
+
+/// Minimum terminal width before the right-column digest panel appears.
+/// Below this we collapse back to `[sidebar, transcript]` so narrow
+/// terminals still get a usable transcript pane. Picked from the parity
+/// plan (§5 Open Questions #7).
+const DIGEST_PANEL_MIN_WIDTH: u16 = 110;
 
 /// Render one frame of the main screen.
 ///
@@ -75,11 +86,29 @@ pub fn draw(app: &App, frame: &mut Frame) {
     };
     frame.render_widget(digest, outer[0]);
 
-    // Content row: 36-char sidebar + transcript fills the rest.
-    let content = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(1)])
-        .split(outer[1]);
+    // Content row: 36-char sidebar + transcript + optional 36-char digest panel.
+    //
+    // Phase C (minimal): the right-column digest panel appears whenever the
+    // terminal is at least `DIGEST_PANEL_MIN_WIDTH` cells wide. Below that
+    // threshold we collapse back to the original two-column layout so the
+    // transcript pane keeps a usable width on narrow terminals (e.g. side
+    // panes / split tmux windows).
+    let show_digest_panel = frame.area().width >= DIGEST_PANEL_MIN_WIDTH;
+    let content = if show_digest_panel {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(SIDEBAR_WIDTH),
+                Constraint::Min(1),
+                Constraint::Length(DIGEST_PANEL_WIDTH),
+            ])
+            .split(outer[1])
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(1)])
+            .split(outer[1])
+    };
 
     // Sidebar — view-model already populated by the session_scanner worker.
     // Divide the 60fps render-tick counter by 5 → ~12fps spinner motion,
@@ -121,6 +150,19 @@ pub fn draw(app: &App, frame: &mut Frame) {
         };
         let bar = FindBarWidget::new(app.find_state.as_ref().unwrap(), &app.theme);
         frame.render_widget(bar, bar_area);
+    }
+
+    // Phase C (minimal): right-column session digest panel. Reuses the same
+    // `selected_item` and `summary` references already resolved above for the
+    // top digest bar — the App holds the data; both widgets just read.
+    if show_digest_panel {
+        let panel_area = content[2];
+        let panel = SessionDigestPanel {
+            theme: &app.theme,
+            selected_item,
+            summary,
+        };
+        frame.render_widget(panel, panel_area);
     }
 
     // Footer — scope-aware, surfaces read-only and status banner.
@@ -277,6 +319,83 @@ mod tests {
         assert!(
             row0.chars().any(|c| !c.is_whitespace()),
             "digest bar row 0 had only whitespace; got: {row0:?}"
+        );
+    }
+
+    #[test]
+    fn digest_panel_renders_on_wide_terminal() {
+        // Phase C: at >= 110 cells wide, the right-column digest panel must
+        // appear and carry the selected session's name. Frame-buffer test —
+        // we render and read cells back, not state.
+        use crate::widgets::session_list::SessionListItem;
+        let mut app = App::new();
+        app.sidebar = vec![SessionListItem {
+            session_id: "abcdef1234".into(),
+            display_name: "wide-term-session".into(),
+            is_active: true,
+            ..Default::default()
+        }];
+        app.selected_session_id = Some("abcdef1234".into());
+        let mut term = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        term.draw(|f| draw(&app, f)).unwrap();
+        let buf = term.backend().buffer();
+        // Sample the panel area: it occupies the rightmost 36 cells (x =
+        // 160-36 = 124..160), rows 1..H-1 (between top digest + footer).
+        let mut panel_dump = String::new();
+        for y in 1..buf.area().height - 1 {
+            for x in 124..buf.area().width {
+                panel_dump.push_str(buf[(x, y)].symbol());
+            }
+            panel_dump.push('\n');
+        }
+        assert!(
+            panel_dump.contains("wide-term-session"),
+            "digest panel did not render session name on wide terminal; got:\n{panel_dump}"
+        );
+        assert!(
+            panel_dump.contains("digest"),
+            "digest panel title missing on wide terminal; got:\n{panel_dump}"
+        );
+        assert!(
+            panel_dump.contains("claude -r"),
+            "digest panel resume command missing on wide terminal; got:\n{panel_dump}"
+        );
+    }
+
+    #[test]
+    fn digest_panel_hidden_on_narrow_terminal() {
+        // Phase C narrow-fallback: at < 110 cells wide the right-column
+        // panel must not render. The transcript pane fills the remainder
+        // after the sidebar.
+        use crate::widgets::session_list::SessionListItem;
+        let mut app = App::new();
+        app.sidebar = vec![SessionListItem {
+            session_id: "abcdef1234".into(),
+            display_name: "narrow-term-session".into(),
+            is_active: true,
+            ..Default::default()
+        }];
+        app.selected_session_id = Some("abcdef1234".into());
+        // 100 < 110 — fallback path.
+        let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        term.draw(|f| draw(&app, f)).unwrap();
+        let buf = term.backend().buffer();
+        // Scan all rows (except the top digest bar at y=0 and footer at
+        // y=H-1) for the panel title " digest " — must NOT appear.
+        let mut body_dump = String::new();
+        for y in 1..buf.area().height - 1 {
+            for x in 0..buf.area().width {
+                body_dump.push_str(buf[(x, y)].symbol());
+            }
+            body_dump.push('\n');
+        }
+        assert!(
+            !body_dump.contains(" digest "),
+            "digest panel must be hidden below 110 cols but title appeared; got:\n{body_dump}"
+        );
+        assert!(
+            !body_dump.contains("claude -r"),
+            "digest panel must be hidden below 110 cols but resume cmd appeared"
         );
     }
 
