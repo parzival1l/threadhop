@@ -42,6 +42,11 @@ pub struct ContextualFooterWidget<'a> {
     pub status: Option<&'a str>,
 }
 
+// Builder methods are not wired into a screen yet — `screens::main`
+// (task 2.11) and the modal screens (Wave B/D) will start consuming
+// the read_only / status setters. Allow dead_code on the impl block in
+// the meantime so clippy stays clean across the wave.
+#[allow(dead_code)]
 impl<'a> ContextualFooterWidget<'a> {
     pub fn new(scope: Scope, theme: &'a Theme) -> Self {
         Self {
