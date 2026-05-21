@@ -141,7 +141,7 @@ optional in MVP) `trigram_fallback(query)` against `messages_fts_trigram`
 when prefix yields zero rows. Parses `project:foo`, `user:`, `assistant:`
 modifiers from the raw query string. Returns hits with surrounding
 context (snippet + 60 chars on either side) and the message UUID for the
-"jump to message" handoff.
+jump-to-message action.
 
 **`observations`** — Read-only access to
 `~/.config/threadhop/observations/<session_id>.jsonl`. Streams the file
@@ -238,7 +238,7 @@ that message.
 
 **`screens::bookmark`** — Modal browser over the `bookmarks` table.
 Lists bookmarks newest-first with session label + note + snippet.
-Enter jumps to the bookmarked message (same handoff as search). `d`
+Enter jumps to the bookmarked message (same jump-to-message action as search). `d`
 deletes a bookmark with a `Confirm` modal interstitial.
 
 **`screens::kanban`** — Modal status board grouping sessions by
@@ -483,6 +483,49 @@ and `screens::help` to parity with the Python registry. Add the
 schema-version mismatch UX, the panic guard for terminal restoration,
 file logging via `tracing-subscriber`. Build a release binary; wire
 the `./threadhop-rs` wrapper script.
+
+**Phase 7 — Semantic search (planned, out of current MVP scope).**
+Add context-driven search: "in what conversation did we talk about X"
+where X is a phrase, not a term. This is *deferred* until after the MVP
+ships, but the search-layer modules in Phases 2–3 must be designed with
+a clean seam so Phase 7 doesn't require rewriting `fts.rs` or the search
+modal.
+
+*Architecture (intended):*
+- **Vector store:** `sqlite-vec` extension, embedded in the same
+  `sessions.db` Rust already opens. No new daemon. Both Python and Rust
+  load the extension at connection time.
+- **Embedding model:** Local ONNX inference via the `ort` Rust crate.
+  Default model: `bge-small-en-v1.5` (~33MB, fast on Apple Silicon).
+  Avoids API roundtrips and per-query cost.
+- **Retrieval:** *Hybrid* — FTS5 retrieves the top ~50 lexical candidates,
+  vector cosine reranks to top ~10. Best precision + recall for chat
+  queries that mix terms and intent.
+- **Indexing:** Extend the Python observer pipeline (out of Rust scope)
+  to emit embeddings for new messages into a `message_embeddings` table.
+  Rust reads that table; never writes to it.
+- **New Rust module:** `threadhop-core::search_semantic` (sibling of
+  `fts.rs`). Adds a `search_semantic(query) -> Vec<Hit>` function and a
+  `search_hybrid(query) -> Vec<Hit>` that composes FTS + vec rerank.
+- **TUI surface:** The existing search modal grows a mode toggle
+  (`f` lexical / `s` semantic / `h` hybrid). No new modal needed; the
+  result-rendering and jump-to-message flow are reused.
+
+*Seam requirements for Phases 2–3 (must be in place before Phase 7):*
+1. `fts::search()` returns a `Vec<Hit>` where `Hit` carries
+   `message_uuid`, `session_id`, `snippet`, `score`. The
+   `search_hybrid()` function composes the same `Hit` type.
+2. The search modal must not assume FTS-only — its query interface
+   takes a `dyn SearchProvider` so Phase 7 can swap implementations
+   without touching screen code.
+3. Message-row queries must always return the canonical `message_uuid`;
+   never an FTS-internal rowid that the vector layer can't join on.
+
+*Alternative direction (worth noting, not chosen yet):* A
+conversational interface where the user asks "where did we talk about
+saving?" and Claude reads top-K FTS hits and answers in prose with
+citations. Leverages the existing harness. Compatible with the
+embedding path — both can ship.
 
 ## 13. Development Workflow
 

@@ -2595,7 +2595,7 @@ Increment `request_id`. Schedule a `tokio::spawn` after 30 ms via `tokio::time::
 
 - [ ] **Step 4: Commit**
 
-### Task 3.3: Jump-to-message handoff
+### Task 3.3: Jump-to-message action
 
 **Files:**
 - Modify: `rust/threadhop-tui/src/app.rs`
@@ -3039,7 +3039,7 @@ After Task 1.1 (scaffold) and 1.5 (error enums) finish, the following can run co
 
 - 3.1 (search scaffold) and 3.4 (find bar) touch different files — parallel.
 - 3.2 (debounce) modifies search.rs, must follow 3.1.
-- 3.3 (jump handoff) touches App — sequential with other App tasks.
+- 3.3 (jump-to-message action) touches App — sequential with other App tasks.
 - 3.5 (recent_searches wiring) modifies both search.rs and App — sequential.
 - 3.6 (filter parsing) modifies search.rs — sequential with 3.2/3.5.
 
