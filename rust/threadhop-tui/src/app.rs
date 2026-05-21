@@ -36,7 +36,7 @@ use crate::screens::label_prompt::{
 use crate::screens::search::{SearchResult, SearchState};
 use crate::widgets::find_bar::{FindResult, FindState};
 use crate::widgets::session_list::SessionListItem;
-use crate::widgets::transcript::message_to_line_index;
+use crate::widgets::transcript::{message_to_line_index, SelectionState};
 
 /// Half-page step size for `ScrollDownHalf` / `ScrollUpHalf`. A constant
 /// rather than a function of terminal height because the App doesn't know
@@ -148,6 +148,13 @@ pub struct App {
     /// The TranscriptWidget can later highlight this row differently —
     /// that's Wave 2's responsibility.
     pub message_cursor: usize,
+
+    /// Phase A: selection-mode state. `Some` while the user is in selection
+    /// mode (entered via `m`). Carries the per-message cursor and an optional
+    /// `range_start` anchor for `v`-toggled multi-message selection. The
+    /// transcript widget reads this each frame to paint the warning-tint +
+    /// warning-gutter on the selected message(s).
+    pub selection_state: Option<SelectionState>,
 
     /// Bookmark browser modal state. `Some` while open.
     pub bookmark_browser: Option<bb::State>,
@@ -262,6 +269,7 @@ impl App {
             db,
             pending_jump_message_uuid: None,
             message_cursor: 0,
+            selection_state: None,
             bookmark_browser: None,
             confirm: None,
             label_prompt: None,
@@ -461,7 +469,16 @@ impl App {
             return None;
         }
 
-        // 3. Normal main-screen dispatch.
+        // 3. Selection mode — owns its own dispatch. The scope-aware
+        // keys::lookup returns selection-table commands; we re-interpret
+        // them here (e.g. SelectNextSession means "move msg cursor +1" in
+        // selection mode, not "select next sidebar entry").
+        if self.scope == Scope::Selection {
+            self.dispatch_selection_mode(key);
+            return None;
+        }
+
+        // 4. Normal main-screen dispatch.
         let cmd = keys::lookup(self.scope, key)?;
         match cmd {
             Command::Quit => self.should_quit = true,
@@ -564,9 +581,7 @@ impl App {
             Command::MoveSessionUp => self.stub_command("reorder session ↑"),
             Command::FocusTranscript => self.stub_command("focus transcript"),
             Command::FocusList => self.stub_command("focus list"),
-            Command::EnterSelectionMode => {
-                self.stub_command("enter selection mode")
-            }
+            Command::EnterSelectionMode => self.enter_selection_mode(),
             Command::EditBookmarkNote => self.stub_command("edit bookmark note"),
             // Cancel is owned by the modal-first dispatch; modal-only
             // commands never fire on the main screen.
@@ -578,6 +593,163 @@ impl App {
             | Command::KanbanMoveItemBack => {}
         }
         Some(cmd)
+    }
+
+    /// Phase A: enter selection mode. Pushes the current scope onto
+    /// `previous_scope` so `Esc` / `m` can restore it cleanly even if the
+    /// user entered selection mode from a non-Main scope. The cursor starts
+    /// at the last message (matching Python's `_enter_selection_mode` —
+    /// "Start at the last message — recent context is usually what you
+    /// want").
+    fn enter_selection_mode(&mut self) {
+        if self.transcript.is_empty() {
+            self.status_message =
+                Some("Nothing to select — transcript empty".into());
+            return;
+        }
+        let cursor = self.transcript.len().saturating_sub(1);
+        self.selection_state = Some(SelectionState {
+            cursor,
+            range_start: None,
+        });
+        self.previous_scope = Some(self.scope);
+        self.scope = Scope::Selection;
+        self.status_message = Some(
+            "Selection: j/k move, v range, y copy, e export, space \
+             bookmark, L note, m/Esc exit"
+                .into(),
+        );
+    }
+
+    /// Phase A: exit selection mode and pop back to the previous scope.
+    fn exit_selection_mode(&mut self) {
+        self.selection_state = None;
+        self.scope = self.previous_scope.take().unwrap_or(Scope::MainScreen);
+    }
+
+    /// Phase A: handle one key event while `scope == Scope::Selection`. The
+    /// selection-table binding registry maps physical keys to abstract
+    /// commands; we re-interpret each command per the Python selection
+    /// semantics (j/k = move cursor, v = range toggle, y = copy, e = export,
+    /// space = toggle bookmark, L = edit bookmark note, m/Esc = exit).
+    fn dispatch_selection_mode(&mut self, key: KeyEvent) {
+        let Some(cmd) = keys::lookup(Scope::Selection, key) else {
+            return;
+        };
+        let max = self.transcript.len().saturating_sub(1);
+        match cmd {
+            Command::SelectNextSession => {
+                if let Some(sel) = self.selection_state.as_mut() {
+                    if sel.cursor < max {
+                        sel.cursor += 1;
+                    }
+                }
+            }
+            Command::SelectPrevSession => {
+                if let Some(sel) = self.selection_state.as_mut() {
+                    sel.cursor = sel.cursor.saturating_sub(1);
+                }
+            }
+            // The binding registry maps `v`, `y`, and `e` to Command::Confirm
+            // (a free slot in the selection table). We disambiguate on the
+            // actual key code here, mirroring Python's char-dispatched
+            // handler. The alternative — separate Command variants for each
+            // — would churn the Command enum for three single-use actions.
+            Command::Confirm => match key.code {
+                crossterm::event::KeyCode::Char('v') => self.toggle_range_mode(),
+                crossterm::event::KeyCode::Char('y') => self.copy_selection_to_clipboard(),
+                crossterm::event::KeyCode::Char('e') => self.export_selection(),
+                _ => {}
+            },
+            Command::ToggleBookmark => {
+                // Selection-mode bookmark: act on the selection cursor, not
+                // the main message_cursor. We temporarily swap, fire the
+                // existing toggle, then restore. Avoids two divergent code
+                // paths for the same DB operation.
+                if let Some(sel) = self.selection_state {
+                    let saved = self.message_cursor;
+                    self.message_cursor = sel.cursor;
+                    self.toggle_bookmark_at_cursor();
+                    self.message_cursor = saved;
+                }
+            }
+            Command::EditBookmarkNote => {
+                // Defer to Phase E for the full bookmark-note prompt path —
+                // surface the action so the user knows it was caught.
+                self.status_message =
+                    Some("Edit bookmark note — not wired yet (Phase E)".into());
+            }
+            Command::EnterSelectionMode | Command::Cancel => {
+                self.exit_selection_mode();
+            }
+            // Quit still works from selection mode (`q` / Ctrl-c falls back
+            // to Global via keys::lookup).
+            Command::Quit => self.should_quit = true,
+            _ => {}
+        }
+    }
+
+    /// Toggle the selection's `range_start` anchor. First press starts a
+    /// range from the current cursor; second press clears it back to single
+    /// selection. Mirrors Python's `_enter_range_mode` / `_exit_range_mode`.
+    fn toggle_range_mode(&mut self) {
+        if let Some(sel) = self.selection_state.as_mut() {
+            if sel.range_start.is_some() {
+                sel.range_start = None;
+            } else {
+                sel.range_start = Some(sel.cursor);
+            }
+        }
+    }
+
+    /// Phase A: copy the selected message(s) to the system clipboard.
+    /// Deferred — `arboard` is not yet a workspace dep and the task brief
+    /// said to NOT add it unilaterally. Surface the deferral via
+    /// status_message so the binding still feels live.
+    fn copy_selection_to_clipboard(&mut self) {
+        // TODO(phase A.6): wire `arboard` (macOS-only initially) and copy
+        // the selected message bodies, mirroring Python's
+        // TranscriptView._copy_selection (session label + role + text).
+        self.status_message =
+            Some("Clipboard backend not yet wired (Phase A.6)".into());
+    }
+
+    /// Phase A: export the selected message(s) to a temp file under
+    /// `/tmp/threadhop-export-<unix_ts>.md`. Mirrors Python's `_export_selection`
+    /// minimally — role labels and message bodies, no session header for
+    /// now. The path lands in `status_message` so the user can paste it.
+    fn export_selection(&mut self) {
+        let Some(sel) = self.selection_state else {
+            return;
+        };
+        let (lo, hi) = sel.range();
+        let max = self.transcript.len().saturating_sub(1);
+        let hi = hi.min(max);
+        let mut body = String::new();
+        for msg in self.transcript.iter().take(hi + 1).skip(lo) {
+            body.push_str("## ");
+            body.push_str(crate::widgets::transcript::role_label(&msg.role));
+            if let Some(ts) = &msg.timestamp {
+                body.push_str("  ");
+                body.push_str(ts);
+            }
+            body.push_str("\n\n");
+            body.push_str(&msg.text);
+            body.push_str("\n\n");
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let path = format!("/tmp/threadhop-export-{now}.md");
+        match std::fs::write(&path, body) {
+            Ok(()) => {
+                self.status_message = Some(format!("Exported → {path}"));
+            }
+            Err(e) => {
+                self.status_message = Some(format!("Export failed: {e}"));
+            }
+        }
     }
 
     /// Phase 0 stub: emit a `tracing::warn!` and surface a status_message
@@ -2438,6 +2610,127 @@ mod tests {
         assert!(
             first_row.contains("bookmarked"),
             "expected bookmarked marker on row 0; got: {first_row:?}"
+        );
+    }
+
+    // ---- Phase A: selection mode ----------------------------------------
+
+    #[test]
+    fn selection_mode_m_enters_and_esc_exits() {
+        let mut app = App::new();
+        app.transcript = vec![
+            msg("u1", "user", "alpha"),
+            msg("u2", "assistant", "beta"),
+            msg("u3", "user", "gamma"),
+        ];
+        // Enter selection mode via `m`.
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert_eq!(app.scope, Scope::Selection);
+        assert!(app.selection_state.is_some(), "selection_state should be Some");
+        // Cursor starts at the last message per Python parity ("recent
+        // context is usually what you want").
+        let cur = app.selection_state.unwrap().cursor;
+        assert_eq!(cur, 2);
+        // Esc exits.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.scope, Scope::MainScreen);
+        assert!(app.selection_state.is_none());
+    }
+
+    #[test]
+    fn selection_cursor_j_moves_down() {
+        let mut app = App::new();
+        app.transcript = vec![
+            msg("u1", "user", "alpha"),
+            msg("u2", "assistant", "beta"),
+            msg("u3", "user", "gamma"),
+        ];
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        // Manually set cursor to 0 to test downward movement.
+        app.selection_state.as_mut().unwrap().cursor = 0;
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.selection_state.unwrap().cursor, 1);
+        // `k` moves up.
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.selection_state.unwrap().cursor, 0);
+        // Out-of-range stays clamped.
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.selection_state.unwrap().cursor, 0);
+    }
+
+    #[test]
+    fn selection_range_v_toggles_range_start() {
+        let mut app = App::new();
+        app.transcript = vec![
+            msg("u1", "user", "alpha"),
+            msg("u2", "assistant", "beta"),
+        ];
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert!(app.selection_state.unwrap().range_start.is_none());
+        // First `v` sets range_start to current cursor.
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert!(app.selection_state.unwrap().range_start.is_some());
+        // Second `v` clears it back to None.
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert!(app.selection_state.unwrap().range_start.is_none());
+    }
+
+    #[test]
+    fn selection_render_applies_warning_tint() {
+        // Frame-buffer test: with selection mode active and cursor on a known
+        // message, the warning-tinted bg should appear on at least one cell
+        // of the selected message's row(s).
+        use ratatui::{backend::TestBackend, style::Color, Terminal};
+        let mut app = App::new();
+        app.transcript = vec![
+            msg("u1", "user", "alpha"),
+            msg("u2", "assistant", "second message body content here"),
+            msg("u3", "user", "gamma"),
+        ];
+        // Enter selection mode; the cursor lands on the last message (index
+        // 2). Move it to index 1 (the assistant message) so the tint pops
+        // on a row that's far from any edge.
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        app.selection_state.as_mut().unwrap().cursor = 1;
+        let theme = app.theme.clone();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let buf = term.backend().buffer();
+        // Recompute the expected tint color.
+        let tint_hex = threadhop_core::theme::blend(&theme.warning, &theme.background, 0.08);
+        let (r, g, b) = threadhop_core::theme::hex_to_rgb(&tint_hex).unwrap();
+        let tint = Color::Rgb(r, g, b);
+        let mut saw_tint = false;
+        for y in 0..buf.area().height {
+            for x in 0..buf.area().width {
+                if buf[(x, y)].bg == tint {
+                    saw_tint = true;
+                    break;
+                }
+            }
+            if saw_tint {
+                break;
+            }
+        }
+        assert!(saw_tint, "selection-mode warning tint never reached the buffer");
+    }
+
+    #[test]
+    fn selection_space_toggles_bookmark_on_selected_message() {
+        // Space inside selection mode should toggle a bookmark on the
+        // selection cursor's message (NOT on the main message_cursor). The
+        // simplest assertion: after a `Space`, status_message changes
+        // (toggle path always writes a status when successful or when the
+        // FK check fails). For an in-memory DB the FK check sees no row
+        // and surfaces the friendly "not yet indexed" path — that's still a
+        // status_message side-effect, which is what we're asserting.
+        let (mut app, _sid, _uuid) = seeded_app();
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        app.status_message = None;
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(
+            app.status_message.is_some(),
+            "Space in selection mode should produce a status_message"
         );
     }
 }

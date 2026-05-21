@@ -138,7 +138,8 @@ pub fn draw(app: &App, frame: &mut Frame) {
     };
     let transcript = TranscriptWidget::new(&app.transcript, app.scroll, &app.theme)
         .find_state(app.find_state.as_ref())
-        .message_cursor(Some(app.message_cursor));
+        .message_cursor(Some(app.message_cursor))
+        .selection(app.selection_state);
     frame.render_widget(transcript, transcript_area);
 
     if has_find && content[1].height > 1 {

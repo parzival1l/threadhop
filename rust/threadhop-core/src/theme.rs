@@ -215,6 +215,32 @@ pub fn hex_to_rgb(hex: &str) -> Option<(u8, u8, u8)> {
     }
 }
 
+/// Blend two `#rrggbb` hex colors with `alpha` (fraction of `fg` mixed into
+/// `bg`). Returns a `#rrggbb` string. Math: `out = bg * (1 - alpha) + fg *
+/// alpha`, per channel, clamped to `[0, 255]`. `alpha` is clamped to
+/// `[0.0, 1.0]`. Malformed hex returns `bg_hex` unchanged so callers never
+/// panic on a missing or garbled palette value.
+///
+/// Phase A line-shaper uses this for selection-mode row tints and the
+/// `$color 15%` Textual idiom the parity plan calls out in §3.1.
+pub fn blend(fg_hex: &str, bg_hex: &str, alpha: f32) -> String {
+    let Some((fr, fg, fb)) = hex_to_rgb(fg_hex) else {
+        return bg_hex.to_string();
+    };
+    let Some((br, bg, bb)) = hex_to_rgb(bg_hex) else {
+        return bg_hex.to_string();
+    };
+    let a = alpha.clamp(0.0, 1.0);
+    let mix = |fg_c: u8, bg_c: u8| -> u8 {
+        let v = (bg_c as f32) * (1.0 - a) + (fg_c as f32) * a;
+        v.round().clamp(0.0, 255.0) as u8
+    };
+    let r = mix(fr, br);
+    let g = mix(fg, bg);
+    let b = mix(fb, bb);
+    format!("#{r:02x}{g:02x}{b:02x}")
+}
+
 // ---- defaults ------------------------------------------------------------
 
 impl Theme {
@@ -363,6 +389,43 @@ mod tests {
         std::fs::write(&p, b"{not json").unwrap();
         let err = load_theme(&p);
         assert!(matches!(err, Err(ThemeError::Decode(_))));
+    }
+
+    // ---- blend ----------------------------------------------------------
+
+    #[test]
+    fn blend_at_zero_returns_bg() {
+        assert_eq!(blend("#ffffff", "#000000", 0.0), "#000000");
+    }
+
+    #[test]
+    fn blend_at_one_returns_fg() {
+        assert_eq!(blend("#ffffff", "#000000", 1.0), "#ffffff");
+    }
+
+    #[test]
+    fn blend_mid_alpha_mixes() {
+        // 0.5 between red and black should produce something close to #7f0000
+        // (off-by-one rounding tolerance allowed).
+        let out = blend("#ff0000", "#000000", 0.5);
+        let (r, g, b) = hex_to_rgb(&out).unwrap();
+        assert!((r as i32 - 0x7f).abs() <= 1, "r={r:#x}");
+        assert_eq!(g, 0);
+        assert_eq!(b, 0);
+    }
+
+    #[test]
+    fn blend_clamps_oob_alpha() {
+        // alpha > 1.0 should behave like alpha = 1.0 (full fg).
+        assert_eq!(blend("#ffffff", "#000000", 5.0), "#ffffff");
+        // alpha < 0.0 should behave like alpha = 0.0 (full bg).
+        assert_eq!(blend("#ffffff", "#123456", -1.0), "#123456");
+    }
+
+    #[test]
+    fn blend_malformed_fg_returns_bg() {
+        assert_eq!(blend("garbage", "#123456", 0.5), "#123456");
+        assert_eq!(blend("#ffffff", "garbage", 0.5), "garbage");
     }
 
     #[test]

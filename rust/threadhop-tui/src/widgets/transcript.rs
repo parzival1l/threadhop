@@ -23,18 +23,41 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Widget, Wrap},
+    widgets::{Paragraph, Widget},
 };
 use threadhop_core::{
     jsonl::CleanedMessage,
-    theme::{hex_to_rgb, Theme},
+    theme::{blend, hex_to_rgb, Theme},
 };
+use unicode_width::UnicodeWidthStr;
 
 /// Glyph used for the role gutter on every rendered line of a message.
 ///
 /// Kept as a module constant so the unit tests can assert on it without
 /// duplicating the literal. Matches the Python widget's left-border styling.
 pub const GUTTER_GLYPH: &str = "▌";
+
+/// Selection-mode state for the transcript pane. Phase A wires this up:
+///   * `cursor` indexes into `App::transcript`.
+///   * `range_start`, when `Some`, marks the anchor for a `v`-toggled range.
+///
+/// Single-message selection is the default; range mode is opt-in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SelectionState {
+    pub cursor: usize,
+    pub range_start: Option<usize>,
+}
+
+impl SelectionState {
+    /// The inclusive (low, high) range of selected message indices. Single
+    /// selection collapses to `(cursor, cursor)`.
+    pub fn range(&self) -> (usize, usize) {
+        match self.range_start {
+            Some(start) => (self.cursor.min(start), self.cursor.max(start)),
+            None => (self.cursor, self.cursor),
+        }
+    }
+}
 
 /// Borrowed view over the state this widget needs. Constructed per frame by
 /// the screen renderer — never owns its data.
@@ -55,6 +78,10 @@ pub struct TranscriptWidget<'a> {
     /// `ToggleBookmark` will act on. When set, the renderer bolds the
     /// matching message header so the user can see what would be bookmarked.
     pub message_cursor: Option<usize>,
+    /// Phase A: optional selection-mode state. When `Some`, the renderer
+    /// paints the selected message(s) with a warning-tinted bg + warning
+    /// gutter, overriding the role-derived gutter color.
+    pub selection: Option<SelectionState>,
 }
 
 impl<'a> TranscriptWidget<'a> {
@@ -67,7 +94,14 @@ impl<'a> TranscriptWidget<'a> {
             theme,
             find_state: None,
             message_cursor: None,
+            selection: None,
         }
+    }
+
+    /// Attach selection-mode state (Phase A). Builder-style.
+    pub fn selection(mut self, selection: Option<SelectionState>) -> Self {
+        self.selection = selection;
+        self
     }
 
     /// Attach an optional find-bar overlay. Builder-style so `screens::main`
@@ -90,29 +124,54 @@ impl<'a> TranscriptWidget<'a> {
 
 impl<'a> Widget for TranscriptWidget<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let mut lines = match self.find_state {
+        let raw_lines = match self.find_state {
             Some(fs) if !fs.matches.is_empty() => {
                 build_lines_with_highlights(self.messages, self.theme, fs)
             }
             _ => build_lines(self.messages, self.theme),
         };
-        // Phase 4 Wave 2: apply the cursor highlight to the header line of
-        // the focused message. We compute the line index off the same
-        // estimator the App uses to scroll-to-message, so the header lands
-        // at the right row regardless of body shape.
+        // Phase A: replace `Paragraph::wrap` with a width-aware shaper that
+        // re-emits the role gutter on every visual row. The shaper preserves
+        // line `style` (carrying row bg) so continuation rows inherit the
+        // card tint — the perceptual gap §3.5 of the parity plan calls out.
+        let mut lines = shape_lines(raw_lines, area.width);
+
+        // Selection-mode tint: apply on top of the shaped lines so
+        // continuation rows are tinted too. Done before the cursor-bold pass
+        // so the cursor highlight remains visible on the warning bg.
+        if let Some(sel) = self.selection {
+            apply_selection_tint(&mut lines, self.messages, sel, self.theme);
+        }
+        // Phase 4 Wave 2 (preserved): bold the header row of the focused
+        // message. We use the same line-index estimator the App uses for
+        // scroll-to-message; since our build is deterministic (1 header + N
+        // body lines), the index lands on the same source line. After
+        // shaping that source line may have expanded into multiple visual
+        // rows; we only bold the FIRST visual row (the header), matching
+        // what the old `Paragraph::wrap` happened to do.
         if let (Some(idx), false) =
             (self.message_cursor, self.messages.is_empty())
         {
             let bounded = idx.min(self.messages.len().saturating_sub(1));
             if let Some(msg) = self.messages.get(bounded) {
-                if let Some(header_line) =
+                if let Some(source_line) =
                     message_to_line_index(self.messages, &msg.uuid)
                 {
-                    if let Some(line) = lines.get_mut(header_line as usize) {
-                        for span in &mut line.spans {
-                            span.style = span
-                                .style
-                                .add_modifier(Modifier::BOLD | Modifier::REVERSED);
+                    // Translate source-line index to shaped-line index by
+                    // walking the build sequence and accumulating visual row
+                    // counts. Since `shape_lines` is order-preserving, we
+                    // can re-derive the mapping with the same algorithm.
+                    if let Some(visual_idx) = source_to_visual_line(
+                        self.messages,
+                        source_line as usize,
+                        area.width,
+                    ) {
+                        if let Some(line) = lines.get_mut(visual_idx) {
+                            for span in &mut line.spans {
+                                span.style = span
+                                    .style
+                                    .add_modifier(Modifier::BOLD | Modifier::REVERSED);
+                            }
                         }
                     }
                 }
@@ -120,21 +179,280 @@ impl<'a> Widget for TranscriptWidget<'a> {
         }
         // Clamp the requested scroll so that scrolling past the end (notably
         // `G` setting scroll to `u16::MAX`) doesn't blank the pane —
-        // `Paragraph::scroll` does NOT clamp on its own. The cap is
-        // `lines.len().saturating_sub(1)` rather than `lines.len() - height`
-        // because we don't know the post-wrap line count (depends on terminal
-        // width). Overshoot for soft-wrapped content is preferable to
-        // undershoot — the user can still see the last source line.
+        // `Paragraph::scroll` does NOT clamp on its own. With the shaper
+        // taking over from `Wrap`, the line count IS the visual row count,
+        // so we can clamp to `len - 1` precisely.
         let line_count = u16::try_from(lines.len()).unwrap_or(u16::MAX);
         let max_scroll = line_count.saturating_sub(1);
         let clamped = self.scroll.min(max_scroll);
         // Empty-state: keep the pane blank rather than dumping an "(empty)"
-        // placeholder — Wave C will render a "no session selected" banner in
-        // the screen itself, not the widget.
-        let paragraph = Paragraph::new(lines)
-            .scroll((clamped, 0))
-            .wrap(Wrap { trim: false });
+        // placeholder — Wave C renders a "no session selected" banner in the
+        // screen itself, not the widget.
+        // NO `.wrap(Wrap { ... })` — the shaper already did the work, and
+        // re-wrapping would drop the gutter on continuations again.
+        let paragraph = Paragraph::new(lines).scroll((clamped, 0));
         paragraph.render(area, buf);
+    }
+}
+
+/// Translate a source-line index (from `message_to_line_index`) to a visual
+/// row index after `shape_lines` has expanded soft-wraps. Walks the same
+/// build sequence used by `build_lines` and applies the shaper's width
+/// budget per-line.
+fn source_to_visual_line(
+    messages: &[CleanedMessage],
+    source_line: usize,
+    width: u16,
+) -> Option<usize> {
+    if width < 4 {
+        return Some(source_line);
+    }
+    let text_width = (width as usize).saturating_sub(2);
+    // Re-derive: 1 header + body_rows per message + 1 blank between.
+    // For each source row, count how many visual rows it expands to:
+    //   - header rows: width is short (role + ts) — almost always 1 row.
+    //     We treat as 1 to keep the math simple and stable.
+    //   - body rows: the raw text width / text_width, ceil.
+    //   - blank separators: 1 row, no expansion.
+    let mut src_idx: usize = 0;
+    let mut vis_idx: usize = 0;
+    for (mi, msg) in messages.iter().enumerate() {
+        // Header row.
+        if src_idx == source_line {
+            return Some(vis_idx);
+        }
+        src_idx += 1;
+        vis_idx += 1;
+        // Body rows.
+        let body_lines: Vec<&str> = if msg.text.is_empty() {
+            vec![""]
+        } else {
+            msg.text.split('\n').collect()
+        };
+        for body in body_lines {
+            if src_idx == source_line {
+                return Some(vis_idx);
+            }
+            let w = UnicodeWidthStr::width(body);
+            let rows = if w == 0 {
+                1
+            } else {
+                w.div_ceil(text_width)
+            };
+            src_idx += 1;
+            vis_idx += rows;
+        }
+        if mi + 1 < messages.len() {
+            if src_idx == source_line {
+                return Some(vis_idx);
+            }
+            src_idx += 1;
+            vis_idx += 1;
+        }
+    }
+    None
+}
+
+// ---- line shaper (Phase A) -------------------------------------------------
+
+/// Shape a slice of already-built `Line`s into width-aware visual rows.
+///
+/// Every input `Line` that begins with a `[gutter, " ", ...content]` prefix
+/// (the shape `push_message` emits) is split such that each soft-wrap
+/// continuation **re-emits the same gutter + space prefix** and inherits the
+/// line's `style` (which carries the role-tinted row background). This is the
+/// fix for the big perceptual gap called out in §3.5 of the parity plan:
+/// `Paragraph::wrap` drops the gutter on continuation rows because it only
+/// re-flows raw text without re-prefixing the role span.
+///
+/// Lines that don't match the gutter prefix shape (blank separators, etc.)
+/// are passed through verbatim — no wrapping applied. The `Widget::render`
+/// path uses `Paragraph::new(shaped)` WITHOUT `.wrap()` so the shaper's
+/// per-row output is the final visual layout.
+///
+/// `width < 4` is treated as a degenerate case: the input is returned
+/// unchanged. With the gutter + space taking 2 cells, there'd be nothing left
+/// for content anyway, and forcing 1-char-per-row hurts more than it helps.
+pub fn shape_lines<'a>(lines: Vec<Line<'a>>, width: u16) -> Vec<Line<'a>> {
+    if width < 4 {
+        return lines;
+    }
+    let text_width = (width as usize).saturating_sub(2);
+    let mut out: Vec<Line<'a>> = Vec::with_capacity(lines.len());
+    for line in lines {
+        // Detect the gutter prefix: first span is exactly GUTTER_GLYPH and
+        // second span is " " (the space). Lines without this shape (e.g.
+        // blank separators between messages) pass through unchanged.
+        let has_gutter_prefix = line.spans.len() >= 2
+            && line.spans[0].content.as_ref() == GUTTER_GLYPH
+            && line.spans[1].content.as_ref() == " ";
+        if !has_gutter_prefix {
+            // No prefix to preserve — but the line might still be wider than
+            // the column. Pass through verbatim; `Paragraph` will truncate at
+            // the edge (acceptable for non-prefixed blank lines).
+            out.push(line);
+            continue;
+        }
+        let line_style = line.style;
+        let gutter_style = line.spans[0].style;
+        let space_style = line.spans[1].style;
+        let content_spans: Vec<Span<'a>> = line.spans.into_iter().skip(2).collect();
+        let total_width: usize = content_spans
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum();
+        if total_width <= text_width {
+            // Single visual row — rebuild the line as-was.
+            let mut spans = Vec::with_capacity(content_spans.len() + 2);
+            spans.push(Span::styled(GUTTER_GLYPH.to_string(), gutter_style));
+            spans.push(Span::styled(" ".to_string(), space_style));
+            spans.extend(content_spans);
+            let mut shaped = Line::from(spans);
+            shaped = shaped.style(line_style);
+            out.push(shaped);
+            continue;
+        }
+        // Need to break into multiple visual rows. Walk content spans,
+        // accumulating cells per row and starting a fresh row at every
+        // text_width boundary. Style is preserved per chunk.
+        let chunks = chunk_spans_by_width(&content_spans, text_width);
+        for chunk_spans in chunks {
+            let mut spans = Vec::with_capacity(chunk_spans.len() + 2);
+            spans.push(Span::styled(GUTTER_GLYPH.to_string(), gutter_style));
+            spans.push(Span::styled(" ".to_string(), space_style));
+            spans.extend(chunk_spans);
+            let mut shaped = Line::from(spans);
+            shaped = shaped.style(line_style);
+            out.push(shaped);
+        }
+    }
+    out
+}
+
+/// Break a list of styled spans into visual rows of at most `text_width`
+/// display cells per row. Style runs are preserved — a span that straddles a
+/// row boundary is split into two spans (one on each row) carrying the
+/// original style.
+fn chunk_spans_by_width<'a>(
+    spans: &[Span<'a>],
+    text_width: usize,
+) -> Vec<Vec<Span<'a>>> {
+    let mut rows: Vec<Vec<Span<'a>>> = Vec::new();
+    let mut cur_row: Vec<Span<'a>> = Vec::new();
+    let mut cur_width: usize = 0;
+    for span in spans {
+        let style = span.style;
+        // Walk grapheme-by-grapheme using char_indices — sufficient for ASCII
+        // + most BMP. Cell width via UnicodeWidthStr on the single-char
+        // substring keeps the math identical to ratatui's downstream
+        // renderer.
+        let text: &str = span.content.as_ref();
+        if text.is_empty() {
+            continue;
+        }
+        let mut chunk_start = 0;
+        let bytes = text.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            // Advance to next char boundary.
+            let char_start = i;
+            let ch_str = match text[char_start..].chars().next() {
+                Some(c) => {
+                    i += c.len_utf8();
+                    &text[char_start..i]
+                }
+                None => break,
+            };
+            let ch_w = UnicodeWidthStr::width(ch_str);
+            if cur_width + ch_w > text_width && cur_width > 0 {
+                // Flush the current row chunk (text up to char_start) and
+                // start a new row.
+                if char_start > chunk_start {
+                    let segment = text[chunk_start..char_start].to_string();
+                    cur_row.push(Span::styled(segment, style));
+                }
+                rows.push(std::mem::take(&mut cur_row));
+                cur_width = 0;
+                chunk_start = char_start;
+            }
+            cur_width += ch_w;
+        }
+        if chunk_start < text.len() {
+            let segment = text[chunk_start..].to_string();
+            cur_row.push(Span::styled(segment, style));
+        }
+    }
+    if !cur_row.is_empty() {
+        rows.push(cur_row);
+    }
+    // Edge: if total content was empty, return one empty row so callers don't
+    // panic on `rows[0]`.
+    if rows.is_empty() {
+        rows.push(Vec::new());
+    }
+    rows
+}
+
+/// Selection-mode visual styling for a slice of already-shaped lines: paint
+/// the rows belonging to the selected message(s) with a warning-tinted bg
+/// and warning-colored gutter. Operates on shaped output so continuation
+/// rows are caught too.
+pub fn apply_selection_tint<'a>(
+    lines: &mut [Line<'a>],
+    messages: &[CleanedMessage],
+    selection: SelectionState,
+    theme: &Theme,
+) {
+    if messages.is_empty() || lines.is_empty() {
+        return;
+    }
+    let (lo, hi) = selection.range();
+    let hi = hi.min(messages.len().saturating_sub(1));
+    let lo = lo.min(hi);
+    // The build_lines emitter is deterministic: header + body_lines + blank
+    // between messages. The shaper preserves that order but expands body
+    // lines into multiple visual rows. We re-walk the shaped output and use
+    // the gutter glyph as a "this is a message row" sentinel: every visual
+    // row of a message starts with GUTTER_GLYPH, blank separators don't.
+    let warning_hex = &theme.warning;
+    let bg_hex = &theme.background;
+    let tint_hex = blend(warning_hex, bg_hex, 0.08);
+    let tint_color = hex_to_rgb(&tint_hex)
+        .map(|(r, g, b)| Color::Rgb(r, g, b))
+        .unwrap_or(Color::Yellow);
+    let warning_color = hex_to_rgb(warning_hex)
+        .map(|(r, g, b)| Color::Rgb(r, g, b))
+        .unwrap_or(Color::Yellow);
+    // Walk lines, counting messages by gutter-prefixed line groups separated
+    // by non-gutter (blank) lines.
+    let mut msg_idx: i64 = -1; // -1 until we hit the first gutter row.
+    let mut prev_was_gutter = false;
+    for line in lines.iter_mut() {
+        let starts_with_gutter = line
+            .spans
+            .first()
+            .map(|s| s.content.as_ref() == GUTTER_GLYPH)
+            .unwrap_or(false);
+        if starts_with_gutter {
+            if !prev_was_gutter {
+                msg_idx += 1;
+            }
+            let i = msg_idx.max(0) as usize;
+            if i >= lo && i <= hi {
+                // Apply warning-tinted bg to the whole line and recolor the
+                // gutter span to warning fg.
+                line.style = line.style.bg(tint_color);
+                for (idx, span) in line.spans.iter_mut().enumerate() {
+                    span.style = span.style.bg(tint_color);
+                    if idx == 0 && span.content.as_ref() == GUTTER_GLYPH {
+                        span.style = span.style.fg(warning_color);
+                    }
+                }
+            }
+            prev_was_gutter = true;
+        } else {
+            prev_was_gutter = false;
+        }
     }
 }
 
@@ -1256,6 +1574,297 @@ mod tests {
             found_bold_h,
             "expected at least one BOLD `h` cell in the body row of the buffer"
         );
+    }
+
+    // ---- shape_lines (Phase A) -----------------------------------------
+
+    #[test]
+    fn shape_emits_gutter_on_every_visual_row() {
+        // A 200-char paragraph at width=40 produces ceil(200 / 38) = 6
+        // visual rows (text_width = 40 - 2 = 38 for gutter + space prefix).
+        // The build path puts this body through md::render -> plain
+        // paragraph -> one Line of 200 plain chars + gutter prefix. The
+        // shaper should emit 6 rows each starting with GUTTER_GLYPH.
+        let theme = Theme::default_dark();
+        let long: String = "x".repeat(200);
+        let msgs = vec![cm("user", &long)];
+        let raw = build_lines(&msgs, &theme);
+        let shaped = shape_lines(raw, 40);
+        // Header row + body shaped rows. Count gutter glyphs.
+        let gutter_rows = shaped
+            .iter()
+            .filter(|line| {
+                line.spans
+                    .first()
+                    .map(|s| s.content.as_ref() == GUTTER_GLYPH)
+                    .unwrap_or(false)
+            })
+            .count();
+        // 1 header + 6 body rows = 7 total gutter rows.
+        let expected = 1 + 200_usize.div_ceil(40 - 2);
+        assert_eq!(gutter_rows, expected, "shaped: {shaped:#?}");
+    }
+
+    #[test]
+    fn shape_applies_role_bg_to_continuation_rows() {
+        // The role bg lives on `Line::style` (the line-wide bg). The shaper
+        // must preserve that style on every emitted visual row — that's the
+        // perceptual gap §3.5 fixes.
+        let theme = Theme::default_dark();
+        let long: String = "y".repeat(150);
+        let msgs = vec![cm("user", &long)]; // user role gets a row bg
+        let raw = build_lines(&msgs, &theme);
+        // Pick the first body line's style as the ground truth.
+        let body_source_bg = raw[1].style.bg;
+        assert!(
+            body_source_bg.is_some(),
+            "user role should carry a row bg in build_lines"
+        );
+        let shaped = shape_lines(raw, 40);
+        // Skip the header (idx 0); body rows are idx 1.. .
+        let body_rows: Vec<_> = shaped.iter().skip(1).collect();
+        assert!(body_rows.len() >= 2, "expected wrapping into >=2 rows");
+        for (i, line) in body_rows.iter().enumerate() {
+            assert_eq!(
+                line.style.bg, body_source_bg,
+                "body continuation row {i} lost its row bg"
+            );
+        }
+    }
+
+    #[test]
+    fn shape_handles_zero_width_gracefully() {
+        // width < 4 → input passes through unchanged. No panic.
+        let theme = Theme::default_dark();
+        let msgs = vec![cm("user", "hi")];
+        let raw = build_lines(&msgs, &theme);
+        let raw_len = raw.len();
+        let shaped = shape_lines(raw, 2);
+        assert_eq!(shaped.len(), raw_len);
+        // width = 3 also passes through (1 cell for content would be
+        // useless).
+        let raw2 = build_lines(&msgs, &theme);
+        let shaped2 = shape_lines(raw2, 3);
+        assert_eq!(shaped2.len(), 2);
+    }
+
+    #[test]
+    fn shape_preserves_inline_style_runs() {
+        // A line with `**bold**` will produce a sequence of spans with
+        // different styles. After shaping, the same total cell width should
+        // still carry the BOLD modifier on the bolded segment(s), even when
+        // shaping splits a span across rows.
+        let theme = Theme::default_dark();
+        // Build something with a bold run that we know fits on one row.
+        let msgs = vec![cm("assistant", "say **hi** there")];
+        let raw = build_lines(&msgs, &theme);
+        let shaped = shape_lines(raw, 80);
+        // Find the body line and assert at least one span carries BOLD.
+        let bold_present = shaped.iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|s| s.style.add_modifier.contains(Modifier::BOLD))
+        });
+        assert!(bold_present, "BOLD style lost during shaping: {shaped:#?}");
+    }
+
+    #[test]
+    fn widget_renders_gutter_on_soft_wrap_continuation_rows() {
+        // Frame-buffer test: render a long paragraph at narrow width and
+        // assert the gutter column has GUTTER_GLYPH on rows beyond the
+        // first source-line emission. This is the regression the parity
+        // plan §3.5 cares about.
+        let theme = Theme::default_dark();
+        let long: String = "z".repeat(120);
+        let msgs = vec![cm("assistant", &long)];
+        let mut term = Terminal::new(TestBackend::new(30, 12)).unwrap();
+        term.draw(|f| {
+            let w = TranscriptWidget::new(&msgs, 0, &theme);
+            f.render_widget(w, f.area());
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        // Rows 0..N should every have GUTTER_GLYPH at column 0 until the
+        // message body ends. With 120 chars at text_width=28, we expect
+        // ceil(120/28) = 5 body rows + 1 header = 6 gutter rows.
+        let mut gutter_count = 0u16;
+        for y in 0..buf.area().height {
+            if buf[(0, y)].symbol() == GUTTER_GLYPH {
+                gutter_count += 1;
+            }
+        }
+        assert!(
+            gutter_count >= 5,
+            "expected >=5 gutter rows for wrapped body; got {gutter_count}"
+        );
+    }
+
+    // ---- find-bar overlay on shaped lines (A3) --------------------------
+
+    #[test]
+    fn find_highlight_on_shaped_lines() {
+        use crate::widgets::find_bar::FindState;
+        // Build a long body with the search term near the end so it should
+        // land on a continuation visual row, not the first row.
+        let theme = Theme::default_dark();
+        let prefix = "a".repeat(80);
+        let body = format!("{prefix}NEEDLE tail");
+        let msgs = vec![cm("user", &body)];
+        let mut fs = FindState::default();
+        fs.query = "NEEDLE".to_string();
+        fs.recompute_matches(&msgs);
+        assert!(!fs.matches.is_empty(), "find should find NEEDLE");
+        let mut term = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        term.draw(|f| {
+            let w = TranscriptWidget::new(&msgs, 0, &theme).find_state(Some(&fs));
+            f.render_widget(w, f.area());
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        // Collect every "N" cell into rows and assert the warning bg shows
+        // up on a row > 1 (the header is row 0, first body row is row 1).
+        let warning = match hex_to_rgb(&theme.warning) {
+            Some((r, g, b)) => Color::Rgb(r, g, b),
+            None => Color::Yellow,
+        };
+        let mut highlighted_rows: Vec<u16> = Vec::new();
+        for y in 0..buf.area().height {
+            for x in 0..buf.area().width {
+                let cell = &buf[(x, y)];
+                if cell.symbol() == "N" && cell.bg == warning {
+                    highlighted_rows.push(y);
+                    break;
+                }
+            }
+        }
+        assert!(
+            !highlighted_rows.is_empty(),
+            "find highlight (warning bg on `N`) missing from buffer"
+        );
+        // The NEEDLE is at byte offset 80; with gutter prefix consuming 2
+        // cells per row, the first row holds 38 chars of content -> NEEDLE
+        // lands on visual row 1 (header) + ~3 body rows in. Just assert it
+        // is NOT on the very first body row (would mean continuation rows
+        // failed to receive the highlight).
+        assert!(
+            highlighted_rows.iter().any(|&y| y >= 2),
+            "expected highlight on a continuation row; got rows {highlighted_rows:?}"
+        );
+    }
+
+    // ---- selection mode (A4) -------------------------------------------
+
+    #[test]
+    fn shape_selection_tint_applied_to_selected_message_rows() {
+        let theme = Theme::default_dark();
+        let msgs = vec![
+            cm("user", "first"),
+            cm("assistant", "second long enough to span a few rows when shaped narrowly"),
+            cm("user", "third"),
+        ];
+        let raw = build_lines(&msgs, &theme);
+        let mut shaped = shape_lines(raw, 30);
+        let sel = SelectionState { cursor: 1, range_start: None };
+        apply_selection_tint(&mut shaped, &msgs, sel, &theme);
+        // Build the expected tint color the same way the impl does.
+        let tint_hex = blend(&theme.warning, &theme.background, 0.08);
+        let tint = hex_to_rgb(&tint_hex)
+            .map(|(r, g, b)| Color::Rgb(r, g, b))
+            .unwrap();
+        // Walk shaped lines: messages are separated by blank (non-gutter)
+        // rows. The 2nd group of gutter rows belongs to the assistant
+        // message at index 1.
+        let mut group_idx: i64 = -1;
+        let mut prev_was_gutter = false;
+        let mut saw_tinted_assistant_row = false;
+        for line in &shaped {
+            let is_gutter = line
+                .spans
+                .first()
+                .map(|s| s.content.as_ref() == GUTTER_GLYPH)
+                .unwrap_or(false);
+            if is_gutter {
+                if !prev_was_gutter {
+                    group_idx += 1;
+                }
+                if group_idx == 1 && line.style.bg == Some(tint) {
+                    saw_tinted_assistant_row = true;
+                }
+                prev_was_gutter = true;
+            } else {
+                prev_was_gutter = false;
+            }
+        }
+        assert!(
+            saw_tinted_assistant_row,
+            "selection tint never landed on assistant message: {shaped:#?}"
+        );
+    }
+
+    #[test]
+    fn message_cursor_bolds_first_visual_row_only_after_shaping() {
+        // A5 — at narrow width, a 3-visual-row message should have the
+        // bold modifier on visual row 1 only (the header row of the cursored
+        // message, which is row 0 -> shaped header at row 0). For our test
+        // we'll put two messages so the cursored one's header isn't at y=0.
+        let theme = Theme::default_dark();
+        let msgs = vec![
+            cm("user", "alpha"),
+            cm(
+                "assistant",
+                "beta gamma delta epsilon zeta eta theta iota kappa lambda mu",
+            ),
+        ];
+        let mut term = Terminal::new(TestBackend::new(20, 12)).unwrap();
+        term.draw(|f| {
+            let w = TranscriptWidget::new(&msgs, 0, &theme).message_cursor(Some(1));
+            f.render_widget(w, f.area());
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        // Find the row that contains "Claude" (the assistant header label).
+        let mut header_row: Option<u16> = None;
+        for y in 0..buf.area().height {
+            let mut row = String::new();
+            for x in 0..buf.area().width {
+                row.push_str(buf[(x, y)].symbol());
+            }
+            if row.contains("Claude") {
+                header_row = Some(y);
+                break;
+            }
+        }
+        let header_y = header_row.expect("expected to find Claude header row");
+        // At least one cell on the header row is BOLD.
+        let mut header_has_bold = false;
+        for x in 0..buf.area().width {
+            if buf[(x, header_y)]
+                .modifier
+                .contains(Modifier::BOLD)
+            {
+                header_has_bold = true;
+                break;
+            }
+        }
+        assert!(header_has_bold, "header row missing BOLD modifier");
+        // And the row IMMEDIATELY BELOW (a body continuation) must NOT be
+        // bold across its whole width — the cursor highlight is header-only.
+        if header_y + 1 < buf.area().height {
+            let mut all_bold = true;
+            for x in 0..buf.area().width {
+                if !buf[(x, header_y + 1)]
+                    .modifier
+                    .contains(Modifier::BOLD)
+                {
+                    all_bold = false;
+                    break;
+                }
+            }
+            assert!(
+                !all_bold,
+                "body continuation row was bolded; cursor should only bold header"
+            );
+        }
     }
 
     #[test]
