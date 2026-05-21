@@ -136,6 +136,11 @@ pub fn draw(app: &App, frame: &mut Frame) {
     } else {
         content[1]
     };
+    // Phase A fix-up: record the transcript pane height so
+    // `App::scroll_selection_into_view` can decide whether the selection
+    // cursor needs to be scrolled into the viewport. Updated every frame —
+    // resizes are picked up on the next render.
+    app.last_transcript_height.set(transcript_area.height);
     let transcript = TranscriptWidget::new(&app.transcript, app.scroll, &app.theme)
         .find_state(app.find_state.as_ref())
         .message_cursor(Some(app.message_cursor))

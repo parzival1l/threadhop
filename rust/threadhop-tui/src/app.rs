@@ -212,6 +212,15 @@ pub struct App {
     /// terminal draw and used as the spinner frame index. `usize` so we
     /// don't have to worry about overflow on hour-long sessions.
     pub spinner_tick: usize,
+
+    /// Last-known transcript pane height in cells, recorded by the screen
+    /// renderer each frame. Phase A fix-up: selection mode uses this to keep
+    /// the cursored message in view on entry and on j/k moves. `Cell<u16>`
+    /// so the renderer (`&self`) can update it without taking `&mut App`.
+    /// Default `0` — pre-first-frame callers fall back to a conservative
+    /// non-zero estimate so scroll math still works the moment the user
+    /// presses `m`.
+    pub last_transcript_height: std::cell::Cell<u16>,
 }
 
 impl App {
@@ -283,6 +292,7 @@ impl App {
             project_filter: None,
             days_filter: None,
             spinner_tick: 0,
+            last_transcript_height: std::cell::Cell::new(0),
         }
     }
 
@@ -619,6 +629,51 @@ impl App {
              bookmark, L note, m/Esc exit"
                 .into(),
         );
+        // Phase A fix-up: park the cursor inside the viewport. Without this
+        // the warning-tint we paint on the cursored row never reaches a cell
+        // — `Paragraph::scroll` clips rows below the fold — and the user
+        // sees zero visual delta on `m` (verifier P0 + P1).
+        self.scroll_selection_into_view();
+    }
+
+    /// Phase A fix-up: ensure the selection cursor's message row lands
+    /// inside the visible transcript window. Mirrors Python's
+    /// `widget.scroll_visible()` — only adjusts `scroll` when the cursored
+    /// row is outside `[scroll, scroll + viewport_height)`, and places the
+    /// row ~30% from the top of the pane when scrolling.
+    ///
+    /// Uses `message_to_line_index` (source-line offsets) rather than visual
+    /// rows, matching what every other scroll path in the App does. A
+    /// soft-wrap above the cursor can leave us a row or two off, but
+    /// undershoot is preferable to overshoot — the cursored row stays in
+    /// frame even if we land slightly low.
+    fn scroll_selection_into_view(&mut self) {
+        let Some(sel) = self.selection_state else {
+            return;
+        };
+        let idx = sel.cursor.min(self.transcript.len().saturating_sub(1));
+        let Some(msg) = self.transcript.get(idx) else {
+            return;
+        };
+        let Some(line) = message_to_line_index(&self.transcript, &msg.uuid) else {
+            return;
+        };
+        // Pull the last-known viewport height; fall back to a conservative
+        // estimate on the first frame so `m` works before the screen has
+        // ever rendered. 16 rows ≈ a typical half-screen — small enough
+        // that we err on the side of scrolling, large enough that short
+        // transcripts don't get unnecessary scrolling.
+        let viewport = self.last_transcript_height.get().max(8);
+        let top = self.scroll;
+        let bottom = top.saturating_add(viewport);
+        if line >= top && line < bottom {
+            return; // Already visible.
+        }
+        // Place the cursored row ~30% from the top of the pane (Textual's
+        // `scroll_visible` default). `target_offset` is how far below the
+        // top of the viewport the row should sit.
+        let target_offset = viewport / 3;
+        self.scroll = line.saturating_sub(target_offset);
     }
 
     /// Phase A: exit selection mode and pop back to the previous scope.
@@ -644,11 +699,15 @@ impl App {
                         sel.cursor += 1;
                     }
                 }
+                // Phase A fix-up: keep the cursor row on screen as the user
+                // walks down the transcript with `j`.
+                self.scroll_selection_into_view();
             }
             Command::SelectPrevSession => {
                 if let Some(sel) = self.selection_state.as_mut() {
                     sel.cursor = sel.cursor.saturating_sub(1);
                 }
+                self.scroll_selection_into_view();
             }
             // The binding registry maps `v`, `y`, and `e` to Command::Confirm
             // (a free slot in the selection table). We disambiguate on the
@@ -2713,6 +2772,93 @@ mod tests {
             }
         }
         assert!(saw_tint, "selection-mode warning tint never reached the buffer");
+    }
+
+    #[test]
+    fn selection_mode_applies_warning_tint_to_cursored_message_in_buffer() {
+        // Phase A fix-up regression: the existing `selection_render_applies_
+        // warning_tint` test ran with a 3-message fixture that fit entirely
+        // inside the viewport, so the cursored row was always on-screen.
+        // The runtime bug the verifier caught was the *opposite* scenario:
+        // a long transcript where entering selection mode parks the cursor
+        // at `len - 1` but never adjusts `app.scroll`, leaving the cursored
+        // row below the fold. The tint paints in-memory `Line`s correctly,
+        // but those lines never reach a cell because `Paragraph::scroll`
+        // clips them.
+        //
+        // This test builds a transcript taller than the 80x24 viewport,
+        // enters selection mode, and asserts the tint bytes land in the
+        // rendered buffer. On the pre-fix code (commit 2789914) it FAILS
+        // because the cursored message is off-screen; with the
+        // scroll-into-view fix it passes.
+        use ratatui::{backend::TestBackend, style::Color, Terminal};
+        let mut app = App::new();
+        let mut transcript = Vec::new();
+        for i in 0..40 {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            transcript.push(msg(
+                &format!("u{i}"),
+                role,
+                &format!("message {i} body lorem ipsum dolor sit amet"),
+            ));
+        }
+        app.transcript = transcript;
+        app.scroll = 0;
+        // Enter selection mode — cursor lands on the last message (index 39).
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert_eq!(app.scope, Scope::Selection);
+        let theme = app.theme.clone();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let buf = term.backend().buffer();
+        let tint_hex = threadhop_core::theme::blend(&theme.warning, &theme.background, 0.08);
+        let (r, g, b) = threadhop_core::theme::hex_to_rgb(&tint_hex).unwrap();
+        let tint = Color::Rgb(r, g, b);
+        let mut saw_tint = false;
+        for y in 0..buf.area().height {
+            for x in 0..buf.area().width {
+                if buf[(x, y)].bg == tint {
+                    saw_tint = true;
+                    break;
+                }
+            }
+            if saw_tint {
+                break;
+            }
+        }
+        assert!(
+            saw_tint,
+            "selection-mode warning tint missing from rendered buffer — the \
+             cursored message is below the fold and was never drawn"
+        );
+    }
+
+    #[test]
+    fn selection_mode_scrolls_cursor_into_view_on_enter() {
+        // P1 regression: `enter_selection_mode` must adjust `app.scroll` so
+        // the cursored message (parked at `len - 1`) ends up inside the
+        // viewport. State-level complement to the frame-buffer test above —
+        // both layers earn their keep: this one pins the scroll heuristic,
+        // the buffer test guards against future regressions in the render
+        // pipeline regardless of scroll math.
+        let mut app = App::new();
+        let mut transcript = Vec::new();
+        for i in 0..50 {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            transcript.push(msg(
+                &format!("u{i}"),
+                role,
+                &format!("message {i} body"),
+            ));
+        }
+        app.transcript = transcript;
+        app.scroll = 0;
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert!(
+            app.scroll > 0,
+            "enter_selection_mode should scroll cursor (at len-1) into view; \
+             scroll is still 0 with 50 messages"
+        );
     }
 
     #[test]
