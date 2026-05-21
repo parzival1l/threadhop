@@ -1,0 +1,46 @@
+[
+  {
+    "uuid": "8a0037a4-6d4f-496d-8da4-929a6c072928",
+    "session_id": "d27acf14-e782-4725-adac-78d04174a219",
+    "role": "user",
+    "text": "What's the shortcut to bookmark a message from the TUI? If I'm inside a message and I have a message selected, how do I bookmark that?",
+    "timestamp": "2026-04-22T20:57:00.953Z",
+    "cwd": "/Users/nandakumar/Personal/threadhop",
+    "parent_uuid": "9076b775-14ab-4e5b-9965-f5ac3a4d1fbe",
+    "is_sidechain": 0,
+    "message_id": null
+  },
+  {
+    "uuid": "9abeab70-6446-4d12-adea-5c5f36effe81",
+    "session_id": "d27acf14-e782-4725-adac-78d04174a219",
+    "role": "assistant",
+    "text": "Running grep",
+    "timestamp": "2026-04-22T20:57:03.823Z",
+    "cwd": "/Users/nandakumar/Personal/threadhop",
+    "parent_uuid": "363095d4-a908-4ba9-84ed-795653e758d8",
+    "is_sidechain": 0,
+    "message_id": "msg_01XsFiEAuf2kpF3N9S3bJYMr"
+  },
+  {
+    "uuid": "14095432-e719-4d96-8803-6b9796e7b8b6",
+    "session_id": "d27acf14-e782-4725-adac-78d04174a219",
+    "role": "assistant",
+    "text": "Reading threadhop",
+    "timestamp": "2026-04-22T20:57:07.646Z",
+    "cwd": "/Users/nandakumar/Personal/threadhop",
+    "parent_uuid": "a67d0b6c-f701-42e9-abc0-fd044d17c5c0",
+    "is_sidechain": 0,
+    "message_id": "msg_01TiBLSBiYirfUKEs7UJDQwy"
+  },
+  {
+    "uuid": "a03e4135-d1c2-41a7-b6b8-fed8dbe4c082",
+    "session_id": "d27acf14-e782-4725-adac-78d04174a219",
+    "role": "assistant",
+    "text": "Here's how bookmarking works in the TUI.\n\n## The shortcut\n\nBookmarking a message is a **two-step action** inside the transcript pane:\n\n1. **Press `m`** \u2014 enters *selection mode* (this is the \"transcript\" scope transitioning to \"selection\" scope).\n2. **Navigate to the message** with `j`/`k` (or `\u2193`/`\u2191`).\n3. **Press `space`** \u2014 toggles the bookmark on the highlighted message.\n\nOptionally, press **`L`** (capital L) while still in selection mode to attach/edit a note on that bookmark.\n\nTo exit selection mode, press `m` again or `Escape`.\n\nTo open the bookmark browser later, press **`b`** from the global scope \u2014 then `Enter` on a row jumps back to that message.\n\n`\u2605 Insight \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500`\n- This TUI uses **scoped keybindings** (see `threadhop:484-505`) \u2014 the same key can mean different things in `SCOPE_TRANSCRIPT`, `SCOPE_SELECTION`, `SCOPE_REPLY`, etc. That's why you can't just press `space` directly; you have to first promote the focus into `SCOPE_SELECTION` with `m`. The `Command` registry at `threadhop:619-629` is the single source of truth that both the footer hints and the help overlay read from.\n- The TUI bookmark shares its storage with the CLI `./threadhop bookmark` command and the plugin's `/threadhop:bookmark` \u2014 all three write to the same `bookmarks` table via `db.upsert_bookmark` (see `threadhop:2195`). So a bookmark you drop with `space` in the TUI is the same row you'd get from the chat-side passthrough.\n- The `space`-as-toggle choice is deliberate: it mirrors the \"select / toggle checkbox\" idiom from file managers like ranger/lf, and keeps `Enter` free for message sending in the reply scope (`threadhop:633`).\n`\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500`",
+    "timestamp": "2026-04-22T20:57:19.710Z",
+    "cwd": "/Users/nandakumar/Personal/threadhop",
+    "parent_uuid": "6cadd2cc-2a49-48ac-9087-9d812a6d636a",
+    "is_sidechain": 0,
+    "message_id": "msg_01TsT5APRjDpxmFExnpcDpcd"
+  }
+]
