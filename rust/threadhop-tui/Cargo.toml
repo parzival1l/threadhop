@@ -6,6 +6,10 @@ license.workspace = true
 
 [dependencies]
 threadhop-core = { path = "../threadhop-core", features = ["async"] }
+# Phase 3 — screens::search takes a `&rusqlite::Connection` so the App owns
+# DB lifetime. Pinned to the same version threadhop-core uses to keep
+# `Connection` a single type across the workspace.
+rusqlite = { version = "0.31", features = ["bundled"] }
 ratatui = "0.28"
 crossterm = { version = "0.28", features = ["event-stream"] }
 # Phase 2 runtime: rt-multi-thread for tokio::main, sync for mpsc/watch,

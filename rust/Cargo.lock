@@ -1152,6 +1152,7 @@ dependencies = [
  "crossterm",
  "futures",
  "ratatui",
+ "rusqlite",
  "tempfile",
  "threadhop-core",
  "tokio",
