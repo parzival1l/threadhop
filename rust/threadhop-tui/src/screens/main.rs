@@ -19,7 +19,7 @@ use ratatui::{
 use crate::app::App;
 use crate::widgets::{
     contextual_footer::ContextualFooterWidget,
-    digest_bar::DigestBarWidget,
+    digest_bar::{DigestBarContext, DigestBarWidget},
     find_bar::FindBarWidget,
     session_list::SessionListWidget,
     transcript::TranscriptWidget,
@@ -51,11 +51,16 @@ pub fn draw(app: &App, frame: &mut Frame) {
         .selected_session_id
         .as_deref()
         .and_then(|sid| app.digest_summary_cache.get(sid));
-    let session_display_name = app
+    let selected_item = app
         .selected_session_id
         .as_deref()
-        .and_then(|sid| app.sidebar.iter().find(|i| i.session_id == sid))
-        .map(|i| i.display_name.as_str());
+        .and_then(|sid| app.sidebar.iter().find(|i| i.session_id == sid));
+    let session_display_name = selected_item.map(|i| i.display_name.as_str());
+    let context = selected_item.map(|i| DigestBarContext {
+        last_active_at: i.last_active_at,
+        is_active: i.is_active,
+        is_working: i.is_working,
+    });
     let has_bookmarks = app
         .selected_session_id
         .as_deref()
@@ -66,6 +71,7 @@ pub fn draw(app: &App, frame: &mut Frame) {
         summary,
         session_display_name,
         has_bookmarks,
+        context,
     };
     frame.render_widget(digest, outer[0]);
 
@@ -232,6 +238,43 @@ mod tests {
         let app = App::new();
         let mut term = Terminal::new(TestBackend::new(10, 5)).unwrap();
         term.draw(|f| draw(&app, f)).unwrap();
+    }
+
+    #[test]
+    fn digest_bar_first_row_has_visible_content_even_without_observations() {
+        // Regression: when no observation summary exists for a session, the
+        // digest bar row used to collapse to invisible whitespace. Verify
+        // that row 0 (the digest bar) carries the session display name and
+        // a visible status hint without any observation cache.
+        use crate::widgets::session_list::SessionListItem;
+        let mut app = App::new();
+        app.sidebar = vec![SessionListItem {
+            session_id: "sess-x".into(),
+            display_name: "my-cool-session".into(),
+            is_active: true,
+            last_active_at: Some(0.0),
+            ..Default::default()
+        }];
+        app.selected_session_id = Some("sess-x".into());
+        // No digest_summary_cache entry — the empty-state path is what we
+        // expect when the Python observer hasn't run yet.
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| draw(&app, f)).unwrap();
+        let buf = term.backend().buffer();
+        let mut row0 = String::new();
+        for x in 0..buf.area().width {
+            row0.push_str(buf[(x, 0)].symbol());
+        }
+        assert!(
+            row0.contains("my-cool-session"),
+            "digest bar row 0 must show session name; got: {row0:?}"
+        );
+        // The visible content must not be pure whitespace — at least one
+        // non-space glyph (the status icon or name) must be present.
+        assert!(
+            row0.chars().any(|c| !c.is_whitespace()),
+            "digest bar row 0 had only whitespace; got: {row0:?}"
+        );
     }
 
     #[test]

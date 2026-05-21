@@ -41,6 +41,19 @@ use ratatui::{
 use threadhop_core::observations::ObservationSummary;
 use threadhop_core::theme::Theme;
 
+/// Optional sidebar item context fed into the digest bar so the row can
+/// always carry something useful — session age + status icon — even when the
+/// observation summary is empty (e.g. before the Python observer has run).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DigestBarContext {
+    /// Last-active timestamp (epoch seconds). Drives a `2h ago` suffix.
+    pub last_active_at: Option<f64>,
+    /// True when a `claude` process is bound to the session.
+    pub is_active: bool,
+    /// True when the session is mid-tool-call.
+    pub is_working: bool,
+}
+
 /// Single-line digest bar.
 ///
 /// Lifetime `'a` borrows everything from the App's frame-local state — the
@@ -62,6 +75,10 @@ pub struct DigestBarWidget<'a> {
     /// table is App-side state (not part of `ObservationSummary`), so it's
     /// passed as a separate flag.
     pub has_bookmarks: bool,
+    /// Optional sidebar context (age, active/working flags) — when present,
+    /// the bar shows the status glyph + age even when `summary` is `None`
+    /// so the row never looks empty.
+    pub context: Option<DigestBarContext>,
 }
 
 #[allow(dead_code)]
@@ -80,18 +97,57 @@ impl<'a> DigestBarWidget<'a> {
         let warn = hex_to_color(&self.theme.warning).unwrap_or(Color::Yellow);
         let err = hex_to_color(&self.theme.error).unwrap_or(Color::Red);
         let accent = hex_to_color(&self.theme.accent).unwrap_or(Color::Cyan);
+        let success = hex_to_color(&self.theme.success).unwrap_or(Color::Green);
 
-        // Empty-state: no summary at all → muted placeholder.
+        // Leading status glyph derived from the optional sidebar context.
+        // Working > Active > Inactive. Even without context (e.g. no session
+        // selected) we still want the bar to start with a visible cue.
+        let (glyph, glyph_color) = match self.context {
+            Some(ctx) if ctx.is_working => ("◐", warn),
+            Some(ctx) if ctx.is_active => ("●", success),
+            Some(_) => ("○", muted),
+            None => ("·", muted),
+        };
+
+        // Empty-state: no summary at all → still render name + status glyph
+        // + age + a muted hint so the row is visibly informative.
         let Some(summary) = self.summary else {
             let mut spans = Vec::new();
-            if let Some(name) = self.session_display_name {
-                spans.push(Span::styled(format!(" {name} "), Style::default().fg(fg)));
-                spans.push(separator(muted));
-            } else {
-                spans.push(Span::raw(" "));
-            }
             spans.push(Span::styled(
-                "no observations",
+                format!(" {glyph} "),
+                Style::default().fg(glyph_color).add_modifier(Modifier::BOLD),
+            ));
+            if let Some(name) = self.session_display_name {
+                spans.push(Span::styled(
+                    name.to_string(),
+                    Style::default().fg(fg).add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    "no session selected",
+                    Style::default().fg(muted).add_modifier(Modifier::DIM),
+                ));
+            }
+            // Age suffix from context, if available.
+            if let Some(ctx) = self.context {
+                if let Some(ts) = ctx.last_active_at {
+                    spans.push(separator(muted));
+                    spans.push(Span::styled(
+                        format!("last {}", format_age(ts, now)),
+                        Style::default().fg(muted),
+                    ));
+                }
+            }
+            if self.has_bookmarks {
+                spans.push(separator(muted));
+                spans.push(Span::styled(
+                    "★ bookmarked",
+                    Style::default().fg(accent),
+                ));
+            }
+            spans.push(separator(muted));
+            spans.push(Span::styled(
+                "no observations yet",
                 Style::default().fg(muted).add_modifier(Modifier::DIM),
             ));
             return Line::from(spans);
@@ -99,14 +155,16 @@ impl<'a> DigestBarWidget<'a> {
 
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(16);
 
-        // 1. Session name (if provided).
+        // 1. Status glyph + session name.
+        spans.push(Span::styled(
+            format!(" {glyph} "),
+            Style::default().fg(glyph_color).add_modifier(Modifier::BOLD),
+        ));
         if let Some(name) = self.session_display_name {
             spans.push(Span::styled(
-                format!(" {name} "),
+                name.to_string(),
                 Style::default().fg(fg).add_modifier(Modifier::BOLD),
             ));
-        } else {
-            spans.push(Span::raw(" "));
         }
 
         // Track whether anything meaningful has been pushed after the name
@@ -190,6 +248,19 @@ impl<'a> Widget for DigestBarWidget<'a> {
         // `$panel`, mirrored here via `background_panel`. Falls back to
         // the canvas background when the theme is missing the field.
         let panel_bg = hex_to_color(&self.theme.background_panel);
+        // First, paint every cell in the row with the panel bg so the
+        // background tint extends across the whole row — Paragraph alone
+        // only styles cells it writes a glyph into, leaving trailing
+        // padding cells un-tinted on some terminals.
+        if let Some(bg) = panel_bg {
+            for y in area.y..area.y.saturating_add(area.height) {
+                for x in area.x..area.x.saturating_add(area.width) {
+                    if let Some(cell) = buf.cell_mut((x, y)) {
+                        cell.set_bg(bg);
+                    }
+                }
+            }
+        }
         let line = self.build_line();
         let mut p = Paragraph::new(line);
         if let Some(bg) = panel_bg {
@@ -358,6 +429,7 @@ mod tests {
             summary: None,
             session_display_name: Some("my-session"),
             has_bookmarks: false,
+            context: None,
         };
         let line = w.build_line();
         let text = joined(&line);
@@ -376,6 +448,7 @@ mod tests {
             summary: None,
             session_display_name: None,
             has_bookmarks: false,
+            context: None,
         };
         // Just shouldn't panic and should produce *something*.
         let line = w.build_line();
@@ -391,6 +464,7 @@ mod tests {
             summary: Some(&summary),
             session_display_name: Some("sess"),
             has_bookmarks: false,
+            context: None,
         };
         let text = joined(&w.build_line());
         assert!(!text.contains("0 todo"), "got {text:?}");
@@ -411,6 +485,7 @@ mod tests {
             summary: Some(&summary),
             session_display_name: Some("sess"),
             has_bookmarks: false,
+            context: None,
         };
         let line = w.build_line();
         let text = joined(&line);
@@ -445,12 +520,14 @@ mod tests {
             summary: Some(&one),
             session_display_name: None,
             has_bookmarks: false,
+            context: None,
         };
         let w2 = DigestBarWidget {
             theme: &t,
             summary: Some(&many),
             session_display_name: None,
             has_bookmarks: false,
+            context: None,
         };
         assert!(joined(&w1.build_line()).contains("✓ 1 todo"));
         assert!(!joined(&w1.build_line()).contains("✓ 1 todos"));
@@ -466,6 +543,7 @@ mod tests {
             summary: Some(&summary),
             session_display_name: Some("sess"),
             has_bookmarks: true,
+            context: None,
         };
         let text = joined(&w.build_line());
         assert!(text.contains("★ bookmarked"), "got {text:?}");
@@ -488,6 +566,7 @@ mod tests {
             summary: Some(&summary),
             session_display_name: None,
             has_bookmarks: false,
+            context: None,
         };
         let line = w.build_line_with_now(now);
         let text = joined(&line);
@@ -507,6 +586,7 @@ mod tests {
             summary: Some(&summary),
             session_display_name: None,
             has_bookmarks: false,
+            context: None,
         };
         let text = joined(&w.build_line());
         assert!(text.contains("…"), "expected ellipsis, got {text:?}");
@@ -549,6 +629,7 @@ mod tests {
                     summary: Some(&summary),
                     session_display_name: Some("my-session"),
                     has_bookmarks: true,
+            context: None,
                 };
                 f.render_widget(w, area);
             })
