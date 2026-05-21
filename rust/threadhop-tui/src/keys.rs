@@ -32,6 +32,12 @@ pub enum Scope {
     BookmarkBrowser,
     /// Phase 4: generic confirm modal (yes/no destructive-action gate).
     ConfirmModal,
+    /// Phase 5: kanban-style status board modal — sessions grouped by status
+    /// column, h/l moves between columns, j/k within a column.
+    Kanban,
+    /// Phase 5: conflict viewer modal — reflector-emitted cross-session
+    /// decision conflicts, Enter / `r` marks resolved.
+    ConflictViewer,
 }
 
 /// High-level action a binding fires. Wave E grows this to cover sidebar
@@ -101,6 +107,22 @@ pub enum Command {
     MoveCursorDown,
     /// Move the in-transcript message cursor up one message (Wave 2).
     MoveCursorUp,
+    // ---- Phase 5 additions ------------------------------------------------
+    /// Open the kanban (status board) modal. Wave 1 wires the binding.
+    OpenKanban,
+    /// Open the conflict viewer modal. Wave 1 wires the binding.
+    OpenConflictViewer,
+    /// Mark the focused conflict as resolved (yes/confirm inside the
+    /// conflict viewer). Distinct from the generic `Confirm` so the
+    /// viewer's footer can advertise a specific label.
+    MarkConflictResolved,
+    /// Move the kanban column focus left (h).
+    KanbanColumnLeft,
+    /// Move the kanban column focus right (l).
+    KanbanColumnRight,
+    /// Move the selected session in the kanban to the next column (Shift+L
+    /// in the reference Python TUI). Wave 1 picks the final binding.
+    KanbanMoveItem,
 }
 
 /// Single binding row. `label` drives the contextual footer + help overlay.
@@ -445,6 +467,41 @@ const LABEL_PROMPT_BINDINGS: &[CommandBinding] = &[
     },
 ];
 
+/// Footer hints shown while the kanban modal is open. Actual key dispatch
+/// will be handled by `screens::kanban::handle_key` once Wave 1 lands.
+const KANBAN_BINDINGS: &[CommandBinding] = &[
+    CommandBinding {
+        key: key(KeyCode::Esc, KeyModifiers::NONE),
+        scope: Scope::Kanban,
+        command: Command::Cancel,
+        label: "close",
+    },
+    CommandBinding {
+        key: key(KeyCode::Enter, KeyModifiers::NONE),
+        scope: Scope::Kanban,
+        command: Command::Confirm,
+        label: "open",
+    },
+];
+
+/// Footer hints shown while the conflict viewer modal is open. Actual key
+/// dispatch will be handled by `screens::conflict_viewer::handle_key` once
+/// Wave 1 lands.
+const CONFLICT_VIEWER_BINDINGS: &[CommandBinding] = &[
+    CommandBinding {
+        key: key(KeyCode::Esc, KeyModifiers::NONE),
+        scope: Scope::ConflictViewer,
+        command: Command::Cancel,
+        label: "close",
+    },
+    CommandBinding {
+        key: key(KeyCode::Enter, KeyModifiers::NONE),
+        scope: Scope::ConflictViewer,
+        command: Command::Confirm,
+        label: "resolved",
+    },
+];
+
 /// Returns the bindings registered for a given scope. Modal scopes return
 /// an empty slice so the footer renders a stable (empty) row until later
 /// waves fill them in.
@@ -457,6 +514,8 @@ pub fn commands_for_scope(scope: Scope) -> &'static [CommandBinding] {
         Scope::BookmarkBrowser => BOOKMARK_BROWSER_BINDINGS,
         Scope::ConfirmModal => CONFIRM_MODAL_BINDINGS,
         Scope::LabelPrompt => LABEL_PROMPT_BINDINGS,
+        Scope::Kanban => KANBAN_BINDINGS,
+        Scope::ConflictViewer => CONFLICT_VIEWER_BINDINGS,
         _ => &[],
     }
 }

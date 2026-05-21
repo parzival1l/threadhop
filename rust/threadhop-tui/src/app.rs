@@ -147,6 +147,11 @@ pub struct App {
 
     /// Label / status prompt modal state. `Some` while open.
     pub label_prompt: Option<lp::State>,
+
+    /// When a modal stacks over another modal, the inner modal saves the outer
+    /// modal's scope here so confirm/closure logic can pop back to it without
+    /// hardcoded branches. None when no modal stack is active.
+    pub previous_scope: Option<keys::Scope>,
 }
 
 impl App {
@@ -199,6 +204,7 @@ impl App {
             bookmark_browser: None,
             confirm: None,
             label_prompt: None,
+            previous_scope: None,
         }
     }
 
@@ -370,14 +376,36 @@ impl App {
                         self.message_cursor += 1;
                     }
                 }
+                tracing::debug!(
+                    target: "threadhop_tui::cursor",
+                    "message cursor moved to {}",
+                    self.message_cursor
+                );
             }
             Command::MoveCursorUp => {
                 self.message_cursor = self.message_cursor.saturating_sub(1);
+                tracing::debug!(
+                    target: "threadhop_tui::cursor",
+                    "message cursor moved to {}",
+                    self.message_cursor
+                );
             }
             // CycleSessionStatus + Cancel still no-ops on MainScreen — Cancel
             // is owned by the modal-first dispatch above, and
             // CycleSessionStatus is reserved for a future quick-toggle bind.
-            Command::CycleSessionStatus | Command::Cancel => {}
+            //
+            // Phase 5 additions are no-ops on the main screen for now —
+            // Wave 1 wires bindings + opens the kanban / conflict_viewer
+            // modals from here. Listed explicitly to keep the match
+            // exhaustive.
+            Command::CycleSessionStatus
+            | Command::Cancel
+            | Command::OpenKanban
+            | Command::OpenConflictViewer
+            | Command::MarkConflictResolved
+            | Command::KanbanColumnLeft
+            | Command::KanbanColumnRight
+            | Command::KanbanMoveItem => {}
         }
         Some(cmd)
     }
@@ -521,13 +549,13 @@ impl App {
             ConfirmResult::Yes => self.execute_pending_action(req.on_yes),
             ConfirmResult::No => {}
         }
-        // The bookmark_browser stays open behind the confirm modal — the
-        // scope returns to whichever modal is still open. Today only
-        // BookmarkBrowser does this; future stackers add their own branch.
-        self.scope = if self.bookmark_browser.is_some() {
-            Scope::BookmarkBrowser
-        } else {
-            Scope::MainScreen
+        // Pop back to the modal that opened the confirm (if any). Stackers
+        // save their scope into `previous_scope` before bumping `scope =
+        // ConfirmModal`, so this branch stays generic for kanban /
+        // conflict_viewer / future modals.
+        self.scope = match self.previous_scope.take() {
+            Some(prev) => prev,
+            None => Scope::MainScreen,
         };
     }
 
@@ -662,7 +690,13 @@ impl App {
             BookmarkBrowserResult::DeleteRequested { bookmark_id } => {
                 // Open the confirm modal *over* the browser. The browser
                 // stays open so cancelling delete returns to the same
-                // selection.
+                // selection. Saving the current scope into `previous_scope`
+                // is what lets `dispatch_confirm` pop back generically —
+                // future modals (kanban, conflict_viewer) get this for free.
+                tracing::debug!(
+                    target: "threadhop_tui",
+                    "bookmark delete requested id={bookmark_id}"
+                );
                 let note = state
                     .bookmarks
                     .iter()
@@ -672,6 +706,7 @@ impl App {
                 if let Some(n) = note {
                     confirm_state = confirm_state.with_detail(format!("\"{n}\""));
                 }
+                self.previous_scope = Some(self.scope);
                 self.confirm = Some(ConfirmRequest {
                     state: confirm_state,
                     on_yes: PendingAction::DeleteBookmark { bookmark_id },

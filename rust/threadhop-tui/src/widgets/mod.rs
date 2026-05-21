@@ -6,6 +6,7 @@
 //! widget concern.
 
 pub mod contextual_footer;
+pub mod digest_bar;
 pub mod find_bar;
 pub mod session_list;
 pub mod transcript;
