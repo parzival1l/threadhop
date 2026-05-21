@@ -5,5 +5,17 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
-threadhop-core = { path = "../threadhop-core" }
+threadhop-core = { path = "../threadhop-core", features = ["async"] }
+ratatui = "0.28"
+crossterm = { version = "0.28", features = ["event-stream"] }
+# Phase 2 runtime: rt-multi-thread for tokio::main, sync for mpsc/watch,
+# time for intervals, macros for select!, process for future worker tasks.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "process"] }
 anyhow = "1"
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+
+[dev-dependencies]
+tempfile = "3"

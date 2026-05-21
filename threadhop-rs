@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# ThreadHop Rust TUI launcher.
+#
+# Wraps `cargo run --release` so the user has a single entrypoint comparable to
+# the Python ./threadhop script. After Phase 6 this will be replaced by a
+# binary built by `cargo install`, but for now we use cargo so the dev loop
+# rebuilds on demand.
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+exec cargo run --release --manifest-path "$here/rust/Cargo.toml" -p threadhop-tui -- "$@"
