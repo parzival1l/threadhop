@@ -19,6 +19,7 @@ use ratatui::{
 use crate::app::App;
 use crate::widgets::{
     contextual_footer::ContextualFooterWidget,
+    digest_bar::DigestBarWidget,
     find_bar::FindBarWidget,
     session_list::SessionListWidget,
     transcript::TranscriptWidget,
@@ -35,17 +36,44 @@ const SIDEBAR_WIDTH: u16 = 36;
 pub fn draw(app: &App, frame: &mut Frame) {
     let area = frame.area();
 
-    // Outer: content (Min 1) + footer (Length 1).
+    // Outer: digest bar (Length 1) + content (Min 1) + footer (Length 1).
     let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
         .split(area);
+
+    // Phase 5 Wave 2: digest bar for the currently-selected session.
+    let summary = app
+        .selected_session_id
+        .as_deref()
+        .and_then(|sid| app.digest_summary_cache.get(sid));
+    let session_display_name = app
+        .selected_session_id
+        .as_deref()
+        .and_then(|sid| app.sidebar.iter().find(|i| i.session_id == sid))
+        .map(|i| i.display_name.as_str());
+    let has_bookmarks = app
+        .selected_session_id
+        .as_deref()
+        .map(|sid| app.has_bookmarks_for_session.contains(sid))
+        .unwrap_or(false);
+    let digest = DigestBarWidget {
+        theme: &app.theme,
+        summary,
+        session_display_name,
+        has_bookmarks,
+    };
+    frame.render_widget(digest, outer[0]);
 
     // Content row: 36-char sidebar + transcript fills the rest.
     let content = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(1)])
-        .split(outer[0]);
+        .split(outer[1]);
 
     // Sidebar — view-model already populated by the session_scanner worker.
     let sidebar = SessionListWidget {
@@ -53,6 +81,7 @@ pub fn draw(app: &App, frame: &mut Frame) {
         selected_session_id: app.selected_session_id.as_deref(),
         spinner_frame: 0,
         now: now_epoch(),
+        theme: Some(&app.theme),
     };
     frame.render_widget(sidebar, content[0]);
 
@@ -89,7 +118,7 @@ pub fn draw(app: &App, frame: &mut Frame) {
     let footer = ContextualFooterWidget::new(app.scope, &app.theme)
         .read_only(app.read_only)
         .status(app.status_message.as_deref());
-    frame.render_widget(footer, outer[1]);
+    frame.render_widget(footer, outer[2]);
 
     // Modals are stacked in z-order (later = on top). `ratatui::widgets::Clear`
     // (called inside each modal's draw) wipes the background, so the
@@ -109,6 +138,26 @@ pub fn draw(app: &App, frame: &mut Frame) {
         let modal_area =
             crate::screens::label_prompt::centered_rect(60, 60, frame.area());
         crate::screens::label_prompt::draw(
+            state,
+            &app.theme,
+            modal_area,
+            frame.buffer_mut(),
+        );
+    }
+    if let Some(state) = app.kanban.as_ref() {
+        let modal_area =
+            crate::screens::kanban::centered_rect(95, 90, frame.area());
+        crate::screens::kanban::draw(
+            state,
+            &app.theme,
+            modal_area,
+            frame.buffer_mut(),
+        );
+    }
+    if let Some(state) = app.conflict_viewer.as_ref() {
+        let modal_area =
+            crate::screens::conflict_viewer::centered_rect(85, 75, frame.area());
+        crate::screens::conflict_viewer::draw(
             state,
             &app.theme,
             modal_area,

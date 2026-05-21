@@ -163,6 +163,41 @@ pub(crate) fn handle_worker_event(app: &mut App, event: WorkerEvent) {
                 }
                 // Phase 3 Wave 2: resolve any pending search-modal jump.
                 app.try_resolve_pending_jump();
+                // Phase 5 Wave 2: refresh the digest summary cache and the
+                // bookmarked-session set for the just-adopted session so the
+                // digest bar reflects the freshest observation file.
+                match threadhop_core::observations::latest_summary(
+                    &app.db,
+                    &session_id,
+                ) {
+                    Ok(summary) => {
+                        app.digest_summary_cache
+                            .insert(session_id.clone(), summary);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "latest_summary({session_id}) failed: {e}"
+                        );
+                    }
+                }
+                match threadhop_core::db::bookmark_uuids_for_session(
+                    &app.db,
+                    &session_id,
+                ) {
+                    Ok(uuids) => {
+                        if uuids.is_empty() {
+                            app.has_bookmarks_for_session.remove(&session_id);
+                        } else {
+                            app.has_bookmarks_for_session
+                                .insert(session_id.clone());
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "bookmark_uuids_for_session({session_id}) failed: {e}"
+                        );
+                    }
+                }
             }
         }
         WorkerEvent::Error(msg) => {
@@ -197,10 +232,7 @@ mod tests {
         SessionListItem {
             session_id: id.into(),
             display_name: id.into(),
-            is_active: false,
-            is_working: false,
-            has_observations: false,
-            last_active_at: None,
+            ..Default::default()
         }
     }
 

@@ -264,10 +264,9 @@ fn head_scan_file(entry: &FileEntry, observations_dir: &Path) -> Option<SessionL
     Some(SessionListItem {
         session_id: meta.session_id,
         display_name,
-        is_active: false,
-        is_working: false,
         has_observations,
         last_active_at: entry.mtime,
+        ..Default::default()
     })
 }
 
@@ -322,26 +321,20 @@ mod tests {
             SessionListItem {
                 session_id: "older".into(),
                 display_name: "o".into(),
-                is_active: false,
-                is_working: false,
-                has_observations: false,
                 last_active_at: Some(100.0),
+                ..Default::default()
             },
             SessionListItem {
                 session_id: "missing-mtime".into(),
                 display_name: "m".into(),
-                is_active: false,
-                is_working: false,
-                has_observations: false,
                 last_active_at: None,
+                ..Default::default()
             },
             SessionListItem {
                 session_id: "newest".into(),
                 display_name: "n".into(),
-                is_active: false,
-                is_working: false,
-                has_observations: false,
                 last_active_at: Some(500.0),
+                ..Default::default()
             },
         ];
         sort_by_recency(&mut items);

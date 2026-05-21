@@ -306,6 +306,22 @@ const MAIN_SCREEN_BINDINGS: &[CommandBinding] = &[
         command: Command::MoveCursorUp,
         label: "msg ↑",
     },
+    // ---- Phase 5 Wave 2 main-screen bindings ----
+    // `t` opens the kanban tag board, `c` opens the conflict viewer. Both
+    // are free in the lowercase set after Phase 4 (uppercase B/J/K/S are
+    // taken; lowercase `k` is sidebar nav, so kanban can't use K).
+    CommandBinding {
+        key: key(KeyCode::Char('t'), KeyModifiers::NONE),
+        scope: Scope::MainScreen,
+        command: Command::OpenKanban,
+        label: "kanban",
+    },
+    CommandBinding {
+        key: key(KeyCode::Char('c'), KeyModifiers::NONE),
+        scope: Scope::MainScreen,
+        command: Command::OpenConflictViewer,
+        label: "conflicts",
+    },
 ];
 
 /// Footer hints shown while the search modal is open. The actual key
@@ -468,7 +484,7 @@ const LABEL_PROMPT_BINDINGS: &[CommandBinding] = &[
 ];
 
 /// Footer hints shown while the kanban modal is open. Actual key dispatch
-/// will be handled by `screens::kanban::handle_key` once Wave 1 lands.
+/// is handled by `screens::kanban::handle_key`.
 const KANBAN_BINDINGS: &[CommandBinding] = &[
     CommandBinding {
         key: key(KeyCode::Esc, KeyModifiers::NONE),
@@ -482,11 +498,40 @@ const KANBAN_BINDINGS: &[CommandBinding] = &[
         command: Command::Confirm,
         label: "open",
     },
+    CommandBinding {
+        key: key(KeyCode::Char('h'), KeyModifiers::NONE),
+        scope: Scope::Kanban,
+        command: Command::KanbanColumnLeft,
+        label: "col ←",
+    },
+    CommandBinding {
+        key: key(KeyCode::Char('l'), KeyModifiers::NONE),
+        scope: Scope::Kanban,
+        command: Command::KanbanColumnRight,
+        label: "col →",
+    },
+    CommandBinding {
+        key: key(KeyCode::Char('j'), KeyModifiers::NONE),
+        scope: Scope::Kanban,
+        command: Command::SelectNextSession,
+        label: "row ↓",
+    },
+    CommandBinding {
+        key: key(KeyCode::Char('k'), KeyModifiers::NONE),
+        scope: Scope::Kanban,
+        command: Command::SelectPrevSession,
+        label: "row ↑",
+    },
+    CommandBinding {
+        key: key(KeyCode::Char('m'), KeyModifiers::NONE),
+        scope: Scope::Kanban,
+        command: Command::KanbanMoveItem,
+        label: "move",
+    },
 ];
 
 /// Footer hints shown while the conflict viewer modal is open. Actual key
-/// dispatch will be handled by `screens::conflict_viewer::handle_key` once
-/// Wave 1 lands.
+/// dispatch is handled by `screens::conflict_viewer::handle_key`.
 const CONFLICT_VIEWER_BINDINGS: &[CommandBinding] = &[
     CommandBinding {
         key: key(KeyCode::Esc, KeyModifiers::NONE),
@@ -498,7 +543,31 @@ const CONFLICT_VIEWER_BINDINGS: &[CommandBinding] = &[
         key: key(KeyCode::Enter, KeyModifiers::NONE),
         scope: Scope::ConflictViewer,
         command: Command::Confirm,
-        label: "resolved",
+        label: "jump",
+    },
+    CommandBinding {
+        key: key(KeyCode::Char('j'), KeyModifiers::NONE),
+        scope: Scope::ConflictViewer,
+        command: Command::SelectNextSession,
+        label: "next",
+    },
+    CommandBinding {
+        key: key(KeyCode::Char('k'), KeyModifiers::NONE),
+        scope: Scope::ConflictViewer,
+        command: Command::SelectPrevSession,
+        label: "prev",
+    },
+    CommandBinding {
+        key: key(KeyCode::Char('r'), KeyModifiers::NONE),
+        scope: Scope::ConflictViewer,
+        command: Command::MarkConflictResolved,
+        label: "resolve",
+    },
+    CommandBinding {
+        key: key(KeyCode::Char('t'), KeyModifiers::NONE),
+        scope: Scope::ConflictViewer,
+        command: Command::Cancel,
+        label: "toggle resolved",
     },
 ];
 

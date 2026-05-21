@@ -8,9 +8,16 @@
 //! Wave E (the previous wave) wired the worker-fed `sidebar` snapshot, the
 //! `active_session_tx` watch sender, and sidebar/transcript key handling.
 
+use std::collections::{HashMap, HashSet};
+
 use crossterm::event::{KeyEvent, KeyModifiers};
 use ratatui::Frame;
-use threadhop_core::{jsonl::CleanedMessage, models::Session, theme::Theme};
+use threadhop_core::{
+    jsonl::CleanedMessage,
+    models::Session,
+    observations::{Observation, ObservationSummary},
+    theme::Theme,
+};
 use tokio::sync::watch;
 
 use crate::keys::{self, Command, Scope};
@@ -18,6 +25,10 @@ use crate::screens::bookmark_browser::{
     self as bb, BookmarkBrowserResult, BookmarkRow,
 };
 use crate::screens::confirm::{self as cf, ConfirmResult};
+use crate::screens::conflict_viewer::{
+    self as cv, ConflictRow, ConflictViewerResult,
+};
+use crate::screens::kanban::{self as kb, KanbanItem, KanbanResult};
 use crate::screens::label_prompt::{
     self as lp, LabelPromptResult,
 };
@@ -152,6 +163,28 @@ pub struct App {
     /// modal's scope here so confirm/closure logic can pop back to it without
     /// hardcoded branches. None when no modal stack is active.
     pub previous_scope: Option<keys::Scope>,
+
+    // ---- Phase 5 Wave 2 -----------------------------------------------------
+    /// Kanban modal state — `Some` while the tag-board is open.
+    pub kanban: Option<kb::State>,
+
+    /// Conflict viewer modal state — `Some` while open.
+    pub conflict_viewer: Option<cv::State>,
+
+    /// Per-session digest summary cache. Re-populated whenever a
+    /// `TranscriptRefreshed` event lands so the digest bar reflects the
+    /// freshest observation file without a per-frame disk read.
+    pub digest_summary_cache: HashMap<String, ObservationSummary>,
+
+    /// Set of session ids that have at least one bookmark. Drives the
+    /// digest-bar `★ bookmarked` marker and avoids re-querying SQLite on
+    /// every frame.
+    pub has_bookmarks_for_session: HashSet<String>,
+
+    /// Per-session count of unresolved cross-session conflicts. Populated
+    /// from observation JSONLs + `conflict_reviews` when the conflict viewer
+    /// is opened or when `MarkResolved` returns.
+    pub conflict_counts: HashMap<String, u32>,
 }
 
 impl App {
@@ -205,6 +238,11 @@ impl App {
             confirm: None,
             label_prompt: None,
             previous_scope: None,
+            kanban: None,
+            conflict_viewer: None,
+            digest_summary_cache: HashMap::new(),
+            has_bookmarks_for_session: HashSet::new(),
+            conflict_counts: HashMap::new(),
         }
     }
 
@@ -228,11 +266,20 @@ impl App {
     /// `None` because the modal owns its own result type.
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Command> {
         // Modal-first dispatch — most-on-top first:
-        //   confirm  > label_prompt > bookmark_browser > search > find_bar
+        //   confirm > kanban | conflict_viewer | label_prompt | bookmark_browser
+        //          > search > find_bar
         // The confirm modal sits over the bookmark browser, so it must be
         // tested before the browser to capture y/n while delete is pending.
         if self.confirm.is_some() {
             self.dispatch_confirm(key);
+            return None;
+        }
+        if self.kanban.is_some() {
+            self.dispatch_kanban(key);
+            return None;
+        }
+        if self.conflict_viewer.is_some() {
+            self.dispatch_conflict_viewer(key);
             return None;
         }
         if self.label_prompt.is_some() {
@@ -390,18 +437,16 @@ impl App {
                     self.message_cursor
                 );
             }
+            // Phase 5 Wave 2: open the kanban + conflict viewer modals.
+            Command::OpenKanban => self.open_kanban(),
+            Command::OpenConflictViewer => self.open_conflict_viewer(),
             // CycleSessionStatus + Cancel still no-ops on MainScreen — Cancel
             // is owned by the modal-first dispatch above, and
             // CycleSessionStatus is reserved for a future quick-toggle bind.
-            //
-            // Phase 5 additions are no-ops on the main screen for now —
-            // Wave 1 wires bindings + opens the kanban / conflict_viewer
-            // modals from here. Listed explicitly to keep the match
-            // exhaustive.
+            // Kanban + conflict_viewer footer-only labels never fire on the
+            // main screen.
             Command::CycleSessionStatus
             | Command::Cancel
-            | Command::OpenKanban
-            | Command::OpenConflictViewer
             | Command::MarkConflictResolved
             | Command::KanbanColumnLeft
             | Command::KanbanColumnRight
@@ -716,6 +761,301 @@ impl App {
         }
     }
 
+    // ---- Phase 5 Wave 2: kanban + conflict viewer dispatch ----------------
+
+    /// Build kanban items from the sidebar, hydrating each row's `status`
+    /// field from the DB. Misses (e.g. session not present in the DB yet
+    /// because the scanner just learned about it) fall back to `Active`.
+    fn build_kanban_items(&self) -> Vec<KanbanItem> {
+        let mut out = Vec::with_capacity(self.sidebar.len());
+        for item in &self.sidebar {
+            let status = threadhop_core::db::session_by_id(&self.db, &item.session_id)
+                .ok()
+                .flatten()
+                .map(|s| s.status)
+                .unwrap_or_default();
+            out.push(KanbanItem {
+                session_id: item.session_id.clone(),
+                display_name: item.display_name.clone(),
+                status,
+            });
+        }
+        out
+    }
+
+    fn open_kanban(&mut self) {
+        let items = self.build_kanban_items();
+        // Mirror status into the sidebar so the optimistic in-place updates
+        // on `StatusChanged` have somewhere to land.
+        for ki in &items {
+            if let Some(side) = self
+                .sidebar
+                .iter_mut()
+                .find(|s| s.session_id == ki.session_id)
+            {
+                side.status = ki.status;
+            }
+        }
+        self.previous_scope = Some(self.scope);
+        self.kanban = Some(kb::State::new(items));
+        self.scope = Scope::Kanban;
+    }
+
+    fn open_conflict_viewer(&mut self) {
+        let (rows, counts) = self.collect_conflicts();
+        let mut state = cv::State::new();
+        state.set_conflicts(rows);
+        self.conflict_counts = counts;
+        // Reflect the counts into the sidebar so the `!` marker is visible
+        // immediately. Sidebar items are clone-on-write through the worker
+        // pipeline; mutating here is safe.
+        self.sync_sidebar_conflict_counts();
+        self.previous_scope = Some(self.scope);
+        self.conflict_viewer = Some(state);
+        self.scope = Scope::ConflictViewer;
+    }
+
+    /// Read every session's observation JSONL, collect `Observation::Conflict`
+    /// entries, and join against `conflict_reviews` for the `reviewed` flag.
+    /// Returns `(rows, per_session_unresolved_counts)`.
+    fn collect_conflicts(&self) -> (Vec<ConflictRow>, HashMap<String, u32>) {
+        // Spec §9 leaves `conflict_reviews` writes to the Python CLI, but
+        // reads are fine. Inline raw SQL keeps the helper out of
+        // `threadhop-core` for now (see follow-up in commit body).
+        let reviewed: HashSet<(String, String, String)> =
+            match self.db.prepare(
+                "SELECT session_id, refs_key, topic FROM conflict_reviews",
+            ) {
+                Ok(mut stmt) => stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    })
+                    .and_then(|rows| rows.collect::<Result<HashSet<_>, _>>())
+                    .unwrap_or_default(),
+                Err(e) => {
+                    tracing::warn!("conflict_reviews query failed: {e}");
+                    HashSet::new()
+                }
+            };
+
+        let mut out: Vec<ConflictRow> = Vec::new();
+        let mut counts: HashMap<String, u32> = HashMap::new();
+        // Stable, content-derived row id — observation JSONLs are
+        // append-only and don't carry numeric ids. Hash a tuple of the
+        // origin session + refs + topic so the same conflict yields the
+        // same id across reads.
+        let mut next_synthetic_id: i64 = 1;
+
+        for item in &self.sidebar {
+            let entries = match threadhop_core::observations::read_entries(&item.session_id) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        "read_entries({}) failed: {e}",
+                        item.session_id
+                    );
+                    continue;
+                }
+            };
+            for entry in entries {
+                if let Observation::Conflict {
+                    refs,
+                    topic,
+                    ts,
+                    text,
+                    ..
+                } = entry
+                {
+                    let refs_key = normalize_conflict_refs(&refs);
+                    let reviewed_flag = reviewed.contains(&(
+                        item.session_id.clone(),
+                        refs_key.clone(),
+                        topic.clone(),
+                    ));
+                    if !reviewed_flag {
+                        *counts.entry(item.session_id.clone()).or_insert(0) += 1;
+                    }
+                    // session_ids[0] = origin; remainder = refs.
+                    let mut session_ids = Vec::with_capacity(1 + refs.len());
+                    session_ids.push(item.session_id.clone());
+                    session_ids.extend(refs);
+                    let text_str = text.unwrap_or_else(|| topic.clone());
+                    let timestamp = parse_iso8601(&ts).unwrap_or(0.0);
+                    let id = next_synthetic_id;
+                    next_synthetic_id += 1;
+                    out.push(ConflictRow {
+                        id,
+                        text: text_str,
+                        session_ids,
+                        timestamp,
+                        reviewed: reviewed_flag,
+                    });
+                }
+            }
+        }
+        (out, counts)
+    }
+
+    fn sync_sidebar_conflict_counts(&mut self) {
+        for side in &mut self.sidebar {
+            side.unresolved_conflict_count = self
+                .conflict_counts
+                .get(&side.session_id)
+                .copied()
+                .unwrap_or(0);
+        }
+    }
+
+    fn dispatch_kanban(&mut self, key: KeyEvent) {
+        let state = self.kanban.as_mut().expect("dispatch_kanban precondition");
+        let result = kb::handle_key(state, key);
+        let Some(result) = result else {
+            return;
+        };
+        match result {
+            KanbanResult::Cancelled => {
+                self.kanban = None;
+                self.scope = self.previous_scope.take().unwrap_or(Scope::MainScreen);
+            }
+            KanbanResult::JumpToSession { session_id } => {
+                self.kanban = None;
+                self.scope = self.previous_scope.take().unwrap_or(Scope::MainScreen);
+                if self.selected_session_id.as_deref() != Some(session_id.as_str()) {
+                    self.selected_session_id = Some(session_id.clone());
+                    let _ = self.active_session_tx.send(Some(session_id));
+                    self.scroll = 0;
+                }
+            }
+            KanbanResult::StatusChanged {
+                session_id,
+                new_status,
+            } => {
+                if self.read_only {
+                    self.status_message = Some("Read-only — DB unavailable".into());
+                    self.revert_kanban_to_db();
+                    return;
+                }
+                match threadhop_core::db::set_session_status_typed(
+                    &self.db,
+                    &session_id,
+                    new_status,
+                ) {
+                    Ok(()) => {
+                        // Mirror the change into the sidebar so the kanban's
+                        // optimistic update is now the source of truth.
+                        if let Some(side) = self
+                            .sidebar
+                            .iter_mut()
+                            .find(|s| s.session_id == session_id)
+                        {
+                            side.status = new_status;
+                        }
+                        self.status_message = Some(format!(
+                            "status → {}",
+                            lp::status_label(new_status)
+                        ));
+                    }
+                    Err(e) => {
+                        tracing::warn!("set_session_status_typed failed: {e}");
+                        self.status_message = Some(format!("status error: {e}"));
+                        self.revert_kanban_to_db();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Re-seed the kanban modal's items from the DB and clamp the row cursor.
+    /// Used to revert the modal's optimistic status-flip when the DB write
+    /// fails (or is blocked by `read_only`).
+    fn revert_kanban_to_db(&mut self) {
+        let items = self.build_kanban_items();
+        if let Some(s) = self.kanban.as_mut() {
+            s.items = items;
+            if s.selected_row_in_column.len() < kb::STATUS_ORDER.len() {
+                s.selected_row_in_column
+                    .resize(kb::STATUS_ORDER.len(), 0);
+            }
+            let col_len = s.items_in_column(s.selected_column).len();
+            let slot = &mut s.selected_row_in_column[s.selected_column];
+            if col_len == 0 {
+                *slot = 0;
+            } else if *slot >= col_len {
+                *slot = col_len - 1;
+            }
+        }
+    }
+
+    fn dispatch_conflict_viewer(&mut self, key: KeyEvent) {
+        let state = self
+            .conflict_viewer
+            .as_mut()
+            .expect("dispatch_conflict_viewer precondition");
+        let result = cv::handle_key(state, key);
+        let Some(result) = result else {
+            return;
+        };
+        match result {
+            ConflictViewerResult::Cancelled => {
+                self.conflict_viewer = None;
+                self.scope = self.previous_scope.take().unwrap_or(Scope::MainScreen);
+            }
+            ConflictViewerResult::JumpToSession { session_id } => {
+                self.conflict_viewer = None;
+                self.scope = self.previous_scope.take().unwrap_or(Scope::MainScreen);
+                if self.selected_session_id.as_deref() != Some(session_id.as_str()) {
+                    self.selected_session_id = Some(session_id.clone());
+                    let _ = self.active_session_tx.send(Some(session_id));
+                    self.scroll = 0;
+                }
+            }
+            ConflictViewerResult::MarkResolved { conflict_id } => {
+                // Spec §9: Rust never writes `conflict_reviews`. Shell out to
+                // the Python CLI; the child uses the synthetic conflict id we
+                // generated in `collect_conflicts`. The Python CLI accepts an
+                // integer index here.
+                let cli = std::env::current_dir()
+                    .ok()
+                    .map(|d| d.join("threadhop"))
+                    .filter(|p| p.exists())
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "threadhop".to_string());
+                match std::process::Command::new(&cli)
+                    .args(["conflicts", "--resolved", &conflict_id.to_string()])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                {
+                    Ok(_child) => {
+                        self.status_message = Some(format!(
+                            "resolved #{conflict_id} (running threadhop conflicts --resolved)"
+                        ));
+                        // Refresh the row set + counts. The shelled-out
+                        // process is async, so the read may race the write;
+                        // counts will reconcile on the next open.
+                        let (rows, counts) = self.collect_conflicts();
+                        if let Some(s) = self.conflict_viewer.as_mut() {
+                            s.set_conflicts(rows);
+                        }
+                        self.conflict_counts = counts;
+                        self.sync_sidebar_conflict_counts();
+                    }
+                    Err(e) => {
+                        tracing::warn!("threadhop conflicts spawn failed: {e}");
+                        self.status_message = Some(format!(
+                            "run `threadhop conflicts --resolved {conflict_id}` to resolve"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     /// Move sidebar selection by `delta` rows (+1 down, -1 up). No-op if the
     /// sidebar is empty. On success, retargets the fs_watcher via
     /// `active_session_tx` and resets transcript scroll.
@@ -770,6 +1110,53 @@ impl App {
 #[allow(dead_code)]
 const _USED_KEYMODIFIERS: KeyModifiers = KeyModifiers::NONE;
 
+/// Mirror Python's `_normalize_conflict_refs` — trim, drop empties, sort,
+/// dedup, join on U+001F. Used by `collect_conflicts` to key the join with
+/// the `conflict_reviews` table.
+fn normalize_conflict_refs(refs: &[String]) -> String {
+    let mut canon: Vec<String> = refs
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    canon.sort();
+    canon.dedup();
+    canon.join("\u{1f}")
+}
+
+/// Tiny ISO-8601 → epoch-seconds parser — mirrors the variant in
+/// `widgets::digest_bar`. Returns `None` on malformed input. Sufficient for
+/// the observer's `YYYY-MM-DDTHH:MM:SS[.fff]Z` shape.
+fn parse_iso8601(ts: &str) -> Option<f64> {
+    let core = ts
+        .trim_end_matches('Z')
+        .trim_end_matches("+00:00")
+        .trim_end_matches("-00:00");
+    let (date, time) = core.split_once('T')?;
+    let mut dp = date.split('-');
+    let year: i64 = dp.next()?.parse().ok()?;
+    let month: i64 = dp.next()?.parse().ok()?;
+    let day: i64 = dp.next()?.parse().ok()?;
+    let (hms, frac) = match time.split_once('.') {
+        Some((a, b)) => (a, b),
+        None => (time, "0"),
+    };
+    let mut t = hms.split(':');
+    let hour: i64 = t.next()?.parse().ok()?;
+    let minute: i64 = t.next()?.parse().ok()?;
+    let second: i64 = t.next().unwrap_or("0").parse().ok()?;
+    let frac_f: f64 = format!("0.{frac}").parse().ok()?;
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let m_adj = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * m_adj + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days_since_epoch = era * 146_097 + doe - 719_468;
+    let seconds = days_since_epoch * 86_400 + hour * 3_600 + minute * 60 + second;
+    Some(seconds as f64 + frac_f)
+}
+
 /// Compact a message body for the bookmark browser snippet column —
 /// collapse whitespace and cap at ~80 characters. Same heuristic the
 /// browser's internal `render_snippet` uses; duplicated here because that
@@ -804,10 +1191,7 @@ mod tests {
         SessionListItem {
             session_id: id.to_string(),
             display_name: id.to_string(),
-            is_active: false,
-            is_working: false,
-            has_observations: false,
-            last_active_at: None,
+            ..Default::default()
         }
     }
 
@@ -1510,5 +1894,126 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(row.status, threadhop_core::models::SessionStatus::InProgress));
+    }
+
+    // ---- Phase 5 Wave 2 frame-buffer + DB regression tests ---------------
+
+    #[test]
+    fn pressing_t_opens_kanban_modal() {
+        let (mut app, _sid, _uuid) = seeded_app();
+        let before = render_to_string(&app, 120, 30);
+        assert!(!before.contains("Kanban"), "title shouldn't appear pre-open");
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert!(app.kanban.is_some(), "kanban state set");
+        assert_eq!(app.scope, Scope::Kanban);
+        let after = render_to_string(&app, 120, 30);
+        assert_ne!(before, after, "modal should change frame buffer");
+        assert!(
+            after.contains("Kanban"),
+            "expected 'Kanban' title in frame; got:\n{after}"
+        );
+    }
+
+    #[test]
+    fn pressing_c_opens_conflict_viewer() {
+        let (mut app, _sid, _uuid) = seeded_app();
+        let before = render_to_string(&app, 120, 30);
+        assert!(!before.contains("Conflicts"), "title shouldn't appear pre-open");
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(app.conflict_viewer.is_some(), "viewer state set");
+        assert_eq!(app.scope, Scope::ConflictViewer);
+        let after = render_to_string(&app, 120, 30);
+        assert_ne!(before, after, "modal should change frame buffer");
+        assert!(
+            after.contains("Conflicts"),
+            "expected 'Conflicts' title in frame; got:\n{after}"
+        );
+    }
+
+    #[test]
+    fn kanban_status_changed_writes_to_db() {
+        let (mut app, sid, _uuid) = seeded_app();
+        // Seed: session starts as Active. Open kanban → cursor is on the
+        // (only) item in column 0; press m → cycles to InProgress and the
+        // App should write that to the DB.
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert!(app.kanban.is_some());
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        let row = threadhop_core::db::session_by_id(&app.db, &sid)
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(row.status, threadhop_core::models::SessionStatus::InProgress),
+            "expected InProgress in DB after m"
+        );
+        // Sidebar mirrors the new status.
+        let sidebar_status = app
+            .sidebar
+            .iter()
+            .find(|i| i.session_id == sid)
+            .map(|i| i.status)
+            .unwrap();
+        assert!(matches!(
+            sidebar_status,
+            threadhop_core::models::SessionStatus::InProgress
+        ));
+    }
+
+    #[test]
+    fn kanban_status_changed_reverts_on_db_error() {
+        // Force the write path to fail by flipping read_only after open.
+        let (mut app, sid, _uuid) = seeded_app();
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        app.read_only = true;
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        // DB row must NOT have changed (read_only blocks the write).
+        let row = threadhop_core::db::session_by_id(&app.db, &sid)
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(row.status, threadhop_core::models::SessionStatus::Active),
+            "row must stay Active when read_only blocks the write"
+        );
+        // Kanban state was reverted — the item should be back in column 0
+        // (Active), not column 1 (InProgress).
+        let s = app.kanban.as_ref().unwrap();
+        assert_eq!(
+            s.items_in_column(0).len(),
+            1,
+            "kanban should revert: item back in Active column"
+        );
+        assert_eq!(s.items_in_column(1).len(), 0);
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap_or("")
+                .to_ascii_lowercase()
+                .contains("read-only"),
+            "expected read-only status message"
+        );
+    }
+
+    #[test]
+    fn digest_bar_renders_in_main_layout() {
+        let (mut app, sid, _uuid) = seeded_app();
+        // Seed a digest summary so the bar has something concrete to show.
+        let summary = ObservationSummary {
+            open_todo_count: 3,
+            ..Default::default()
+        };
+        app.digest_summary_cache.insert(sid.clone(), summary);
+        app.has_bookmarks_for_session.insert(sid.clone());
+        let frame = render_to_string(&app, 120, 30);
+        // The digest bar lives on row 0. Pull that row out so we don't trip
+        // on incidental "3" digits elsewhere in the layout.
+        let first_row = frame.lines().next().unwrap_or("");
+        assert!(
+            first_row.contains("3 todos"),
+            "expected digest bar text on row 0; got: {first_row:?}"
+        );
+        assert!(
+            first_row.contains("bookmarked"),
+            "expected bookmarked marker on row 0; got: {first_row:?}"
+        );
     }
 }

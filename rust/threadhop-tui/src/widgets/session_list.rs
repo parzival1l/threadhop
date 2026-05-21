@@ -25,10 +25,11 @@
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, StatefulWidget, Widget},
 };
+use threadhop_core::{models::SessionStatus, theme::hex_to_rgb};
 
 /// Width reserved for the display name column. Mirrors
 /// `threadhop_core.tui.constants.DISPLAY_NAME_WIDTH`.
@@ -51,7 +52,7 @@ pub const OBSERVATION_MARKER_FALLBACK: &str = "≡";
 /// drive the sidebar; those are derived by Wave C workers (active detector
 /// and session scanner). This struct is the per-row contract the widget
 /// needs. The worker layer fills it in, the App holds the resulting `Vec`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SessionListItem {
     /// Stable session id — matches `Session::session_id`. Used by callers to
     /// resolve selection back to a session.
@@ -74,6 +75,17 @@ pub struct SessionListItem {
     /// JSONL `modified` timestamp (epoch seconds) — drives the age column.
     /// None renders as empty.
     pub last_active_at: Option<f64>,
+
+    /// Tag status from `sessions.status`. Wave 2 (Phase 5) populates this when
+    /// opening the kanban modal so status changes can update sidebar items in
+    /// place without a worker round-trip. Default `Active` keeps existing
+    /// scanner code path untouched.
+    pub status: SessionStatus,
+
+    /// Count of unresolved cross-session conflicts whose origin is this
+    /// session. Populated by Phase 5 Wave 2 from `app.conflict_counts`; the
+    /// session_scanner worker leaves it at 0.
+    pub unresolved_conflict_count: u32,
 }
 
 /// Stateless sidebar renderer. Holds references to App state so a fresh
@@ -86,6 +98,9 @@ pub struct SessionListWidget<'a> {
     /// `SystemTime::now()` in production; tests pass a fixed value so
     /// snapshots are stable.
     pub now: f64,
+    /// Optional theme — Phase 5 Wave 2 uses `theme.error` to color the
+    /// unresolved-conflict `!` marker. `None` keeps the marker uncolored.
+    pub theme: Option<&'a threadhop_core::theme::Theme>,
 }
 
 impl<'a> SessionListWidget<'a> {
@@ -100,11 +115,21 @@ impl<'a> SessionListWidget<'a> {
 impl<'a> Widget for SessionListWidget<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let selected = self.selected_index();
+        let supports_emoji = supports_observation_emoji();
+        let error_color = self.theme.and_then(|t| {
+            hex_to_rgb(&t.error).map(|(r, g, b)| Color::Rgb(r, g, b))
+        });
         let list_items: Vec<ListItem> = self
             .items
             .iter()
             .map(|it| {
-                ListItem::new(render_session_label_line(it, self.spinner_frame, self.now))
+                ListItem::new(render_session_label_line_themed(
+                    it,
+                    self.spinner_frame,
+                    self.now,
+                    supports_emoji,
+                    error_color,
+                ))
             })
             .collect();
 
@@ -229,6 +254,19 @@ pub fn render_session_label_line_with<'a>(
     now: f64,
     supports_emoji: bool,
 ) -> Line<'a> {
+    render_session_label_line_themed(item, spinner_frame, now, supports_emoji, None)
+}
+
+/// Variant that optionally styles a Phase-5 unresolved-conflict marker (`!`)
+/// in the supplied theme's `error` color. Pass `None` to render without
+/// styling (used by the text-only convenience helper and existing tests).
+pub fn render_session_label_line_themed<'a>(
+    item: &SessionListItem,
+    spinner_frame: usize,
+    now: f64,
+    supports_emoji: bool,
+    error_color: Option<Color>,
+) -> Line<'a> {
     let icon = status_icon(item, spinner_frame);
     let middle = render_display_segment(item, supports_emoji);
     let age = item
@@ -238,11 +276,20 @@ pub fn render_session_label_line_with<'a>(
     // Right-align age to 4 cols, matching the Python `f" {age_str:>4}"`.
     let age_padded = format!("{age:>4}");
 
-    Line::from(vec![
+    let mut spans = vec![
         Span::raw(format!("{icon} ")),
         Span::raw(middle),
         Span::raw(format!(" {age_padded}")),
-    ])
+    ];
+    if item.unresolved_conflict_count > 0 {
+        let marker = " !";
+        let style = match error_color {
+            Some(c) => Style::default().fg(c).add_modifier(Modifier::BOLD),
+            None => Style::default().add_modifier(Modifier::BOLD),
+        };
+        spans.push(Span::styled(marker.to_string(), style));
+    }
+    Line::from(spans)
 }
 
 /// Render text for one row — convenience that drops styling for callers
@@ -272,8 +319,8 @@ mod tests {
             display_name: name.to_string(),
             is_active: active,
             is_working: working,
-            has_observations: false,
             last_active_at: Some(0.0),
+            ..Default::default()
         }
     }
 
@@ -324,9 +371,8 @@ mod tests {
             session_id: "s1".into(),
             display_name: "Refactor parser".into(),
             is_active: true,
-            is_working: false,
-            has_observations: false,
             last_active_at: Some(0.0),
+            ..Default::default()
         };
         // 30s ago → "30s" age.
         let text = render_session_label_text(&it, 0, 30.0, true);
@@ -343,10 +389,8 @@ mod tests {
         let it = SessionListItem {
             session_id: "s1".into(),
             display_name: "a".repeat(50),
-            is_active: false,
-            is_working: false,
-            has_observations: false,
             last_active_at: Some(0.0),
+            ..Default::default()
         };
         let text = render_session_label_text(&it, 0, 0.0, true);
         // The middle segment is exactly DISPLAY_NAME_WIDTH cells wide,
@@ -361,10 +405,9 @@ mod tests {
         let it = SessionListItem {
             session_id: "s1".into(),
             display_name: "abc".into(),
-            is_active: false,
-            is_working: false,
             has_observations: true,
             last_active_at: Some(0.0),
+            ..Default::default()
         };
         let text = render_session_label_text(&it, 0, 0.0, false);
         // ASCII marker takes 1 + 1 = 2 cols → name is "abc" + padding.
@@ -394,6 +437,7 @@ mod tests {
             selected_session_id: Some("s2"),
             spinner_frame: 0,
             now: 30.0,
+            theme: None,
         };
         let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
         term.draw(|f| {
@@ -409,6 +453,7 @@ mod tests {
             selected_session_id: None,
             spinner_frame: 0,
             now: 0.0,
+            theme: None,
         };
         let mut term = Terminal::new(TestBackend::new(20, 5)).unwrap();
         term.draw(|f| {
@@ -427,6 +472,7 @@ mod tests {
             selected_session_id: Some("missing"),
             spinner_frame: 0,
             now: 0.0,
+            theme: None,
         };
         let mut term = Terminal::new(TestBackend::new(30, 5)).unwrap();
         term.draw(|f| {
@@ -445,6 +491,7 @@ mod tests {
             selected_session_id: Some("s1"),
             spinner_frame: 0,
             now: 30.0,
+            theme: None,
         };
         let mut term = Terminal::new(TestBackend::new(36, 8)).unwrap();
         term.draw(|f| {
