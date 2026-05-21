@@ -15,12 +15,7 @@ use tokio::sync::mpsc;
 use tokio::time::interval;
 
 use crate::app::App;
-
-/// Worker event placeholder. Wave A leaves this empty — the channel exists so
-/// the `select!` arm compiles and later waves don't have to restructure the
-/// loop. Wave C adds variants like `SessionsRefreshed`.
-#[derive(Debug)]
-pub enum WorkerEvent {}
+use crate::workers::WorkerEvent;
 
 /// Run the event loop until `app.should_quit` is true (or the crossterm stream
 /// closes, which only happens on EOF).
@@ -40,7 +35,9 @@ pub async fn run(
 ) -> Result<()> {
     let mut crossterm_events = EventStream::new();
     let mut tick = interval(Duration::from_millis(16));
-    let (_worker_tx, mut worker_rx) = mpsc::channel::<WorkerEvent>(64);
+    let (worker_tx, mut worker_rx) = mpsc::channel::<WorkerEvent>(64);
+    crate::workers::spawn_all(worker_tx.clone());
+    drop(worker_tx);
 
     // Prime draw — without this the user stares at an empty terminal until
     // their first keystroke.
@@ -66,12 +63,19 @@ pub async fn run(
             // redraw at the bottom of the loop handles this implicitly. We
             // still consume the tick so the interval doesn't backlog.
             _ = tick.tick() => {}
-            // Worker channel placeholder. Wave A never sends, but the arm
-            // must exist or `select!` would only have two branches and
-            // future waves would have to restructure.
-            Some(_event) = worker_rx.recv() => {
-                // Wave A: WorkerEvent is uninhabited, so this arm is
-                // statically unreachable. Left in place for Wave C.
+            // Worker channel. Wave C/D agents fan more variants in here;
+            // today only `Error` has a real handler. The catch-all keeps the
+            // shape `match event { ... _ => {} }` so later waves drop new
+            // arms in without restructuring (clippy::single_match suppressed
+            // for the same reason).
+            Some(event) = worker_rx.recv() => {
+                #[allow(clippy::single_match)]
+                match event {
+                    WorkerEvent::Error(msg) => {
+                        tracing::warn!("worker error: {msg}");
+                    }
+                    _ => {}
+                }
             }
         }
 

@@ -8,7 +8,9 @@
 mod app;
 mod event;
 mod keys;
+mod screens;
 mod widgets;
+mod workers;
 
 use std::io::{stdout, Stdout};
 
