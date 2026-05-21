@@ -1,0 +1,9 @@
+[package]
+name = "threadhop-tui"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+threadhop-core = { path = "../threadhop-core" }
+anyhow = "1"
