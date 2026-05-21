@@ -139,9 +139,15 @@ impl<'a> Widget for TranscriptWidget<'a> {
         // Selection-mode tint: apply on top of the shaped lines so
         // continuation rows are tinted too. Done before the cursor-bold pass
         // so the cursor highlight remains visible on the warning bg.
-        if let Some(sel) = self.selection {
-            apply_selection_tint(&mut lines, self.messages, sel, self.theme);
-        }
+        //
+        // `tinted_range` captures the visual-row span of the painted region
+        // so we can nudge the viewport below — without this the App-level
+        // `scroll_selection_into_view` undershoots dramatically on
+        // markdown-rich / soft-wrapped transcripts (source-line offsets ≠
+        // visual-row offsets), and the tinted rows end up below the fold.
+        let tinted_range: Option<(usize, usize)> = self
+            .selection
+            .and_then(|sel| apply_selection_tint(&mut lines, self.messages, sel, self.theme));
         // Phase 4 Wave 2 (preserved): bold the header row of the focused
         // message. We use the same line-index estimator the App uses for
         // scroll-to-message; since our build is deterministic (1 header + N
@@ -184,7 +190,25 @@ impl<'a> Widget for TranscriptWidget<'a> {
         // so we can clamp to `len - 1` precisely.
         let line_count = u16::try_from(lines.len()).unwrap_or(u16::MAX);
         let max_scroll = line_count.saturating_sub(1);
-        let clamped = self.scroll.min(max_scroll);
+        let mut clamped = self.scroll.min(max_scroll);
+        // Visual-row scroll-into-view for selection mode: if the tinted span
+        // sits outside `[clamped, clamped + area.height)`, override the
+        // scroll so the tint lands ~1/3 from the top of the viewport. This
+        // is the visual-row analogue of `App::scroll_selection_into_view`
+        // (which works in source-line coordinates and so under-shoots on
+        // wrapped / markdown-expanded transcripts — the bug commit `2789914`
+        // tried to fix and `4c83cf7` half-fixed).
+        if let Some((first, last)) = tinted_range {
+            let view_top = clamped as usize;
+            let view_bottom = view_top.saturating_add(area.height as usize);
+            let visible = first < view_bottom && last >= view_top;
+            if !visible {
+                let target_offset = (area.height as usize) / 3;
+                let new_scroll = first.saturating_sub(target_offset);
+                let new_scroll = new_scroll.min(max_scroll as usize) as u16;
+                clamped = new_scroll;
+            }
+        }
         // Empty-state: keep the pane blank rather than dumping an "(empty)"
         // placeholder — Wave C renders a "no session selected" banner in the
         // screen itself, not the widget.
@@ -397,14 +421,23 @@ fn chunk_spans_by_width<'a>(
 /// the rows belonging to the selected message(s) with a warning-tinted bg
 /// and warning-colored gutter. Operates on shaped output so continuation
 /// rows are caught too.
+///
+/// Returns `Some((first_tinted_lidx, last_tinted_lidx))` — the visual-row
+/// span (inclusive) of the tinted region. `None` if no row matched.
+/// The renderer uses this to nudge the viewport so the tint is actually on
+/// screen: the App-level `scroll_selection_into_view` uses
+/// `message_to_line_index` (source-line offsets), which under-shoots
+/// dramatically once markdown rendering and `shape_lines` soft-wraps expand
+/// long bodies — the cursored message can end up dozens of visual rows below
+/// the viewport even though App thinks it parked the cursor in view.
 pub fn apply_selection_tint<'a>(
     lines: &mut [Line<'a>],
     messages: &[CleanedMessage],
     selection: SelectionState,
     theme: &Theme,
-) {
+) -> Option<(usize, usize)> {
     if messages.is_empty() || lines.is_empty() {
-        return;
+        return None;
     }
     let (lo, hi) = selection.range();
     let hi = hi.min(messages.len().saturating_sub(1));
@@ -427,7 +460,9 @@ pub fn apply_selection_tint<'a>(
     // by non-gutter (blank) lines.
     let mut msg_idx: i64 = -1; // -1 until we hit the first gutter row.
     let mut prev_was_gutter = false;
-    for line in lines.iter_mut() {
+    let mut first_tinted: Option<usize> = None;
+    let mut last_tinted: Option<usize> = None;
+    for (lidx, line) in lines.iter_mut().enumerate() {
         let starts_with_gutter = line
             .spans
             .first()
@@ -448,11 +483,19 @@ pub fn apply_selection_tint<'a>(
                         span.style = span.style.fg(warning_color);
                     }
                 }
+                if first_tinted.is_none() {
+                    first_tinted = Some(lidx);
+                }
+                last_tinted = Some(lidx);
             }
             prev_was_gutter = true;
         } else {
             prev_was_gutter = false;
         }
+    }
+    match (first_tinted, last_tinted) {
+        (Some(f), Some(l)) => Some((f, l)),
+        _ => None,
     }
 }
 
@@ -1798,6 +1841,46 @@ mod tests {
         assert!(
             saw_tinted_assistant_row,
             "selection tint never landed on assistant message: {shaped:#?}"
+        );
+    }
+
+    #[test]
+    fn widget_scrolls_selection_tint_into_view_when_app_scroll_undershoots() {
+        let theme = Theme::default_dark();
+        let mut msgs: Vec<CleanedMessage> = Vec::new();
+        for i in 0..30 {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            let body: String = format!("msg{i} ").repeat(30);
+            msgs.push(cm(role, &body));
+        }
+        let mut term = Terminal::new(TestBackend::new(40, 18)).unwrap();
+        let scroll = 0u16;
+        let sel = SelectionState { cursor: 29, range_start: None };
+        term.draw(|f| {
+            let w = TranscriptWidget::new(&msgs, scroll, &theme).selection(Some(sel));
+            f.render_widget(w, f.area());
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let tint_hex = blend(&theme.warning, &theme.background, 0.08);
+        let tint = hex_to_rgb(&tint_hex)
+            .map(|(r, g, b)| Color::Rgb(r, g, b))
+            .unwrap();
+        let mut saw_tint = false;
+        for y in 0..buf.area().height {
+            for x in 0..buf.area().width {
+                if buf[(x, y)].bg == tint {
+                    saw_tint = true;
+                    break;
+                }
+            }
+            if saw_tint {
+                break;
+            }
+        }
+        assert!(
+            saw_tint,
+            "selection tint never reached the rendered buffer (scroll={scroll})"
         );
     }
 
