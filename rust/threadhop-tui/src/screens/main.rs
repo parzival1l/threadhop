@@ -70,7 +70,8 @@ pub fn draw(app: &App, frame: &mut Frame) {
         content[1]
     };
     let transcript = TranscriptWidget::new(&app.transcript, app.scroll, &app.theme)
-        .find_state(app.find_state.as_ref());
+        .find_state(app.find_state.as_ref())
+        .message_cursor(Some(app.message_cursor));
     frame.render_widget(transcript, transcript_area);
 
     if has_find && content[1].height > 1 {
@@ -90,12 +91,48 @@ pub fn draw(app: &App, frame: &mut Frame) {
         .status(app.status_message.as_deref());
     frame.render_widget(footer, outer[1]);
 
-    // Search modal — drawn last so it overlays everything else.
+    // Modals are stacked in z-order (later = on top). `ratatui::widgets::Clear`
+    // (called inside each modal's draw) wipes the background, so the
+    // underlying main layout never bleeds through. The confirm modal lands
+    // last because it stacks over the bookmark browser during delete flow.
+    if let Some(state) = app.bookmark_browser.as_ref() {
+        let modal_area =
+            crate::screens::bookmark_browser::centered_rect(80, 70, frame.area());
+        crate::screens::bookmark_browser::draw(
+            state,
+            &app.theme,
+            modal_area,
+            frame.buffer_mut(),
+        );
+    }
+    if let Some(state) = app.label_prompt.as_ref() {
+        let modal_area =
+            crate::screens::label_prompt::centered_rect(60, 60, frame.area());
+        crate::screens::label_prompt::draw(
+            state,
+            &app.theme,
+            modal_area,
+            frame.buffer_mut(),
+        );
+    }
     if let Some(search_state) = app.search.as_ref() {
         let modal_area =
             crate::screens::search::centered_rect(70, 60, frame.area());
         crate::screens::search::draw(
             search_state,
+            &app.theme,
+            modal_area,
+            frame.buffer_mut(),
+        );
+    }
+    // Confirm is the top layer — it stacks over the bookmark browser when
+    // delete is pending.
+    if let Some(req) = app.confirm.as_ref() {
+        // Small popup — confirm only needs ~5 rows.
+        let modal_area =
+            crate::screens::confirm::centered_rect(50, 30, frame.area());
+        crate::screens::confirm::draw(
+            &req.state,
             &app.theme,
             modal_area,
             frame.buffer_mut(),

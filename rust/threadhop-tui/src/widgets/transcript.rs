@@ -51,6 +51,10 @@ pub struct TranscriptWidget<'a> {
     /// current match rendered bold + reversed. None means "no highlights" —
     /// the widget renders exactly as it did before Wave 2.
     pub find_state: Option<&'a crate::widgets::find_bar::FindState>,
+    /// Optional index of the currently-focused message — the one
+    /// `ToggleBookmark` will act on. When set, the renderer bolds the
+    /// matching message header so the user can see what would be bookmarked.
+    pub message_cursor: Option<usize>,
 }
 
 impl<'a> TranscriptWidget<'a> {
@@ -62,6 +66,7 @@ impl<'a> TranscriptWidget<'a> {
             scroll,
             theme,
             find_state: None,
+            message_cursor: None,
         }
     }
 
@@ -74,16 +79,45 @@ impl<'a> TranscriptWidget<'a> {
         self.find_state = find_state;
         self
     }
+
+    /// Attach the message-cursor index (Phase 4 Wave 2). Builder-style for
+    /// the same reason `find_state` is.
+    pub fn message_cursor(mut self, idx: Option<usize>) -> Self {
+        self.message_cursor = idx;
+        self
+    }
 }
 
 impl<'a> Widget for TranscriptWidget<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let lines = match self.find_state {
+        let mut lines = match self.find_state {
             Some(fs) if !fs.matches.is_empty() => {
                 build_lines_with_highlights(self.messages, self.theme, fs)
             }
             _ => build_lines(self.messages, self.theme),
         };
+        // Phase 4 Wave 2: apply the cursor highlight to the header line of
+        // the focused message. We compute the line index off the same
+        // estimator the App uses to scroll-to-message, so the header lands
+        // at the right row regardless of body shape.
+        if let (Some(idx), false) =
+            (self.message_cursor, self.messages.is_empty())
+        {
+            let bounded = idx.min(self.messages.len().saturating_sub(1));
+            if let Some(msg) = self.messages.get(bounded) {
+                if let Some(header_line) =
+                    message_to_line_index(self.messages, &msg.uuid)
+                {
+                    if let Some(line) = lines.get_mut(header_line as usize) {
+                        for span in &mut line.spans {
+                            span.style = span
+                                .style
+                                .add_modifier(Modifier::BOLD | Modifier::REVERSED);
+                        }
+                    }
+                }
+            }
+        }
         // Clamp the requested scroll so that scrolling past the end (notably
         // `G` setting scroll to `u16::MAX`) doesn't blank the pane —
         // `Paragraph::scroll` does NOT clamp on its own. The cap is

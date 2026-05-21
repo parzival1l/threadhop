@@ -239,6 +239,51 @@ const MAIN_SCREEN_BINDINGS: &[CommandBinding] = &[
         command: Command::OpenFindBar,
         label: "find",
     },
+    // ---- Phase 4 Wave 2 main-screen bindings ----
+    // Lowercase j/k already drive the sidebar; uppercase shift-J/K move the
+    // in-transcript message cursor. `b` toggles bookmark on the message at
+    // the cursor; `Shift+B` opens the cross-session bookmark browser.
+    // `s` opens the label-prompt modal (status picker; Tab inside the modal
+    // toggles to custom-name mode).
+    CommandBinding {
+        key: key(KeyCode::Char('b'), KeyModifiers::NONE),
+        scope: Scope::MainScreen,
+        command: Command::ToggleBookmark,
+        label: "bookmark",
+    },
+    CommandBinding {
+        key: key(KeyCode::Char('B'), KeyModifiers::SHIFT),
+        scope: Scope::MainScreen,
+        command: Command::OpenBookmarkBrowser,
+        label: "browse bookmarks",
+    },
+    CommandBinding {
+        key: key(KeyCode::Char('s'), KeyModifiers::NONE),
+        scope: Scope::MainScreen,
+        command: Command::OpenLabelPrompt,
+        label: "status",
+    },
+    // `Shift+S` is intentionally bound to the same command — the modal's
+    // Tab toggles between status picker and custom-name modes, so we don't
+    // need two separate openers today.
+    CommandBinding {
+        key: key(KeyCode::Char('S'), KeyModifiers::SHIFT),
+        scope: Scope::MainScreen,
+        command: Command::OpenLabelPrompt,
+        label: "rename",
+    },
+    CommandBinding {
+        key: key(KeyCode::Char('J'), KeyModifiers::SHIFT),
+        scope: Scope::MainScreen,
+        command: Command::MoveCursorDown,
+        label: "msg ↓",
+    },
+    CommandBinding {
+        key: key(KeyCode::Char('K'), KeyModifiers::SHIFT),
+        scope: Scope::MainScreen,
+        command: Command::MoveCursorUp,
+        label: "msg ↑",
+    },
 ];
 
 /// Footer hints shown while the search modal is open. The actual key
@@ -301,9 +346,8 @@ const FIND_BAR_BINDINGS: &[CommandBinding] = &[
     },
 ];
 
-/// Phase 4 footer-hint stubs for the bookmark browser modal. Wave 1 fills
-/// in scope-specific bindings (j/k/d/etc.); for now Esc cancels and Enter
-/// confirms so the footer renders sane defaults.
+/// Footer hints shown while the bookmark browser modal is open. Actual key
+/// dispatch is handled by `screens::bookmark_browser::handle_key`.
 const BOOKMARK_BROWSER_BINDINGS: &[CommandBinding] = &[
     CommandBinding {
         key: key(KeyCode::Esc, KeyModifiers::NONE),
@@ -317,27 +361,57 @@ const BOOKMARK_BROWSER_BINDINGS: &[CommandBinding] = &[
         command: Command::Confirm,
         label: "jump",
     },
+    CommandBinding {
+        key: key(KeyCode::Char('j'), KeyModifiers::NONE),
+        scope: Scope::BookmarkBrowser,
+        command: Command::SelectNextSession,
+        label: "next",
+    },
+    CommandBinding {
+        key: key(KeyCode::Char('k'), KeyModifiers::NONE),
+        scope: Scope::BookmarkBrowser,
+        command: Command::SelectPrevSession,
+        label: "prev",
+    },
+    CommandBinding {
+        key: key(KeyCode::Char('d'), KeyModifiers::NONE),
+        scope: Scope::BookmarkBrowser,
+        command: Command::Cancel, // close-ish; real dispatch handles delete
+        label: "delete",
+    },
 ];
 
-/// Phase 4 footer-hint stubs for the generic confirm modal. Wave 1 will
-/// likely also bind `y` / `n` directly inside `screens::confirm::handle_key`.
+/// Footer hints shown while the confirm modal is open. Actual key dispatch
+/// is handled by `screens::confirm::handle_key` (y / n / Enter / Esc).
 const CONFIRM_MODAL_BINDINGS: &[CommandBinding] = &[
     CommandBinding {
-        key: key(KeyCode::Esc, KeyModifiers::NONE),
+        key: key(KeyCode::Char('y'), KeyModifiers::NONE),
+        scope: Scope::ConfirmModal,
+        command: Command::Confirm,
+        label: "yes",
+    },
+    CommandBinding {
+        key: key(KeyCode::Char('n'), KeyModifiers::NONE),
         scope: Scope::ConfirmModal,
         command: Command::Cancel,
-        label: "cancel",
+        label: "no",
     },
     CommandBinding {
         key: key(KeyCode::Enter, KeyModifiers::NONE),
         scope: Scope::ConfirmModal,
         command: Command::Confirm,
-        label: "confirm",
+        label: "yes",
+    },
+    CommandBinding {
+        key: key(KeyCode::Esc, KeyModifiers::NONE),
+        scope: Scope::ConfirmModal,
+        command: Command::Cancel,
+        label: "no",
     },
 ];
 
-/// Phase 4 footer-hint stubs for the label prompt modal. Wave 1 adds
-/// j/k/digit shortcuts for the label rows.
+/// Footer hints shown while the label prompt modal is open. Actual key
+/// dispatch is handled by `screens::label_prompt::handle_key`.
 const LABEL_PROMPT_BINDINGS: &[CommandBinding] = &[
     CommandBinding {
         key: key(KeyCode::Esc, KeyModifiers::NONE),
@@ -350,6 +424,24 @@ const LABEL_PROMPT_BINDINGS: &[CommandBinding] = &[
         scope: Scope::LabelPrompt,
         command: Command::Confirm,
         label: "set",
+    },
+    CommandBinding {
+        key: key(KeyCode::Char('j'), KeyModifiers::NONE),
+        scope: Scope::LabelPrompt,
+        command: Command::SelectNextSession,
+        label: "next",
+    },
+    CommandBinding {
+        key: key(KeyCode::Char('k'), KeyModifiers::NONE),
+        scope: Scope::LabelPrompt,
+        command: Command::SelectPrevSession,
+        label: "prev",
+    },
+    CommandBinding {
+        key: key(KeyCode::Tab, KeyModifiers::NONE),
+        scope: Scope::LabelPrompt,
+        command: Command::Cancel, // footer-hint only; real dispatch toggles mode
+        label: "mode",
     },
 ];
 
