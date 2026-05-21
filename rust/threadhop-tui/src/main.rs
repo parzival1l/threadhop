@@ -69,10 +69,13 @@ fn main() -> Result<()> {
     result
 }
 
-async fn run(_cli: Cli) -> Result<()> {
+async fn run(cli: Cli) -> Result<()> {
     enter_terminal()?;
     let mut terminal = build_terminal()?;
-    let app = App::new();
+    let mut app = App::new();
+    // Phase 6: route CLI flags into the App. `--days` defaults to 7 via
+    // clap; 0 means "no filter" (apply_cli short-circuits in that case).
+    app.apply_cli(cli.project, Some(cli.days), cli.session);
     event::run(app, &mut terminal).await
 }
 

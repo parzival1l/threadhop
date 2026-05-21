@@ -112,7 +112,25 @@ fn handle_terminal_event(app: &mut App, event: CtEvent) {
 pub(crate) fn handle_worker_event(app: &mut App, event: WorkerEvent) {
     match event {
         WorkerEvent::SessionsRefreshed(items) => {
-            app.sidebar = items;
+            // Apply CLI `--project` and `--days` filters at receive time.
+            // The scanner runs unfiltered (so swapping flags at runtime
+            // would work without a worker respawn — Phase 6 only needs the
+            // boot-time path though). `now` is read once per refresh.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            let filtered: Vec<_> = if app.project_filter.is_some()
+                || app.days_filter.map(|d| d > 0).unwrap_or(false)
+            {
+                items
+                    .into_iter()
+                    .filter(|it| app.sidebar_item_passes_filters(it, now))
+                    .collect()
+            } else {
+                items
+            };
+            app.sidebar = filtered;
             // Preserve selection if it still exists; otherwise fall back to
             // the first row. The fs_watcher rebinds to the new id via the
             // watch channel.

@@ -242,9 +242,13 @@ fn push_message_highlighted<'a>(
                         && c.length == me - ms
                 })
                 .unwrap_or(false);
+            // Phase 6: route the match highlight through the theme — warning
+            // for the background (yellow-equivalent across opencode variants),
+            // background for the fg so the text stays legible. Falls back to
+            // Yellow/Black for terminals that can't parse the hex.
             let mut style = Style::default()
-                .bg(Color::Yellow)
-                .fg(Color::Black);
+                .bg(theme_color(&theme.warning, Color::Yellow))
+                .fg(theme_color(&theme.background, Color::Black));
             if is_current {
                 style = style.add_modifier(Modifier::BOLD | Modifier::REVERSED);
             }

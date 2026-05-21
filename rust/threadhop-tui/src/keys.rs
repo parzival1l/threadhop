@@ -571,6 +571,26 @@ const CONFLICT_VIEWER_BINDINGS: &[CommandBinding] = &[
     },
 ];
 
+/// Footer hints shown while the help overlay is open. The overlay itself
+/// owns key dispatch; these entries drive the footer + show up in the help
+/// overlay's "Help" group when invoked from `HelpOverlay` (rare — most users
+/// invoke from MainScreen, in which case the overlay reads MainScreen's
+/// bindings).
+const HELP_OVERLAY_BINDINGS: &[CommandBinding] = &[
+    CommandBinding {
+        key: key(KeyCode::Esc, KeyModifiers::NONE),
+        scope: Scope::HelpOverlay,
+        command: Command::Cancel,
+        label: "close",
+    },
+    CommandBinding {
+        key: key(KeyCode::Char('?'), KeyModifiers::NONE),
+        scope: Scope::HelpOverlay,
+        command: Command::OpenHelp,
+        label: "close",
+    },
+];
+
 /// Returns the bindings registered for a given scope. Modal scopes return
 /// an empty slice so the footer renders a stable (empty) row until later
 /// waves fill them in.
@@ -585,6 +605,7 @@ pub fn commands_for_scope(scope: Scope) -> &'static [CommandBinding] {
         Scope::LabelPrompt => LABEL_PROMPT_BINDINGS,
         Scope::Kanban => KANBAN_BINDINGS,
         Scope::ConflictViewer => CONFLICT_VIEWER_BINDINGS,
+        Scope::HelpOverlay => HELP_OVERLAY_BINDINGS,
         _ => &[],
     }
 }

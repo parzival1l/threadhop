@@ -28,6 +28,7 @@ use crate::screens::confirm::{self as cf, ConfirmResult};
 use crate::screens::conflict_viewer::{
     self as cv, ConflictRow, ConflictViewerResult,
 };
+use crate::screens::help::{self as hp, HelpResult};
 use crate::screens::kanban::{self as kb, KanbanItem, KanbanResult};
 use crate::screens::label_prompt::{
     self as lp, LabelPromptResult,
@@ -185,6 +186,20 @@ pub struct App {
     /// from observation JSONLs + `conflict_reviews` when the conflict viewer
     /// is opened or when `MarkResolved` returns.
     pub conflict_counts: HashMap<String, u32>,
+
+    // ---- Phase 6 -----------------------------------------------------------
+    /// Help overlay state — `Some` while the overlay is open. The overlay
+    /// remembers the scope that was active when the user hit `?` so closing
+    /// can restore it via `previous_scope`.
+    pub help: Option<hp::State>,
+
+    /// Optional `--project` filter from CLI. When set, the App drops sidebar
+    /// items whose derived project name doesn't match.
+    pub project_filter: Option<String>,
+
+    /// Optional `--days` filter from CLI. When set, the App drops sidebar
+    /// items older than `now - days * 86400 seconds`.
+    pub days_filter: Option<u32>,
 }
 
 impl App {
@@ -243,6 +258,9 @@ impl App {
             digest_summary_cache: HashMap::new(),
             has_bookmarks_for_session: HashSet::new(),
             conflict_counts: HashMap::new(),
+            help: None,
+            project_filter: None,
+            days_filter: None,
         }
     }
 
@@ -250,6 +268,65 @@ impl App {
     /// the fs_watcher (or any other consumer) can `.changed()` on.
     pub fn active_session_rx(&self) -> watch::Receiver<Option<String>> {
         self.active_session_tx.subscribe()
+    }
+
+    /// Apply CLI flag values. Called by `main` after construction so the
+    /// flags drive sidebar filtering and initial selection. Behaviour:
+    ///
+    /// * `--project <name>`: stored in `project_filter`. Future
+    ///   `SessionsRefreshed` events filter sidebar items by derived project
+    ///   name (see `event::handle_worker_event`).
+    /// * `--days <N>`: stored in `days_filter`. Sessions older than `N` days
+    ///   are dropped at receive time.
+    /// * `--session <id>`: immediately set the selected session id and
+    ///   publish on the active-session watch so the fs_watcher picks it up
+    ///   on its first tick. No filtering side-effect.
+    pub fn apply_cli(
+        &mut self,
+        project: Option<String>,
+        days: Option<u32>,
+        session: Option<String>,
+    ) {
+        self.project_filter = project;
+        self.days_filter = days;
+        if let Some(sid) = session {
+            self.selected_session_id = Some(sid.clone());
+            let _ = self.active_session_tx.send(Some(sid));
+        }
+    }
+
+    /// True when `item` survives the configured `--project` / `--days`
+    /// filters. Public-in-crate so `event::handle_worker_event` can call it
+    /// directly without re-reading the App fields.
+    pub(crate) fn sidebar_item_passes_filters(
+        &self,
+        item: &crate::widgets::session_list::SessionListItem,
+        now: f64,
+    ) -> bool {
+        if let Some(want) = &self.project_filter {
+            // Prefer the stamped field; fall back to a filesystem lookup so
+            // items synthesised by tests (which skip the scanner) still
+            // filter correctly.
+            let project = item
+                .project
+                .clone()
+                .or_else(|| derive_project_for_session(&item.session_id));
+            if project.as_deref() != Some(want.as_str()) {
+                return false;
+            }
+        }
+        if let Some(days) = self.days_filter {
+            // `Some(0)` is intentionally treated as "no filter" — clap's
+            // default would otherwise hide every session at startup.
+            if days > 0 {
+                let cutoff = now - (days as f64) * 86_400.0;
+                let ts = item.last_active_at.unwrap_or(0.0);
+                if ts < cutoff {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Draw one frame. Delegates to `screens::main` — Wave A's centered
@@ -266,8 +343,14 @@ impl App {
     /// `None` because the modal owns its own result type.
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Command> {
         // Modal-first dispatch — most-on-top first:
-        //   confirm > kanban | conflict_viewer | label_prompt | bookmark_browser
-        //          > search > find_bar
+        //   help > confirm > kanban | conflict_viewer | label_prompt | bookmark_browser
+        //        > search > find_bar
+        // Help sits on top of everything so the user can pop it open from any
+        // scope without losing the underlying modal stack.
+        if self.help.is_some() {
+            self.dispatch_help(key);
+            return None;
+        }
         // The confirm modal sits over the bookmark browser, so it must be
         // tested before the browser to capture y/n while delete is pending.
         if self.confirm.is_some() {
@@ -410,7 +493,7 @@ impl App {
             | Command::JumpToCurrentMatch
             | Command::NextMatch
             | Command::PrevMatch => {}
-            Command::OpenHelp => {}
+            Command::OpenHelp => self.open_help(),
             Command::Confirm => {}
             // Phase 4 Wave 2: real handlers.
             Command::ToggleBookmark => self.toggle_bookmark_at_cursor(),
@@ -458,31 +541,89 @@ impl App {
     /// Toggle the bookmark on the message currently under
     /// [`Self::message_cursor`]. No-op when the transcript is empty or
     /// `read_only` is set.
+    ///
+    /// Phase 6 verifier: defensively check that the message uuid exists in
+    /// the `messages` table before attempting the insert. The bookmarks
+    /// table has an FK on `messages.uuid`; if the Python observer/indexer
+    /// hasn't ingested the message yet (common race when the TUI catches a
+    /// fresh tail of the JSONL before SQLite knows about it), the INSERT
+    /// would fail with `FOREIGN KEY constraint failed`. Surface that as a
+    /// friendlier status message instead of a SQLite error.
     fn toggle_bookmark_at_cursor(&mut self) {
         let Some(msg) = self.transcript.get(self.message_cursor) else {
             self.status_message = Some("no message under cursor".into());
             return;
         };
+        let uuid = msg.uuid.clone();
         if self.read_only {
             self.status_message = Some("Read-only — DB unavailable".into());
             return;
+        }
+        // Defensive lookup: confirm the message row exists before issuing the
+        // INSERT. Doing it pre-flight rather than catching the FK error keeps
+        // tracing logs clean. Note: we only short-circuit when we can confirm
+        // the row is missing; if the query itself errors (e.g. read-only DB
+        // with no schema), fall through to the regular toggle path so the
+        // existing read-only handling applies.
+        let message_exists: Option<bool> = self
+            .db
+            .query_row(
+                "SELECT 1 FROM messages WHERE uuid = ? LIMIT 1",
+                [&uuid],
+                |_| Ok(true),
+            )
+            .ok();
+        if message_exists.is_none() {
+            // SELECT returned no row → the message isn't indexed yet.
+            // Distinguish from the schema-missing case by probing once for
+            // the table; if the table exists but has no row, surface the
+            // friendly message.
+            let table_present: bool = self
+                .db
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages'",
+                    [],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+            if table_present {
+                tracing::warn!(
+                    target: "threadhop_tui",
+                    "toggle_bookmark skipped: message uuid={uuid} not in DB"
+                );
+                self.status_message =
+                    Some("Cannot bookmark — message not yet indexed".into());
+                return;
+            }
         }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
-        match threadhop_core::db::toggle_bookmark(&self.db, &msg.uuid, now) {
+        match threadhop_core::db::toggle_bookmark(&self.db, &uuid, now) {
             Ok(Some(_)) => {
-                tracing::debug!(target: "threadhop_tui", "bookmark toggled inserted uuid={}", msg.uuid);
+                tracing::debug!(target: "threadhop_tui", "bookmark toggled inserted uuid={uuid}");
                 self.status_message = Some("★ bookmarked".into());
             }
             Ok(None) => {
-                tracing::debug!(target: "threadhop_tui", "bookmark toggled removed uuid={}", msg.uuid);
+                tracing::debug!(target: "threadhop_tui", "bookmark toggled removed uuid={uuid}");
                 self.status_message = Some("removed bookmark".into());
             }
             Err(e) => {
-                tracing::warn!("toggle_bookmark failed: {e}");
-                self.status_message = Some(format!("bookmark error: {e}"));
+                // Translate the specific FK-violation case to a friendlier
+                // message — anything else (corruption, disk full) flows
+                // through with the raw error.
+                let lower = e.to_string().to_ascii_lowercase();
+                if lower.contains("foreign key") {
+                    tracing::warn!(
+                        "toggle_bookmark FK violation for uuid={uuid}: {e}"
+                    );
+                    self.status_message =
+                        Some("Cannot bookmark — message not yet indexed".into());
+                } else {
+                    tracing::warn!("toggle_bookmark failed: {e}");
+                    self.status_message = Some(format!("bookmark error: {e}"));
+                }
             }
         }
     }
@@ -759,6 +900,33 @@ impl App {
                 self.scope = Scope::ConfirmModal;
             }
         }
+    }
+
+    // ---- Phase 6: help overlay --------------------------------------------
+
+    /// Open the help overlay over the current scope. The overlay remembers
+    /// the current scope so `dispatch_help` can restore it on close, even if
+    /// the user invoked it from a modal.
+    fn open_help(&mut self) {
+        self.previous_scope = Some(self.scope);
+        self.help = Some(hp::State::new(self.scope));
+        self.scope = keys::Scope::HelpOverlay;
+    }
+
+    /// Dispatch one keystroke into the help overlay.
+    fn dispatch_help(&mut self, key: KeyEvent) {
+        let state = self.help.as_mut().expect("dispatch_help precondition");
+        let result = hp::handle_key(state, key);
+        let Some(HelpResult::Closed) = result else {
+            return;
+        };
+        self.help = None;
+        // Restore the scope the overlay was opened from. previous_scope was
+        // set in open_help.
+        self.scope = self
+            .previous_scope
+            .take()
+            .unwrap_or(keys::Scope::MainScreen);
     }
 
     // ---- Phase 5 Wave 2: kanban + conflict viewer dispatch ----------------
@@ -1110,6 +1278,38 @@ impl App {
 #[allow(dead_code)]
 const _USED_KEYMODIFIERS: KeyModifiers = KeyModifiers::NONE;
 
+/// Derive the project name for a session id by scanning the Claude projects
+/// directory for `<session_id>.jsonl`. The project is the parent directory's
+/// name. Returns `None` when the session file isn't found (e.g. test setups
+/// without a real `~/.claude/projects`).
+///
+/// Used by `--project` filter — keeps the lookup off the hot path by
+/// caching per-receive on the App side (Phase 6 follow-up if N grows).
+fn derive_project_for_session(session_id: &str) -> Option<String> {
+    let projects = threadhop_core::paths::claude_projects_dir();
+    let target = format!("{session_id}.jsonl");
+    let entries = std::fs::read_dir(&projects).ok()?;
+    for project_entry in entries.flatten() {
+        let project_path = project_entry.path();
+        if !project_path.is_dir() {
+            continue;
+        }
+        let inner = match std::fs::read_dir(&project_path) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        for session_entry in inner.flatten() {
+            if session_entry.file_name().to_string_lossy() == target {
+                return project_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Mirror Python's `_normalize_conflict_refs` — trim, drop empties, sort,
 /// dedup, join on U+001F. Used by `collect_conflicts` to key the join with
 /// the `conflict_reviews` table.
@@ -1330,10 +1530,18 @@ mod tests {
     }
 
     #[test]
-    fn help_and_confirm_are_noops_today() {
+    fn question_mark_opens_help_overlay() {
+        // Phase 6: `?` now opens the help overlay (it was a no-op pre-Phase 6).
+        // Confirm is still a no-op on the main screen.
         let mut app = App::new();
         let r1 = app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
         assert_eq!(r1, Some(Command::OpenHelp));
+        assert!(app.help.is_some(), "help overlay state must be set");
+        assert_eq!(app.scope, Scope::HelpOverlay);
+        // Esc closes the overlay and restores the MainScreen scope.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.help.is_none(), "help overlay must close on Esc");
+        assert_eq!(app.scope, Scope::MainScreen);
         let r2 = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(r2, Some(Command::Confirm));
         assert!(!app.should_quit);
@@ -1990,6 +2198,130 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("read-only"),
             "expected read-only status message"
+        );
+    }
+
+    // ---- Phase 6 regression tests ----------------------------------------
+
+    #[test]
+    fn pressing_question_opens_help_overlay() {
+        // Render before; press `?`; render after — assert the buffer differs
+        // and the overlay's "Help" title is visible.
+        let mut app = App::new();
+        app.sidebar = vec![item("s1")];
+        app.selected_session_id = Some("s1".into());
+        let before = render_to_string(&app, 100, 30);
+        assert!(
+            !before.contains("Help"),
+            "Help title should not appear before pressing ?"
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(app.help.is_some(), "help state must be set");
+        assert_eq!(app.scope, Scope::HelpOverlay);
+        let after = render_to_string(&app, 100, 30);
+        assert_ne!(before, after, "frame buffer must change when help opens");
+        assert!(
+            after.contains("Help"),
+            "expected 'Help' title in frame; got:\n{after}"
+        );
+        // Esc closes the overlay.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.help.is_none(), "help should close on Esc");
+        assert_eq!(app.scope, Scope::MainScreen);
+    }
+
+    #[test]
+    fn project_filter_excludes_unmatched_sessions() {
+        // Set project_filter to "myproject" and feed a mixed
+        // SessionsRefreshed event; only the matching row should remain in
+        // the sidebar after handle_worker_event.
+        let mut app = App::new();
+        app.project_filter = Some("myproject".into());
+        let mut a = item("sess-a");
+        a.project = Some("myproject".into());
+        let mut b = item("sess-b");
+        b.project = Some("other".into());
+        crate::event::handle_worker_event(
+            &mut app,
+            crate::workers::WorkerEvent::SessionsRefreshed(vec![a, b]),
+        );
+        assert_eq!(app.sidebar.len(), 1, "only matching session should remain");
+        assert_eq!(app.sidebar[0].session_id, "sess-a");
+    }
+
+    #[test]
+    fn days_filter_excludes_old_sessions() {
+        let mut app = App::new();
+        app.days_filter = Some(7);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let mut fresh = item("fresh");
+        fresh.last_active_at = Some(now - 3.0 * 86_400.0);
+        let mut stale = item("stale");
+        stale.last_active_at = Some(now - 30.0 * 86_400.0);
+        crate::event::handle_worker_event(
+            &mut app,
+            crate::workers::WorkerEvent::SessionsRefreshed(vec![fresh, stale]),
+        );
+        let ids: Vec<&str> =
+            app.sidebar.iter().map(|i| i.session_id.as_str()).collect();
+        assert_eq!(ids, vec!["fresh"], "old session must be filtered out");
+    }
+
+    #[test]
+    fn apply_cli_session_sets_selection_and_publishes_watch() {
+        let mut app = App::new();
+        let mut rx = app.active_session_rx();
+        let _ = rx.borrow_and_update();
+        app.apply_cli(None, None, Some("preselected".into()));
+        assert_eq!(app.selected_session_id.as_deref(), Some("preselected"));
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(rx.borrow().as_deref(), Some("preselected"));
+    }
+
+    #[test]
+    fn toggle_bookmark_skips_when_message_not_in_db() {
+        // Seed a DB but DON'T insert the message row. App has a transcript
+        // referencing the missing uuid; toggle should produce the friendly
+        // not-yet-indexed status instead of a SQL error.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE messages (
+                 uuid TEXT PRIMARY KEY,
+                 session_id TEXT NOT NULL,
+                 role TEXT NOT NULL,
+                 text TEXT NOT NULL
+             );
+             CREATE TABLE bookmarks (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 message_uuid TEXT NOT NULL UNIQUE,
+                 note TEXT,
+                 kind TEXT NOT NULL DEFAULT 'bookmark',
+                 tags TEXT NOT NULL DEFAULT '[]',
+                 created_at REAL NOT NULL,
+                 FOREIGN KEY (message_uuid) REFERENCES messages(uuid)
+             );",
+        )
+        .unwrap();
+        let mut app = App::new();
+        app.db = conn;
+        app.read_only = false;
+        app.transcript = vec![msg("not-in-db", "user", "ghost")];
+        app.message_cursor = 0;
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        // No bookmark should have been inserted.
+        let cnt: i64 = app
+            .db
+            .query_row("SELECT COUNT(*) FROM bookmarks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cnt, 0, "no row should be inserted for missing message");
+        let status = app.status_message.as_deref().unwrap_or("");
+        assert!(
+            status.to_ascii_lowercase().contains("not yet indexed"),
+            "expected friendly status; got {status:?}"
         );
     }
 

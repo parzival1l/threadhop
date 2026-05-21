@@ -86,7 +86,9 @@ impl<'a> ContextualFooterWidget<'a> {
                 spans.push(Span::raw("  "));
                 spans.push(Span::styled(
                     "[read-only]",
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Style::default()
+                    .fg(hex_to_color(&self.theme.warning).unwrap_or(Color::Yellow))
+                    .add_modifier(Modifier::BOLD),
                 ));
             }
             return Line::from(spans);
@@ -125,7 +127,9 @@ impl<'a> ContextualFooterWidget<'a> {
             }
             spans.push(Span::styled(
                 "[read-only]",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(hex_to_color(&self.theme.warning).unwrap_or(Color::Yellow))
+                    .add_modifier(Modifier::BOLD),
             ));
         }
 

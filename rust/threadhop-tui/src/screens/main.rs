@@ -187,6 +187,18 @@ pub fn draw(app: &App, frame: &mut Frame) {
             frame.buffer_mut(),
         );
     }
+    // Help overlay sits above every other modal — the user can pop it open
+    // from any scope.
+    if let Some(state) = app.help.as_ref() {
+        let modal_area =
+            crate::screens::help::centered_rect(70, 80, frame.area());
+        crate::screens::help::draw(
+            state,
+            &app.theme,
+            modal_area,
+            frame.buffer_mut(),
+        );
+    }
 }
 
 /// Current unix timestamp in seconds. Defined here (not in the widget) so

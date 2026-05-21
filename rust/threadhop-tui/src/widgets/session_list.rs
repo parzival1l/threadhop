@@ -86,6 +86,11 @@ pub struct SessionListItem {
     /// session. Populated by Phase 5 Wave 2 from `app.conflict_counts`; the
     /// session_scanner worker leaves it at 0.
     pub unresolved_conflict_count: u32,
+
+    /// Project name (the `<encoded-project>` directory under
+    /// `~/.claude/projects/`). Populated by the session_scanner so the App
+    /// can apply a `--project` filter without re-scanning the filesystem.
+    pub project: Option<String>,
 }
 
 /// Stateless sidebar renderer. Holds references to App state so a fresh
@@ -337,6 +342,26 @@ mod tests {
         // Clock skew shouldn't produce "-3s" — the Python version doesn't
         // either (int(negative) collapses to 0).
         assert_eq!(format_age(100.0, 50.0), "0s");
+    }
+
+    #[test]
+    fn format_age_handles_28d_edge_case() {
+        // Phase 6 verifier regression: a sidebar row was observed showing
+        // "28" instead of "28d". Pin the day bucket so any future refactor
+        // that drops the unit suffix at the exact-day boundary trips this
+        // test. Covers both the exact-multiple-of-86400 case and a value
+        // a hair under 29 days (which must still bucket as "28d").
+        assert_eq!(format_age(0.0, 28.0 * 86_400.0), "28d");
+        assert_eq!(
+            format_age(0.0, 28.0 * 86_400.0 + 3600.0 * 23.0),
+            "28d",
+            "23 hours past the 28-day mark must still read as 28d"
+        );
+        // Exactly the 24h → 1d transition: 86_400 seconds exactly bucket as
+        // "1d", not "24h" (the `< 86_400.0` guard is strict-less-than).
+        assert_eq!(format_age(0.0, 86_400.0), "1d");
+        // And confirm a 3-digit day-count keeps its suffix.
+        assert_eq!(format_age(0.0, 100.0 * 86_400.0), "100d");
     }
 
     #[test]

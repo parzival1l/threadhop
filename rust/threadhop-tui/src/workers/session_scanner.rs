@@ -261,11 +261,22 @@ fn head_scan_file(entry: &FileEntry, observations_dir: &Path) -> Option<SessionL
     let observation_path = observations_dir.join(format!("{}.jsonl", meta.session_id));
     let has_observations = observation_path.is_file();
 
+    // Phase 6: stamp the project (parent directory under
+    // `~/.claude/projects/<encoded-project>/`) so the App can apply the
+    // `--project` filter without re-walking the filesystem.
+    let project = entry
+        .path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string());
+
     Some(SessionListItem {
         session_id: meta.session_id,
         display_name,
         has_observations,
         last_active_at: entry.mtime,
+        project,
         ..Default::default()
     })
 }
