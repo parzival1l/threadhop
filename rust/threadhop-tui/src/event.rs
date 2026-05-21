@@ -149,6 +149,12 @@ pub(crate) fn handle_worker_event(app: &mut App, event: WorkerEvent) {
             // next tick anyway.
             if matches {
                 app.transcript = messages;
+                // Phase 4 pre-pop: the message cursor indexes into the
+                // transcript, so a fresh load invalidates the old index.
+                // Reset to 0; Wave 2 may grow this to preserve "track the
+                // last message" semantics, but 0 is safe for the bookmark
+                // toggle which is the only consumer today.
+                app.message_cursor = 0;
                 // If a find bar is open, its match positions reference the
                 // *previous* transcript. Recompute now that the transcript
                 // changed so highlights stay in sync.

@@ -104,6 +104,13 @@ pub struct App {
     /// `WorkerEvent::TranscriptRefreshed` arrives, the event loop resolves
     /// the UUID to a scroll position and clears this back to `None`.
     pub pending_jump_message_uuid: Option<String>,
+
+    /// Currently-focused message in the transcript. Indexes into
+    /// `Self::transcript`. Phase 4 `ToggleBookmark` uses this to know which
+    /// message to bookmark. Reset to 0 whenever a new transcript is adopted.
+    /// The TranscriptWidget can later highlight this row differently —
+    /// that's Wave 2's responsibility.
+    pub message_cursor: usize,
 }
 
 impl App {
@@ -149,6 +156,7 @@ impl App {
             find_state: None,
             db,
             pending_jump_message_uuid: None,
+            message_cursor: 0,
         }
     }
 
@@ -292,6 +300,16 @@ impl App {
             | Command::PrevMatch => {}
             Command::OpenHelp => {}
             Command::Confirm => {}
+            // Phase 4 pre-pop: enum reservations. Wave 1 / Wave 2 wire real
+            // handlers (and may register bindings on `Scope::MainScreen` too).
+            // No-ops keep the match exhaustive without changing behaviour.
+            Command::ToggleBookmark
+            | Command::OpenBookmarkBrowser
+            | Command::CycleSessionStatus
+            | Command::OpenLabelPrompt
+            | Command::Cancel
+            | Command::MoveCursorDown
+            | Command::MoveCursorUp => {}
         }
         Some(cmd)
     }

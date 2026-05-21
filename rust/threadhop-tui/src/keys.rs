@@ -27,11 +27,22 @@ pub enum Scope {
     HelpOverlay,
     LabelPrompt,
     Confirm,
+    /// Phase 4: bookmark browser modal — list of pinned messages, Enter
+    /// jumps via the App's `pending_jump_message_uuid` channel.
+    BookmarkBrowser,
+    /// Phase 4: generic confirm modal (yes/no destructive-action gate).
+    ConfirmModal,
 }
 
 /// High-level action a binding fires. Wave E grows this to cover sidebar
 /// navigation and transcript scrolling; later waves add OpenSearch /
 /// ToggleBookmark / etc.
+///
+/// Phase 4 reserves several variants (`ToggleBookmark`, `OpenBookmarkBrowser`,
+/// `CycleSessionStatus`, `OpenLabelPrompt`, `MoveCursorDown`, `MoveCursorUp`)
+/// that aren't bound to any key yet — Wave 1 / Wave 2 register the bindings.
+/// `#[allow(dead_code)]` keeps `-D warnings` happy in the pre-pop commit.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Command {
     Quit,
@@ -69,6 +80,27 @@ pub enum Command {
     NextMatch,
     /// Step to the previous find-bar match (footer hint only).
     PrevMatch,
+    // ---- Phase 4 additions ------------------------------------------------
+    /// Bookmark the message at `App::message_cursor` in the current
+    /// transcript. Wave 1/2 wires the binding (`b` on the main screen).
+    ToggleBookmark,
+    /// Open the bookmark browser modal (Wave 1).
+    OpenBookmarkBrowser,
+    /// Cycle the focused session's status forward through the legal label
+    /// values (Wave 2). Distinct from `OpenLabelPrompt` — Wave 2 picks which
+    /// keybinding (if any) maps to which.
+    CycleSessionStatus,
+    /// Open the explicit label/status picker modal (Wave 1).
+    OpenLabelPrompt,
+    /// Generic cancel (Esc / `n` in confirm modals). Distinct from
+    /// `CloseFindBar` which is find-bar-specific. Wave 1 modal handlers
+    /// translate this into their own `Cancelled` result.
+    Cancel,
+    /// Move the in-transcript message cursor down one message (Wave 2 —
+    /// driver for `ToggleBookmark`).
+    MoveCursorDown,
+    /// Move the in-transcript message cursor up one message (Wave 2).
+    MoveCursorUp,
 }
 
 /// Single binding row. `label` drives the contextual footer + help overlay.
@@ -269,6 +301,58 @@ const FIND_BAR_BINDINGS: &[CommandBinding] = &[
     },
 ];
 
+/// Phase 4 footer-hint stubs for the bookmark browser modal. Wave 1 fills
+/// in scope-specific bindings (j/k/d/etc.); for now Esc cancels and Enter
+/// confirms so the footer renders sane defaults.
+const BOOKMARK_BROWSER_BINDINGS: &[CommandBinding] = &[
+    CommandBinding {
+        key: key(KeyCode::Esc, KeyModifiers::NONE),
+        scope: Scope::BookmarkBrowser,
+        command: Command::Cancel,
+        label: "close",
+    },
+    CommandBinding {
+        key: key(KeyCode::Enter, KeyModifiers::NONE),
+        scope: Scope::BookmarkBrowser,
+        command: Command::Confirm,
+        label: "jump",
+    },
+];
+
+/// Phase 4 footer-hint stubs for the generic confirm modal. Wave 1 will
+/// likely also bind `y` / `n` directly inside `screens::confirm::handle_key`.
+const CONFIRM_MODAL_BINDINGS: &[CommandBinding] = &[
+    CommandBinding {
+        key: key(KeyCode::Esc, KeyModifiers::NONE),
+        scope: Scope::ConfirmModal,
+        command: Command::Cancel,
+        label: "cancel",
+    },
+    CommandBinding {
+        key: key(KeyCode::Enter, KeyModifiers::NONE),
+        scope: Scope::ConfirmModal,
+        command: Command::Confirm,
+        label: "confirm",
+    },
+];
+
+/// Phase 4 footer-hint stubs for the label prompt modal. Wave 1 adds
+/// j/k/digit shortcuts for the label rows.
+const LABEL_PROMPT_BINDINGS: &[CommandBinding] = &[
+    CommandBinding {
+        key: key(KeyCode::Esc, KeyModifiers::NONE),
+        scope: Scope::LabelPrompt,
+        command: Command::Cancel,
+        label: "close",
+    },
+    CommandBinding {
+        key: key(KeyCode::Enter, KeyModifiers::NONE),
+        scope: Scope::LabelPrompt,
+        command: Command::Confirm,
+        label: "set",
+    },
+];
+
 /// Returns the bindings registered for a given scope. Modal scopes return
 /// an empty slice so the footer renders a stable (empty) row until later
 /// waves fill them in.
@@ -278,6 +362,9 @@ pub fn commands_for_scope(scope: Scope) -> &'static [CommandBinding] {
         Scope::MainScreen => MAIN_SCREEN_BINDINGS,
         Scope::SearchModal => SEARCH_MODAL_BINDINGS,
         Scope::FindBar => FIND_BAR_BINDINGS,
+        Scope::BookmarkBrowser => BOOKMARK_BROWSER_BINDINGS,
+        Scope::ConfirmModal => CONFIRM_MODAL_BINDINGS,
+        Scope::LabelPrompt => LABEL_PROMPT_BINDINGS,
         _ => &[],
     }
 }
