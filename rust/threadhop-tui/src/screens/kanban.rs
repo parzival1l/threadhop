@@ -37,8 +37,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        block::Padding, Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph,
-        StatefulWidget, Widget,
+        block::Padding, Block, BorderType, Borders, Clear, Paragraph, Widget,
     },
 };
 use threadhop_core::{
@@ -364,6 +363,11 @@ fn render_header(
     Paragraph::new(Line::from(Span::styled(label, style))).render(area, buf);
 }
 
+/// Height (in rows) of a single rendered card: top border + content row +
+/// bottom border. Kept as a `const` so the scroll math and the renderer
+/// agree without a runtime parameter.
+const CARD_HEIGHT: u16 = 3;
+
 fn render_column(
     state: &State,
     col_idx: usize,
@@ -391,36 +395,28 @@ fn render_column(
         return;
     }
 
-    let list_items: Vec<ListItem> = items
-        .iter()
-        .map(|it| {
-            let sid_short: String = it.session_id.chars().take(8).collect();
-            let line = Line::from(vec![
-                Span::styled(
-                    format!("{:<8}", sid_short),
-                    Style::default()
-                        .fg(theme_color(&theme.secondary, Color::Cyan))
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" "),
-                Span::raw(truncate_display(&it.display_name, area.width.saturating_sub(10) as usize)),
-            ]);
-            ListItem::new(line)
-        })
-        .collect();
-
-    // Only the selected column shows its highlight; other columns render
-    // without selection so the cursor is unambiguous.
-    let mut list_state = ListState::default();
-    if col_idx == state.selected_column {
+    let is_selected_column = col_idx == state.selected_column;
+    let selected_row = if is_selected_column {
         let row = *state.selected_row_in_column.get(col_idx).unwrap_or(&0);
-        let row = row.min(items.len().saturating_sub(1));
-        list_state.select(Some(row));
-    }
+        Some(row.min(items.len().saturating_sub(1)))
+    } else {
+        None
+    };
 
-    // Phase E: selected-card tint. Blend 25% of the warning color into the
-    // panel bg so the selection reads as a soft amber chip instead of the
-    // old hard magenta pill, and bold the row so it carries weight.
+    // How many full cards fit vertically? At least 1 if there's any height
+    // at all, so a too-tight area still draws the selected card (clipped).
+    let visible = (area.height / CARD_HEIGHT).max(1) as usize;
+
+    // Scroll: keep the selected card in view (only matters for the selected
+    // column; other columns anchor at the top, mirroring the old List).
+    let first_visible = match selected_row {
+        Some(sel) if sel >= visible => sel + 1 - visible,
+        _ => 0,
+    };
+
+    // Phase E: selected-card tint. 25% blend of warning into panel bg —
+    // applied to the selected card's Block style so it paints the inner
+    // area as well as the border-row gaps between glyphs.
     let selected_bg_hex = threadhop_core::theme::blend(
         &theme.warning,
         &theme.background_panel,
@@ -429,13 +425,81 @@ fn render_column(
     let selected_bg = threadhop_core::theme::hex_to_rgb(&selected_bg_hex)
         .map(|(r, g, b)| Color::Rgb(r, g, b))
         .unwrap_or_else(|| theme_color(&theme.warning, Color::Yellow));
-    let list = List::new(list_items).highlight_style(
-        Style::default()
-            .bg(selected_bg)
-            .fg(theme_color(&theme.foreground, Color::White))
-            .add_modifier(Modifier::BOLD),
-    );
-    StatefulWidget::render(list, area, buf, &mut list_state);
+
+    let border_fg = theme_color(&theme.border, Color::DarkGray);
+    let border_selected_fg = theme_color(&theme.border_active, Color::White);
+
+    for (visible_idx, item_idx) in (first_visible..items.len().min(first_visible + visible))
+        .enumerate()
+    {
+        let card_y = area.y + (visible_idx as u16) * CARD_HEIGHT;
+        // Guard against overflow on the last partial card slot.
+        if card_y >= area.y + area.height {
+            break;
+        }
+        let card_height = CARD_HEIGHT.min(area.y + area.height - card_y);
+        let card_rect = Rect {
+            x: area.x,
+            y: card_y,
+            width: area.width,
+            height: card_height,
+        };
+
+        let is_selected = selected_row == Some(item_idx);
+        let mut block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(if is_selected {
+                BorderType::Thick
+            } else {
+                BorderType::Plain
+            })
+            .border_style(Style::default().fg(if is_selected {
+                border_selected_fg
+            } else {
+                border_fg
+            }));
+
+        if is_selected {
+            // Tint the entire card (inner + the bg of the border row
+            // between glyphs) so the selection reads as a coherent chip.
+            // Border glyphs themselves still pick up the border fg.
+            block = block.style(Style::default().bg(selected_bg));
+        }
+
+        let inner = block.inner(card_rect);
+        block.render(card_rect, buf);
+
+        if inner.height == 0 || inner.width == 0 {
+            continue;
+        }
+
+        let it = items[item_idx];
+        let sid_short: String = it.session_id.chars().take(8).collect();
+        let name_max = (inner.width as usize).saturating_sub(9); // 8 sid + 1 space
+        let mut content_style = Style::default();
+        if is_selected {
+            content_style = content_style.bg(selected_bg).add_modifier(Modifier::BOLD);
+        }
+        let line = Line::from(vec![
+            Span::styled(
+                format!("{:<8}", sid_short),
+                Style::default()
+                    .fg(theme_color(&theme.secondary, Color::Cyan))
+                    .add_modifier(Modifier::BOLD)
+                    .bg(if is_selected {
+                        selected_bg
+                    } else {
+                        Color::Reset
+                    }),
+            ),
+            Span::styled(" ", content_style),
+            Span::styled(
+                truncate_display(&it.display_name, name_max),
+                content_style.fg(theme_color(&theme.foreground, Color::White)),
+            ),
+        ]);
+        Paragraph::new(line).render(inner, buf);
+    }
 }
 
 fn render_help(theme: &Theme, area: Rect, buf: &mut Buffer) {
@@ -935,5 +999,99 @@ mod tests {
             before, after,
             "buffer should differ after column + row navigation"
         );
+    }
+
+    // ---- Wave 1 / E6: heavy outer card border ----------------------
+
+    /// Glyphs ratatui paints for `BorderType::Thick`.
+    const THICK_GLYPHS: &[&str] = &["┏", "┓", "┗", "┛", "━", "┃"];
+
+    /// Glyphs ratatui paints for `BorderType::Plain`.
+    const PLAIN_GLYPHS: &[&str] = &["┌", "┐", "└", "┘", "─", "│"];
+
+    fn buffer_contains_any(buf: &Buffer, needles: &[&str]) -> bool {
+        for y in 0..buf.area().height {
+            for x in 0..buf.area().width {
+                let sym = buf[(x, y)].symbol();
+                if needles.contains(&sym) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn kanban_selected_card_renders_thick_border() {
+        // Two stacked cards in the Active column; cursor on row 0 by default.
+        // The selected card must be drawn with `BorderType::Thick`, whose
+        // glyph set is distinct from `Plain` (heavy weight strokes + corners).
+        let st = State::new(vec![
+            item("alpha-1", "Card A", SessionStatus::Active),
+            item("beta-2", "Card B", SessionStatus::Active),
+        ]);
+        let theme = Theme::default_dark();
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| {
+            let area = centered_rect(95, 90, f.area());
+            draw(&st, &theme, area, f.buffer_mut());
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        assert!(
+            buffer_contains_any(buf, THICK_GLYPHS),
+            "expected at least one heavy border glyph from {:?} in the rendered buffer; \
+             the selected card should use BorderType::Thick",
+            THICK_GLYPHS
+        );
+    }
+
+    #[test]
+    fn kanban_unselected_card_renders_plain_border() {
+        // Two cards in the same column: row 0 is selected (Thick), row 1
+        // un-selected (Plain). Assert that Plain glyphs are present so we
+        // know the un-selected card kept its lighter weight border.
+        let st = State::new(vec![
+            item("alpha-1", "Card A", SessionStatus::Active),
+            item("beta-2", "Card B", SessionStatus::Active),
+        ]);
+        let theme = Theme::default_dark();
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| {
+            let area = centered_rect(95, 90, f.area());
+            draw(&st, &theme, area, f.buffer_mut());
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        assert!(
+            buffer_contains_any(buf, PLAIN_GLYPHS),
+            "expected at least one plain border glyph from {:?} for the un-selected card",
+            PLAIN_GLYPHS
+        );
+    }
+
+    #[test]
+    fn kanban_unselected_column_cards_all_use_plain_border() {
+        // Cards in a non-selected column should never show a Thick border.
+        // Cursor stays on column 0 (Active) here; the InProgress column
+        // should draw only Plain card borders, while column 0's selected
+        // card is Thick.
+        let st = State::new(vec![
+            item("a", "Card A", SessionStatus::Active),
+            item("c", "Card C", SessionStatus::InProgress),
+            item("d", "Card D", SessionStatus::InProgress),
+        ]);
+        let theme = Theme::default_dark();
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| {
+            let area = centered_rect(95, 90, f.area());
+            draw(&st, &theme, area, f.buffer_mut());
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        // Plain glyphs must exist (the un-selected column's cards draw them).
+        assert!(buffer_contains_any(buf, PLAIN_GLYPHS));
+        // Thick glyphs must also exist (the selected card in column 0).
+        assert!(buffer_contains_any(buf, THICK_GLYPHS));
     }
 }
