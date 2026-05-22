@@ -216,10 +216,18 @@ pub fn draw(app: &App, frame: &mut Frame) {
     // top digest bar — the App holds the data; both widgets just read.
     if show_digest_panel {
         let panel_area = content[2];
+        // Wave 3 Worker H: pull the populated `SessionDigest` (if any) so
+        // the panel can render real Outputs/Context blocks. The cache is
+        // filled lazily in the worker-event handler on `TranscriptRefreshed`.
+        let digest = app
+            .selected_session_id
+            .as_deref()
+            .and_then(|sid| app.digest_cache.get(sid));
         let panel = SessionDigestPanel {
             theme: &app.theme,
             selected_item,
             summary,
+            digest,
         };
         frame.render_widget(panel, panel_area);
     }
