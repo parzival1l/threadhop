@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use crossterm::event::{KeyEvent, KeyModifiers};
+use crossterm::event::{KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use threadhop_core::{
     jsonl::CleanedMessage,
@@ -283,6 +283,89 @@ pub struct App {
     /// non-zero estimate so scroll math still works the moment the user
     /// presses `m`.
     pub last_transcript_height: std::cell::Cell<u16>,
+
+    /// Phase E: which pane currently owns focus. Drives the focus-aware
+    /// border on the sidebar (`PaneFocus::Sidebar` → accent border, anything
+    /// else → muted). Toggled by `FocusList` / `FocusTranscript`.
+    pub pane_focus: PaneFocus,
+
+    /// Phase E: rect the sidebar occupied on the most recent frame. Mouse
+    /// dispatch uses it to translate a click row → session index.
+    pub last_sidebar_rect: std::cell::Cell<ratatui::layout::Rect>,
+
+    /// Phase E: per-row mapping (header vs. session index) emitted by the
+    /// sidebar widget during render. Mouse dispatch reads this back.
+    pub last_sidebar_rows:
+        std::cell::RefCell<Vec<crate::widgets::session_list::SidebarRowKind>>,
+
+    /// Phase E: rect the transcript pane occupied on the most recent frame.
+    /// Mouse dispatch uses it for scroll-wheel routing.
+    pub last_transcript_rect: std::cell::Cell<ratatui::layout::Rect>,
+
+    /// Phase E: rect the find bar occupied on the most recent frame, or
+    /// zero-area when the bar is closed.
+    pub last_find_bar_rect: std::cell::Cell<ratatui::layout::Rect>,
+
+    /// Phase E: current mouse cursor position, set by `MouseEventKind::Moved`.
+    /// Drives the find-bar `×` hover tint.
+    pub mouse_cursor: Option<(u16, u16)>,
+
+    /// Phase E: whether mouse capture is enabled this session. Set by
+    /// `--no-mouse` CLI flag (inverted) and consulted by the event loop.
+    pub mouse_enabled: bool,
+}
+
+/// Phase E: an action emitted by the mouse hit-test pipeline. The variant
+/// list grows as more clickable surfaces come online — Phase E ships with
+/// the four that paid for themselves on day one (sidebar select, transcript
+/// scroll, transcript focus, find-bar close). Kanban/help/conflict viewer
+/// rectangles would push more variants here once their hit-tests land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HitAction {
+    /// User clicked the sidebar row that maps to this session index.
+    SelectSessionAt(usize),
+    /// Scroll wheel moved the transcript by `delta` rows (sign carries
+    /// direction; live impl always uses ±1 per tick to feel smooth).
+    ScrollTranscript(i16),
+    /// User clicked inside the transcript pane — no row-level action, but
+    /// pane focus shifts so subsequent keystrokes route here.
+    FocusTranscript,
+    /// User clicked the find-bar `×` close glyph.
+    CloseFindBar,
+}
+
+/// Returns true when `(col, row)` sits inside `rect`. Zero-area rects always
+/// return false — used as a guard when the renderer hasn't published a real
+/// rect yet (e.g. between App construction and the first frame).
+fn rect_contains(rect: ratatui::layout::Rect, col: u16, row: u16) -> bool {
+    if rect.width == 0 || rect.height == 0 {
+        return false;
+    }
+    col >= rect.x
+        && col < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
+}
+
+/// Returns the column the find-bar `×` close glyph occupies, given the bar's
+/// rect. None when the bar's width can't fit the trailing glyph.
+pub fn find_bar_close_col(bar: ratatui::layout::Rect) -> Option<u16> {
+    if bar.width < 2 {
+        return None;
+    }
+    // The glyph sits one cell from the right edge of the bar.
+    Some(bar.x + bar.width - 2)
+}
+
+/// Phase E: which pane owns focus. Drives the focus-aware border highlight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PaneFocus {
+    /// Sidebar (session list) has focus — the right border lights up in the
+    /// accent color.
+    Sidebar,
+    /// Transcript pane has focus.
+    #[default]
+    Transcript,
 }
 
 impl App {
@@ -376,6 +459,13 @@ impl App {
             days_filter: None,
             spinner_tick: 0,
             last_transcript_height: std::cell::Cell::new(0),
+            pane_focus: PaneFocus::default(),
+            last_sidebar_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            last_sidebar_rows: std::cell::RefCell::new(Vec::new()),
+            last_transcript_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            last_find_bar_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            mouse_cursor: None,
+            mouse_enabled: true,
         }
     }
 
@@ -775,8 +865,14 @@ impl App {
             }
             Command::MoveSessionDown => self.stub_command("reorder session ↓"),
             Command::MoveSessionUp => self.stub_command("reorder session ↑"),
-            Command::FocusTranscript => self.stub_command("focus transcript"),
-            Command::FocusList => self.stub_command("focus list"),
+            Command::FocusTranscript => {
+                // Phase E: real focus toggle. Drives the focus-aware sidebar
+                // border + the (future) transcript-pane border.
+                self.pane_focus = PaneFocus::Transcript;
+            }
+            Command::FocusList => {
+                self.pane_focus = PaneFocus::Sidebar;
+            }
             Command::EnterSelectionMode => self.enter_selection_mode(),
             Command::EditBookmarkNote => self.stub_command("edit bookmark note"),
             // Cancel is owned by the modal-first dispatch; modal-only
@@ -789,6 +885,101 @@ impl App {
             | Command::KanbanMoveItemBack => {}
         }
         Some(cmd)
+    }
+
+    /// Phase E: dispatch one crossterm `MouseEvent`. The App walks the
+    /// stored hit-test layout (sidebar rect + row kinds, transcript rect,
+    /// find-bar rect) and emits a corresponding state mutation. Returns
+    /// `Some(HitAction)` for the visible smoke tests; the live event loop
+    /// ignores the return value.
+    ///
+    /// Disabled paths:
+    /// * `--no-mouse` flips `self.mouse_enabled = false`; the event loop
+    ///   never calls this so terminal-native text selection still works.
+    /// * Modal scopes ignore positional events for now (clicks would need
+    ///   per-modal hit-tests). Mouse motion is still recorded so the
+    ///   find-bar hover state survives modal stacking.
+    pub fn handle_mouse(&mut self, event: MouseEvent) -> Option<HitAction> {
+        // Always track the cursor position so the find-bar hover tint
+        // updates even when the click target is somewhere else.
+        match event.kind {
+            MouseEventKind::Moved
+            | MouseEventKind::Drag(_)
+            | MouseEventKind::Down(_)
+            | MouseEventKind::Up(_) => {
+                self.mouse_cursor = Some((event.column, event.row));
+            }
+            _ => {}
+        }
+
+        // Scroll wheel works regardless of scope — it routes to the
+        // transcript pane when the cursor sits inside it.
+        match event.kind {
+            MouseEventKind::ScrollDown => {
+                if rect_contains(self.last_transcript_rect.get(), event.column, event.row) {
+                    self.set_scroll(self.scroll.saturating_add(1));
+                    return Some(HitAction::ScrollTranscript(1));
+                }
+                return None;
+            }
+            MouseEventKind::ScrollUp => {
+                if rect_contains(self.last_transcript_rect.get(), event.column, event.row) {
+                    self.set_scroll(self.scroll.saturating_sub(1));
+                    return Some(HitAction::ScrollTranscript(-1));
+                }
+                return None;
+            }
+            _ => {}
+        }
+
+        // Only left-down clicks trigger pane-level dispatch.
+        if !matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return None;
+        }
+
+        // 1. Find-bar `×` close glyph — only when the bar is open.
+        if self.find_state.is_some() {
+            let bar_rect = self.last_find_bar_rect.get();
+            if let Some(close_col) = find_bar_close_col(bar_rect) {
+                if event.row == bar_rect.y && event.column == close_col {
+                    self.find_state = None;
+                    self.scope = keys::Scope::MainScreen;
+                    return Some(HitAction::CloseFindBar);
+                }
+            }
+        }
+
+        // 2. Sidebar click — translate Y to row → session index.
+        let sidebar_rect = self.last_sidebar_rect.get();
+        if rect_contains(sidebar_rect, event.column, event.row) {
+            let row = event.row.saturating_sub(sidebar_rect.y) as usize;
+            let rows = self.last_sidebar_rows.borrow();
+            if let Some(crate::widgets::session_list::SidebarRowKind::Session(idx)) =
+                rows.get(row).copied()
+            {
+                drop(rows);
+                if let Some(item) = self.sidebar.get(idx) {
+                    let sid = item.session_id.clone();
+                    if self.selected_session_id.as_deref() != Some(sid.as_str()) {
+                        self.selected_session_id = Some(sid.clone());
+                        let _ = self.active_session_tx.send(Some(sid));
+                        self.set_scroll(0);
+                    }
+                    self.pane_focus = PaneFocus::Sidebar;
+                    return Some(HitAction::SelectSessionAt(idx));
+                }
+            }
+            return None;
+        }
+
+        // 3. Transcript pane click — give it focus so subsequent
+        // keystrokes route the way the user expects.
+        if rect_contains(self.last_transcript_rect.get(), event.column, event.row) {
+            self.pane_focus = PaneFocus::Transcript;
+            return Some(HitAction::FocusTranscript);
+        }
+
+        None
     }
 
     /// Phase A: enter selection mode. Pushes the current scope onto
@@ -3149,6 +3340,126 @@ mod tests {
             Some(v) => std::env::set_var("THREADHOP_NO_ANIM", v),
             None => std::env::remove_var("THREADHOP_NO_ANIM"),
         }
+    }
+
+    // ---- Phase E: mouse dispatch -----------------------------------------
+
+    fn left_down(col: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn scroll_event(kind: MouseEventKind, col: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn mouse_sidebar_click_selects_session_at_row() {
+        use crate::widgets::session_list::SidebarRowKind;
+        let mut app = App::new();
+        app.sidebar = vec![item("alpha"), item("beta"), item("gamma")];
+        // Pretend the renderer landed the sidebar at (0,0,36,10) with
+        // three session rows packed at the top.
+        app.last_sidebar_rect
+            .set(ratatui::layout::Rect { x: 0, y: 0, width: 36, height: 10 });
+        *app.last_sidebar_rows.borrow_mut() = vec![
+            SidebarRowKind::Session(0),
+            SidebarRowKind::Session(1),
+            SidebarRowKind::Session(2),
+        ];
+        let action = app.handle_mouse(left_down(5, 1));
+        assert_eq!(action, Some(HitAction::SelectSessionAt(1)));
+        assert_eq!(app.selected_session_id.as_deref(), Some("beta"));
+        assert_eq!(app.pane_focus, PaneFocus::Sidebar);
+    }
+
+    #[test]
+    fn mouse_sidebar_click_on_header_is_a_noop() {
+        use crate::widgets::session_list::SidebarRowKind;
+        let mut app = App::new();
+        app.sidebar = vec![item("alpha")];
+        app.last_sidebar_rect
+            .set(ratatui::layout::Rect { x: 0, y: 0, width: 36, height: 10 });
+        *app.last_sidebar_rows.borrow_mut() =
+            vec![SidebarRowKind::Header, SidebarRowKind::Session(0)];
+        let action = app.handle_mouse(left_down(5, 0));
+        assert!(action.is_none(), "clicking a header row must not emit a hit");
+        assert!(app.selected_session_id.is_none());
+    }
+
+    #[test]
+    fn mouse_scroll_wheel_inside_transcript_moves_scroll() {
+        let mut app = App::new();
+        app.scroll = 10;
+        app.scroll_current = 10.0;
+        app.last_transcript_rect
+            .set(ratatui::layout::Rect { x: 36, y: 1, width: 84, height: 30 });
+        let down = app.handle_mouse(scroll_event(MouseEventKind::ScrollDown, 50, 5));
+        assert_eq!(down, Some(HitAction::ScrollTranscript(1)));
+        assert_eq!(app.scroll, 11);
+        let up = app.handle_mouse(scroll_event(MouseEventKind::ScrollUp, 50, 5));
+        assert_eq!(up, Some(HitAction::ScrollTranscript(-1)));
+        assert_eq!(app.scroll, 10);
+    }
+
+    #[test]
+    fn mouse_scroll_wheel_outside_transcript_is_a_noop() {
+        let mut app = App::new();
+        app.scroll = 10;
+        app.scroll_current = 10.0;
+        app.last_transcript_rect
+            .set(ratatui::layout::Rect { x: 36, y: 1, width: 84, height: 30 });
+        // Click is outside (x < transcript rect).
+        let action = app.handle_mouse(scroll_event(MouseEventKind::ScrollDown, 5, 5));
+        assert!(action.is_none());
+        assert_eq!(app.scroll, 10);
+    }
+
+    #[test]
+    fn mouse_click_on_find_bar_close_glyph_closes_bar() {
+        let mut app = App::new();
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        assert!(app.find_state.is_some());
+        // Pretend the find bar is at (0, 5) with width 40 — close glyph at
+        // column 38.
+        app.last_find_bar_rect
+            .set(ratatui::layout::Rect { x: 0, y: 5, width: 40, height: 1 });
+        let action = app.handle_mouse(left_down(38, 5));
+        assert_eq!(action, Some(HitAction::CloseFindBar));
+        assert!(app.find_state.is_none());
+        assert_eq!(app.scope, Scope::MainScreen);
+    }
+
+    #[test]
+    fn mouse_moved_event_records_cursor() {
+        let mut app = App::new();
+        let moved = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 12,
+            row: 7,
+            modifiers: KeyModifiers::NONE,
+        };
+        let _ = app.handle_mouse(moved);
+        assert_eq!(app.mouse_cursor, Some((12, 7)));
+    }
+
+    #[test]
+    fn focus_list_command_promotes_sidebar_focus() {
+        let mut app = App::new();
+        assert_eq!(app.pane_focus, PaneFocus::Transcript);
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert_eq!(app.pane_focus, PaneFocus::Sidebar);
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert_eq!(app.pane_focus, PaneFocus::Transcript);
     }
 
     #[test]

@@ -418,10 +418,21 @@ fn render_column(
         list_state.select(Some(row));
     }
 
+    // Phase E: selected-card tint. Blend 25% of the warning color into the
+    // panel bg so the selection reads as a soft amber chip instead of the
+    // old hard magenta pill, and bold the row so it carries weight.
+    let selected_bg_hex = threadhop_core::theme::blend(
+        &theme.warning,
+        &theme.background_panel,
+        0.25,
+    );
+    let selected_bg = threadhop_core::theme::hex_to_rgb(&selected_bg_hex)
+        .map(|(r, g, b)| Color::Rgb(r, g, b))
+        .unwrap_or_else(|| theme_color(&theme.warning, Color::Yellow));
     let list = List::new(list_items).highlight_style(
         Style::default()
-            .bg(theme_color(&theme.accent, Color::Magenta))
-            .fg(theme_color(&theme.background, Color::Black))
+            .bg(selected_bg)
+            .fg(theme_color(&theme.foreground, Color::White))
             .add_modifier(Modifier::BOLD),
     );
     StatefulWidget::render(list, area, buf, &mut list_state);
@@ -845,6 +856,47 @@ mod tests {
             draw(&st, &theme, area, f.buffer_mut());
         })
         .unwrap();
+    }
+
+    #[test]
+    fn kanban_selected_card_renders_warning_tint_bg() {
+        // Phase E E6: the selected card row carries a bg that's a 25% blend
+        // of theme.warning into theme.background_panel. Two stacked items in
+        // the Active column; cursor on row 0 by default.
+        let st = State::new(vec![
+            item("alpha-1", "Card A", SessionStatus::Active),
+            item("beta-2", "Card B", SessionStatus::Active),
+        ]);
+        let theme = Theme::default_dark();
+        let want_hex = threadhop_core::theme::blend(
+            &theme.warning,
+            &theme.background_panel,
+            0.25,
+        );
+        let want = threadhop_core::theme::hex_to_rgb(&want_hex)
+            .map(|(r, g, b)| Color::Rgb(r, g, b))
+            .unwrap();
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| {
+            let area = centered_rect(95, 90, f.area());
+            draw(&st, &theme, area, f.buffer_mut());
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        // Scan: some cell should be painted with the warning tint bg.
+        let mut found = false;
+        'rows: for y in 0..buf.area().height {
+            for x in 0..buf.area().width {
+                if buf[(x, y)].bg == want {
+                    found = true;
+                    break 'rows;
+                }
+            }
+        }
+        assert!(
+            found,
+            "expected at least one cell with the warning-tint bg for the selected card"
+        );
     }
 
     #[test]

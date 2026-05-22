@@ -18,6 +18,7 @@ use std::io::{stdout, Stdout};
 use anyhow::Result;
 use clap::Parser;
 use crossterm::{
+    event::{DisableMouseCapture, EnableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -46,6 +47,13 @@ pub struct Cli {
     /// Open a specific session by id on launch.
     #[arg(long)]
     pub session: Option<String>,
+
+    /// Disable terminal mouse capture. Without this flag the TUI listens
+    /// for click + scroll events; with it set, the terminal's native
+    /// text-selection (e.g. Cmd+drag on macOS) keeps working at the cost
+    /// of clickable sidebar rows + scroll-wheel transcript navigation.
+    #[arg(long)]
+    pub no_mouse: bool,
 }
 
 fn main() -> Result<()> {
@@ -71,18 +79,26 @@ fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    enter_terminal()?;
+    let mouse_enabled = !cli.no_mouse;
+    enter_terminal(mouse_enabled)?;
     let mut terminal = build_terminal()?;
     let mut app = App::new();
+    app.mouse_enabled = mouse_enabled;
     // Phase 6: route CLI flags into the App. `--days` defaults to 7 via
     // clap; 0 means "no filter" (apply_cli short-circuits in that case).
     app.apply_cli(cli.project, Some(cli.days), cli.session);
     event::run(app, &mut terminal).await
 }
 
-fn enter_terminal() -> Result<()> {
+fn enter_terminal(mouse: bool) -> Result<()> {
     enable_raw_mode()?;
     execute!(stdout(), EnterAlternateScreen)?;
+    if mouse {
+        // Best-effort: terminals that don't support mouse reporting silently
+        // ignore the escape; we don't surface an error because the rest of
+        // the TUI is still usable.
+        let _ = execute!(stdout(), EnableMouseCapture);
+    }
     Ok(())
 }
 
@@ -96,6 +112,11 @@ fn restore_terminal() {
     // terminal, and the user will get a corrupted shell. Logging is no help
     // because tracing writes to a file. The next shell command (`reset`) is
     // the recovery path.
+    //
+    // Always emit `DisableMouseCapture` — sending it when capture wasn't
+    // enabled is a no-op on every terminal we care about, and the alternative
+    // (threading the flag through the panic hook) costs more than it saves.
+    let _ = execute!(stdout(), DisableMouseCapture);
     let _ = disable_raw_mode();
     let _ = execute!(stdout(), LeaveAlternateScreen);
 }

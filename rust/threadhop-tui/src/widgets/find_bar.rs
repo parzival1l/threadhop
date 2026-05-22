@@ -212,6 +212,10 @@ pub struct FindBarWidget<'a> {
     pub state: &'a FindState,
     pub theme: &'a Theme,
     pub active: bool,
+    /// Phase E: optional current mouse cursor, used to drive the `×` close
+    /// glyph's hover tint. `None` (the default) renders the glyph in the
+    /// muted default style.
+    pub mouse_cursor: Option<(u16, u16)>,
 }
 
 impl<'a> FindBarWidget<'a> {
@@ -220,11 +224,19 @@ impl<'a> FindBarWidget<'a> {
             state,
             theme,
             active: true,
+            mouse_cursor: None,
         }
     }
 
     pub fn active(mut self, active: bool) -> Self {
         self.active = active;
+        self
+    }
+
+    /// Phase E: stamp the live mouse cursor so the `×` close glyph can
+    /// pick up the hover tint.
+    pub fn mouse_cursor(mut self, cursor: Option<(u16, u16)>) -> Self {
+        self.mouse_cursor = cursor;
         self
     }
 
@@ -287,6 +299,48 @@ impl<'a> Widget for FindBarWidget<'a> {
         }
         let line = self.build_line();
         Paragraph::new(line).render(area, buf);
+
+        // Phase E: paint the `×` close glyph in the rightmost cell of the
+        // bar (with one trailing pad cell). The glyph is the mouse close
+        // affordance; hover tint applies when the mouse cursor sits over
+        // its cell. Click is dispatched by the App, not the widget.
+        if area.width < 2 || area.height == 0 {
+            return;
+        }
+        let close_col = area.x + area.width - 2;
+        let close_row = area.y;
+        let error = hex_to_color(&self.theme.error).unwrap_or(Color::Red);
+        let panel = hex_to_color(&self.theme.background_panel).unwrap_or(Color::Reset);
+        let foreground = hex_to_color(&self.theme.foreground).unwrap_or(Color::White);
+
+        let hovered = self
+            .mouse_cursor
+            .map(|(cx, cy)| cx == close_col && cy == close_row)
+            .unwrap_or(false);
+
+        let glyph_style = if hovered {
+            // Blend 15% of the error color into the panel bg — a quiet
+            // warning lift that hints "click to dismiss" without shouting.
+            let hex = threadhop_core::theme::blend(
+                &self.theme.error,
+                &self.theme.background_panel,
+                0.15,
+            );
+            let bg = threadhop_core::theme::hex_to_rgb(&hex)
+                .map(|(r, g, b)| Color::Rgb(r, g, b))
+                .unwrap_or(panel);
+            Style::default()
+                .fg(error)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(foreground).bg(panel)
+        };
+
+        if let Some(cell) = buf.cell_mut((close_col, close_row)) {
+            cell.set_symbol("×");
+            cell.set_style(glyph_style);
+        }
     }
 }
 
@@ -827,6 +881,57 @@ mod tests {
         }
         assert!(text.contains("find:"), "expected 'find:' label, got {text:?}");
         assert!(text.contains("hello"), "expected query echo, got {text:?}");
+    }
+
+    #[test]
+    fn find_bar_renders_close_glyph_in_rightmost_cell() {
+        // Phase E: the bar paints a `×` close affordance in column `area.x +
+        // area.width - 2`. Frame-buffer assertion.
+        let t = theme();
+        let s = FindState::default();
+        let mut terminal = Terminal::new(TestBackend::new(40, 1)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = Rect { x: 0, y: 0, width: 40, height: 1 };
+                let w = FindBarWidget::new(&s, &t);
+                f.render_widget(w, area);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        assert_eq!(buf.cell((38, 0)).unwrap().symbol(), "×");
+    }
+
+    #[test]
+    fn find_bar_close_glyph_carries_hover_tint_under_mouse() {
+        // Phase E E7: hovering the `×` glyph paints its bg with a 15% blend
+        // of theme.error over the panel bg. Without the mouse hint, the
+        // glyph's bg stays the muted panel default.
+        let t = theme();
+        let s = FindState::default();
+        // First: render without hover. Capture the bg.
+        let mut term = Terminal::new(TestBackend::new(40, 1)).unwrap();
+        term.draw(|f| {
+            let area = Rect { x: 0, y: 0, width: 40, height: 1 };
+            f.render_widget(FindBarWidget::new(&s, &t), area);
+        })
+        .unwrap();
+        let cold_bg = term.backend().buffer().cell((38, 0)).unwrap().bg;
+        // Second: same render but with the cursor pinned on the `×`.
+        let mut term2 = Terminal::new(TestBackend::new(40, 1)).unwrap();
+        term2
+            .draw(|f| {
+                let area = Rect { x: 0, y: 0, width: 40, height: 1 };
+                f.render_widget(
+                    FindBarWidget::new(&s, &t).mouse_cursor(Some((38, 0))),
+                    area,
+                );
+            })
+            .unwrap();
+        let hot_bg = term2.backend().buffer().cell((38, 0)).unwrap().bg;
+        assert_ne!(
+            cold_bg, hot_bg,
+            "hovering the close glyph must change its background tint"
+        );
     }
 
     #[test]

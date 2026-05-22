@@ -93,6 +93,10 @@ pub async fn run(
         // when no tween is active — early-out inside the App.
         app.tick_animations();
         terminal.draw(|f| app.draw(f))?;
+        // Advance the spinner tick after each draw so the next frame
+        // picks up a new spinner glyph. Saturating-add keeps us safe
+        // across infinitely long sessions.
+        app.spinner_tick = app.spinner_tick.wrapping_add(1);
     }
 }
 
@@ -101,10 +105,16 @@ fn handle_terminal_event(app: &mut App, event: CtEvent) {
         CtEvent::Key(key) => {
             app.handle_key(key);
         }
+        // Phase E: `--no-mouse` flips `app.mouse_enabled` off. We still
+        // receive the event from crossterm (the escape sequences are
+        // already capture-enabled at TTY level), but ignoring them keeps
+        // the TUI behaving as if mouse capture had never been turned on.
+        CtEvent::Mouse(mouse) if app.mouse_enabled => {
+            let _ = app.handle_mouse(mouse);
+        }
         CtEvent::Resize(_, _) => {
             // ratatui handles resize on the next draw automatically.
         }
-        // Mouse / paste / focus are not bound today.
         _ => {}
     }
 }

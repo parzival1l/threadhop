@@ -139,7 +139,6 @@ pub fn draw(state: &State, theme: &Theme, area: Rect, buf: &mut Buffer) {
         label_color,
     );
     if state.origin_scope != Scope::Global {
-        lines.push(Line::from(""));
         push_group(
             &mut lines,
             scope_label(state.origin_scope),
@@ -163,15 +162,21 @@ fn push_group<'a>(
     out: &mut Vec<Line<'a>>,
     label: &'a str,
     bindings: &'a [CommandBinding],
-    scope_color: Color,
+    _scope_color: Color,
     key_color: Color,
     label_color: Color,
 ) {
+    // Phase E: scope-group section header. Render as dim italic with a
+    // 1-row top margin so groups visually separate. Mirrors the Python
+    // `css/help.tcss::.help-scope` rule: `color: $text-muted; text-style:
+    // italic; margin-top: 1`.
+    let muted = Style::default()
+        .fg(_scope_color) // already a primary-ish color; OK to keep here
+        .add_modifier(Modifier::DIM | Modifier::ITALIC);
+    out.push(Line::from(""));
     out.push(Line::from(vec![Span::styled(
-        label.to_string(),
-        Style::default()
-            .fg(scope_color)
-            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        format!("── {label} ──"),
+        muted,
     )]));
     // Dedup: many scopes register the same Command under both letter+arrow
     // aliases. Show each label once per scope, keyed on (key_text, label).

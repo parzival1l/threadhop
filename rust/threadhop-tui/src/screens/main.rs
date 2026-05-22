@@ -19,7 +19,7 @@ use ratatui::{
 use threadhop_core::theme::{blend, hex_to_rgb};
 
 use crate::anim::Easing;
-use crate::app::{App, MODAL_BACKDROP_ALPHA, MODAL_FADE_DURATION};
+use crate::app::{App, PaneFocus, MODAL_BACKDROP_ALPHA, MODAL_FADE_DURATION};
 use crate::widgets::{
     contextual_footer::ContextualFooterWidget,
     digest_bar::{DigestBarContext, DigestBarWidget},
@@ -123,7 +123,12 @@ pub fn draw(app: &App, frame: &mut Frame) {
         spinner_frame: app.spinner_tick / SPINNER_DIVISOR,
         now: now_epoch(),
         theme: Some(&app.theme),
+        focused: app.pane_focus == PaneFocus::Sidebar,
+        row_layout: Some(&app.last_sidebar_rows),
     };
+    // Phase E: remember the sidebar rect so the mouse dispatcher can
+    // translate a click row into a session index.
+    app.last_sidebar_rect.set(content[0]);
     frame.render_widget(sidebar, content[0]);
 
     // Transcript pane. When the find bar is open, reserve the bottom row of
@@ -148,6 +153,9 @@ pub fn draw(app: &App, frame: &mut Frame) {
         .find_state(app.find_state.as_ref())
         .message_cursor(Some(app.message_cursor))
         .selection(app.selection_state);
+    // Phase E: remember the transcript rect so the mouse dispatcher can
+    // route scroll-wheel events to it.
+    app.last_transcript_rect.set(transcript_area);
     frame.render_widget(transcript, transcript_area);
 
     if has_find && content[1].height > 1 {
@@ -157,8 +165,15 @@ pub fn draw(app: &App, frame: &mut Frame) {
             width: content[1].width,
             height: 1,
         };
-        let bar = FindBarWidget::new(app.find_state.as_ref().unwrap(), &app.theme);
+        // Phase E: stamp the find-bar rect + the mouse cursor so the bar
+        // can compute the hover/click state for its `×` close glyph.
+        app.last_find_bar_rect.set(bar_area);
+        let bar = FindBarWidget::new(app.find_state.as_ref().unwrap(), &app.theme)
+            .mouse_cursor(app.mouse_cursor);
         frame.render_widget(bar, bar_area);
+    } else {
+        app.last_find_bar_rect
+            .set(ratatui::layout::Rect::default());
     }
 
     // Phase C (minimal): right-column session digest panel. Reuses the same
