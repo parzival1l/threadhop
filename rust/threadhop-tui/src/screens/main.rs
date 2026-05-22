@@ -13,7 +13,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::Color,
+    style::{Color, Style},
+    widgets::{Block, Borders},
     Frame,
 };
 use threadhop_core::theme::{blend, hex_to_rgb};
@@ -131,18 +132,43 @@ pub fn draw(app: &App, frame: &mut Frame) {
     app.last_sidebar_rect.set(content[0]);
     frame.render_widget(sidebar, content[0]);
 
-    // Transcript pane. When the find bar is open, reserve the bottom row of
-    // the transcript pane for it so the bar sits flush with the footer.
-    let has_find = app.find_state.is_some();
-    let transcript_area = if has_find && content[1].height > 1 {
-        ratatui::layout::Rect {
-            x: content[1].x,
-            y: content[1].y,
-            width: content[1].width,
-            height: content[1].height - 1,
+    // Wave 1 E4: outer Block around the transcript pane with a
+    // focus-aware border color. When the transcript pane is focused the
+    // border lights up in `theme.accent`; otherwise it falls back to
+    // `theme.border_subtle` so it's visible but quiet. This mirrors the
+    // sidebar's right-border focus indicator from Phase E.
+    let transcript_focused = app.pane_focus == PaneFocus::Transcript;
+    let transcript_border_color = if transcript_focused {
+        match hex_to_rgb(&app.theme.accent) {
+            Some((r, g, b)) => Color::Rgb(r, g, b),
+            None => Color::Magenta,
         }
     } else {
-        content[1]
+        match hex_to_rgb(&app.theme.border_subtle) {
+            Some((r, g, b)) => Color::Rgb(r, g, b),
+            None => Color::DarkGray,
+        }
+    };
+    let transcript_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(transcript_border_color));
+    let block_outer = content[1];
+    let block_inner = transcript_block.inner(block_outer);
+    frame.render_widget(transcript_block, block_outer);
+
+    // Transcript pane. When the find bar is open, reserve the bottom row of
+    // the transcript pane (inside the block) for it so the bar sits flush
+    // with the bottom border.
+    let has_find = app.find_state.is_some();
+    let transcript_area = if has_find && block_inner.height > 1 {
+        ratatui::layout::Rect {
+            x: block_inner.x,
+            y: block_inner.y,
+            width: block_inner.width,
+            height: block_inner.height - 1,
+        }
+    } else {
+        block_inner
     };
     // Phase A fix-up: record the transcript pane height so
     // `App::scroll_selection_into_view` can decide whether the selection
@@ -158,11 +184,11 @@ pub fn draw(app: &App, frame: &mut Frame) {
     app.last_transcript_rect.set(transcript_area);
     frame.render_widget(transcript, transcript_area);
 
-    if has_find && content[1].height > 1 {
+    if has_find && block_inner.height > 1 {
         let bar_area = ratatui::layout::Rect {
-            x: content[1].x,
-            y: content[1].y + content[1].height - 1,
-            width: content[1].width,
+            x: block_inner.x,
+            y: block_inner.y + block_inner.height - 1,
+            width: block_inner.width,
             height: 1,
         };
         // Phase E: stamp the find-bar rect + the mouse cursor so the bar
@@ -559,6 +585,119 @@ mod tests {
         assert!(
             (alpha - MODAL_BACKDROP_ALPHA).abs() < 1e-5,
             "no_anim alpha must snap to peak; got {alpha}"
+        );
+    }
+
+    // ---- Wave 1 E4: transcript pane focus border ------------------------
+
+    #[test]
+    fn transcript_pane_renders_block_with_accent_border_when_focused() {
+        // When the transcript pane has focus, the outer Block painted
+        // around it must render its border in `theme.accent`. We sweep
+        // the perimeter of the transcript area (computed the same way
+        // `draw` does) and require at least one cell to match.
+        let mut app = App::new();
+        app.pane_focus = PaneFocus::Transcript;
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| draw(&app, f)).unwrap();
+        let buf = term.backend().buffer();
+
+        let (r, g, b) = hex_to_rgb(&app.theme.accent)
+            .expect("default theme accent is valid hex");
+        let want = Color::Rgb(r, g, b);
+
+        // The transcript block lives at content[1]: x = SIDEBAR_WIDTH = 36.
+        // Width = total - sidebar - digest_panel (when shown). For 120 cols,
+        // digest panel shows (120 >= 110), so transcript x ∈ [36, 120-36) =
+        // [36, 84). Vertical: rows 1..(H-1) (between digest bar + footer).
+        let outer = ratatui::layout::Rect {
+            x: 36,
+            y: 1,
+            width: 120 - 36 - 36,
+            height: 24 - 2,
+        };
+
+        let mut found = false;
+        // Top + bottom rows.
+        for x in outer.x..outer.x + outer.width {
+            for y in [outer.y, outer.y + outer.height - 1] {
+                if buf[(x, y)].fg == want {
+                    found = true;
+                }
+            }
+        }
+        // Left + right columns.
+        for y in outer.y..outer.y + outer.height {
+            for x in [outer.x, outer.x + outer.width - 1] {
+                if buf[(x, y)].fg == want {
+                    found = true;
+                }
+            }
+        }
+        assert!(
+            found,
+            "focused transcript block must paint at least one perimeter cell in accent"
+        );
+    }
+
+    #[test]
+    fn transcript_pane_renders_block_with_default_border_when_not_focused() {
+        // When the sidebar has focus, the transcript block's border must
+        // NOT use the accent color — instead it should fall back to the
+        // theme's subtle border color. We confirm no perimeter cell paints
+        // in accent, AND that at least one perimeter cell paints in the
+        // border_subtle color (so the block is in fact drawn).
+        let mut app = App::new();
+        app.pane_focus = PaneFocus::Sidebar;
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| draw(&app, f)).unwrap();
+        let buf = term.backend().buffer();
+
+        let (ar, ag, ab) = hex_to_rgb(&app.theme.accent)
+            .expect("default theme accent is valid hex");
+        let accent = Color::Rgb(ar, ag, ab);
+        let (sr, sg, sb) = hex_to_rgb(&app.theme.border_subtle)
+            .expect("default theme border_subtle is valid hex");
+        let subtle = Color::Rgb(sr, sg, sb);
+
+        let outer = ratatui::layout::Rect {
+            x: 36,
+            y: 1,
+            width: 120 - 36 - 36,
+            height: 24 - 2,
+        };
+
+        let mut saw_accent = false;
+        let mut saw_subtle = false;
+        for x in outer.x..outer.x + outer.width {
+            for y in [outer.y, outer.y + outer.height - 1] {
+                let fg = buf[(x, y)].fg;
+                if fg == accent {
+                    saw_accent = true;
+                }
+                if fg == subtle {
+                    saw_subtle = true;
+                }
+            }
+        }
+        for y in outer.y..outer.y + outer.height {
+            for x in [outer.x, outer.x + outer.width - 1] {
+                let fg = buf[(x, y)].fg;
+                if fg == accent {
+                    saw_accent = true;
+                }
+                if fg == subtle {
+                    saw_subtle = true;
+                }
+            }
+        }
+        assert!(
+            !saw_accent,
+            "unfocused transcript block must NOT paint perimeter cells in accent"
+        );
+        assert!(
+            saw_subtle,
+            "unfocused transcript block must paint perimeter cells in border_subtle"
         );
     }
 
