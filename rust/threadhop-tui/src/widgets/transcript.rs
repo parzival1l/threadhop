@@ -679,6 +679,16 @@ fn push_message_highlighted<'a>(
     theme: &Theme,
     find_state: &crate::widgets::find_bar::FindState,
 ) {
+    // Wave 3 (Worker G) — CommandPill rows take the same shape in find-mode
+    // as in normal rendering. The pill label is a synthesized glyph + body,
+    // not the original message text, so threading find-bar highlights
+    // through it would surface false-positive ranges. Render the pill
+    // unchanged.
+    if is_command_pill_role(&msg.role) {
+        out.push(build_command_pill_line(msg, theme));
+        return;
+    }
+
     let role_style = style_for_role(&msg.role, theme);
     let muted = muted_style(theme);
     let row_bg = role_bg(&msg.role, theme);
@@ -787,28 +797,16 @@ fn push_message_highlighted<'a>(
 }
 
 fn push_message<'a>(out: &mut Vec<Line<'a>>, msg: &CleanedMessage, theme: &Theme) {
-    // Wave 2.5 — `command` and `skill_load` rows render as a single dim
-    // one-liner: gutter + space + glyph + label. NO header row. Worker G
-    // (Wave 3) will polish this into a proper CommandPill; for now we
-    // only need a non-panicking render path that obeys the Phase A
-    // gutter invariant.
+    // Wave 3 (Worker G) — `command` and `skill_load` rows render as a single
+    // dim one-liner: gutter + space + glyph + label. NO header row, NO role
+    // color accent on the gutter (theme.text_muted only — these are
+    // secondary events). The line is truncated to `COMMAND_PILL_MAX_WIDTH`
+    // chars with an ellipsis so the row never soft-wraps. The Phase A
+    // selection-tint walker still recognizes the gutter prefix; the
+    // foreground style on the gutter changing from role-color to muted is
+    // fine — the walker only checks `content == GUTTER_GLYPH`.
     if is_command_pill_role(&msg.role) {
-        let muted = muted_style(theme).add_modifier(Modifier::DIM);
-        let role_style = style_for_role(&msg.role, theme);
-        // Pre-pop matches the Python CommandPill glyph convention:
-        //   command    → `▶ /name`
-        //   skill_load → `✦ skill:<name>`
-        let label = match msg.role.as_str() {
-            "command" => format!("▶ {}", msg.text),
-            "skill_load" => format!("✦ skill:{}", msg.text),
-            _ => msg.text.clone(),
-        };
-        let spans: Vec<Span<'a>> = vec![
-            gutter_span_bg(role_style, None),
-            Span::styled(" ", Style::default()),
-            Span::styled(label, muted),
-        ];
-        out.push(Line::from(spans));
+        out.push(build_command_pill_line(msg, theme));
         return;
     }
 
@@ -885,6 +883,67 @@ fn push_message<'a>(out: &mut Vec<Line<'a>>, msg: &CleanedMessage, theme: &Theme
             out.push(line);
         }
     }
+}
+
+/// Maximum visual width (in display columns) for a CommandPill row before
+/// the text is truncated with `…`. The Python reference renders pills on a
+/// single line by relying on the parent widget's overflow ellipsis; here we
+/// don't know the column width at `push_message` time (the renderer applies
+/// `Wrap { trim: false }` afterwards), so we pre-truncate at a static cap
+/// that comfortably fits the sidebar-narrowed transcript pane (~60–80 cols
+/// after gutter + space). 60 chars is wide enough for realistic slash
+/// commands and the longest `superpowers:*` skill names without spilling.
+pub const COMMAND_PILL_MAX_WIDTH: usize = 60;
+
+/// Build the single `Line` for a `command` / `skill_load` row. Shared by
+/// `push_message` and `push_message_highlighted` so find-mode and normal
+/// rendering stay byte-for-byte identical for these rows (find-bar
+/// highlights are not applied — the pill text is a synthesized label, not
+/// the original message body, so highlight ranges would be meaningless).
+fn build_command_pill_line<'a>(msg: &CleanedMessage, theme: &Theme) -> Line<'a> {
+    let muted = muted_style(theme).add_modifier(Modifier::DIM);
+    // Python CommandPill source-of-truth glyphs:
+    //   command    → `▶ /foo`
+    //   skill_load → `✦ skill loaded: <name>`
+    let prefix = match msg.role.as_str() {
+        "command" => "\u{25B6} ",
+        "skill_load" => "\u{2726} skill loaded: ",
+        _ => "",
+    };
+    let label = format!("{prefix}{}", msg.text);
+    let truncated = truncate_display(&label, COMMAND_PILL_MAX_WIDTH);
+    // Gutter is muted + DIM (no role accent) — the row reads as a
+    // secondary event, not a turn boundary. `apply_selection_tint` only
+    // checks the gutter glyph's content, not its style, so this is safe.
+    let spans: Vec<Span<'a>> = vec![
+        Span::styled(GUTTER_GLYPH.to_string(), muted),
+        Span::styled(" ".to_string(), Style::default()),
+        Span::styled(truncated, muted),
+    ];
+    Line::from(spans)
+}
+
+/// Truncate `s` to at most `max_cols` display columns (per `unicode-width`),
+/// appending `…` if any truncation occurs. The ellipsis itself counts
+/// toward the budget so the final string never exceeds `max_cols`.
+fn truncate_display(s: &str, max_cols: usize) -> String {
+    if UnicodeWidthStr::width(s) <= max_cols {
+        return s.to_string();
+    }
+    // Reserve one column for the ellipsis.
+    let budget = max_cols.saturating_sub(1);
+    let mut out = String::with_capacity(s.len());
+    let mut used = 0usize;
+    for ch in s.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push('\u{2026}');
+    out
 }
 
 /// Estimate the rendered line index for the message at `target_index`. Used
@@ -2919,28 +2978,121 @@ mod tests {
 
     #[test]
     fn command_role_renders_as_single_dim_pill_with_gutter() {
-        // Wave 2.5 — `command` rows should render as ONE line starting
-        // with the gutter glyph and the `▶ /name` label. No header row.
+        // Wave 3 (Worker G) — `command` rows render as ONE line: gutter +
+        // space + `▶ /name` label. NO header row, NO role-color accent on
+        // the gutter (muted text only), and the text span carries the DIM
+        // modifier so it reads as a secondary event.
         let theme = Theme::default_dark();
         let mut m = cm("command", "/foo");
         m.uuid = "c1".into();
         let lines = build_lines(&[m], &theme);
         assert_eq!(lines.len(), 1, "command should be one line, got {lines:#?}");
+        // Phase A gutter invariant — first span content is exactly GUTTER_GLYPH.
         assert_eq!(lines[0].spans[0].content.as_ref(), GUTTER_GLYPH);
         let joined: String = lines[0].spans.iter().map(|s| s.content.to_string()).collect();
-        assert!(joined.contains("▶ /foo"), "got {joined:?}");
+        assert!(joined.contains("\u{25B6} /foo"), "got {joined:?}");
+        // Color: gutter + label use theme.text_muted, not theme.foreground.
+        let muted_fg =
+            super::theme_color(&theme.text_muted, ratatui::style::Color::DarkGray);
+        let fg_color =
+            super::theme_color(&theme.foreground, ratatui::style::Color::White);
+        let gutter_fg = lines[0].spans[0].style.fg.expect("gutter has fg");
+        let label_span = &lines[0].spans[2];
+        let label_fg = label_span.style.fg.expect("label has fg");
+        assert_eq!(gutter_fg, muted_fg, "gutter should be muted, not role-accent");
+        assert_eq!(label_fg, muted_fg, "label should be muted");
+        assert_ne!(label_fg, fg_color, "label must not be the regular foreground");
+        // DIM modifier on the label span.
+        assert!(
+            label_span.style.add_modifier.contains(Modifier::DIM),
+            "label span should carry Modifier::DIM, got {:?}",
+            label_span.style.add_modifier
+        );
     }
 
     #[test]
     fn skill_load_role_renders_as_single_dim_pill_with_gutter() {
+        // Wave 3 (Worker G) — `skill_load` rows render as ONE line: gutter
+        // + space + `✦ skill loaded: <name>` label. Same dim styling as
+        // the `command` pill; only the glyph + prefix wording differ.
         let theme = Theme::default_dark();
-        let mut m = cm("skill_load", "handoff");
+        let mut m = cm("skill_load", "superpowers:using-superpowers");
         m.uuid = "s1".into();
         let lines = build_lines(&[m], &theme);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].spans[0].content.as_ref(), GUTTER_GLYPH);
         let joined: String = lines[0].spans.iter().map(|s| s.content.to_string()).collect();
-        assert!(joined.contains("✦ skill:handoff"), "got {joined:?}");
+        assert!(
+            joined.contains("\u{2726} skill loaded: superpowers:using-superpowers")
+                || joined.contains("\u{2726} skill loaded: superpowers:using-superpow\u{2026}"),
+            "expected skill-loaded prefix + full skill name (or truncated form), got {joined:?}"
+        );
+        let muted_fg =
+            super::theme_color(&theme.text_muted, ratatui::style::Color::DarkGray);
+        let gutter_fg = lines[0].spans[0].style.fg.expect("gutter has fg");
+        assert_eq!(gutter_fg, muted_fg);
+        let label_span = &lines[0].spans[2];
+        assert_eq!(label_span.style.fg.expect("label fg"), muted_fg);
+        assert!(label_span.style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn command_pill_truncates_long_text_with_ellipsis() {
+        // Feed a 200-char command body. The rendered pill must be a single
+        // line whose label is ≤ COMMAND_PILL_MAX_WIDTH display columns and
+        // ends with `…`.
+        let theme = Theme::default_dark();
+        let long = "/".to_string() + &"x".repeat(199);
+        assert_eq!(long.len(), 200);
+        let mut m = cm("command", &long);
+        m.uuid = "long".into();
+        let lines = build_lines(&[m], &theme);
+        assert_eq!(lines.len(), 1, "pill must collapse to one line even for long text");
+        let label = lines[0].spans[2].content.to_string();
+        let width = UnicodeWidthStr::width(label.as_str());
+        assert!(
+            width <= COMMAND_PILL_MAX_WIDTH,
+            "label width {width} exceeds cap {COMMAND_PILL_MAX_WIDTH}: {label:?}"
+        );
+        assert!(label.ends_with('\u{2026}'), "label should end with `…`, got {label:?}");
+    }
+
+    #[test]
+    fn command_pill_short_text_is_not_truncated() {
+        // Sanity guardrail — a short label must NOT pick up a stray ellipsis.
+        let theme = Theme::default_dark();
+        let m = cm("command", "/foo");
+        let lines = build_lines(&[m], &theme);
+        let label = lines[0].spans[2].content.to_string();
+        assert!(!label.ends_with('\u{2026}'), "short label gained an ellipsis: {label:?}");
+        assert_eq!(label, "\u{25B6} /foo");
+    }
+
+    #[test]
+    fn command_pill_in_find_mode_uses_same_styling() {
+        // Wave 3 — `build_lines_with_highlights` (the find-mode renderer)
+        // must produce the same shape as `build_lines` for command and
+        // skill_load rows. Find-bar highlights are a no-op on synthesized
+        // pill labels (the body is the rendered glyph + name, not the
+        // original message text).
+        use crate::widgets::find_bar::FindState;
+        let theme = Theme::default_dark();
+        let msgs = vec![cm("command", "/foo"), cm("skill_load", "handoff")];
+        let normal = build_lines(&msgs, &theme);
+        let with_hl = build_lines_with_highlights(&msgs, &theme, &FindState::default());
+        assert_eq!(
+            normal.len(),
+            with_hl.len(),
+            "find-mode must emit identical row count for pills, got normal={} hl={}",
+            normal.len(),
+            with_hl.len()
+        );
+        // Per-row, the gutter glyph and label content match byte-for-byte.
+        for (n, h) in normal.iter().zip(with_hl.iter()) {
+            let n_join: String = n.spans.iter().map(|s| s.content.to_string()).collect();
+            let h_join: String = h.spans.iter().map(|s| s.content.to_string()).collect();
+            assert_eq!(n_join, h_join, "pill text drifted between normal and find-mode");
+        }
     }
 
     #[test]
