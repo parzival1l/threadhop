@@ -258,6 +258,9 @@ mod tests {
             parent_uuid: None,
             is_sidechain: 0,
             message_id: None,
+            usage: None,
+            model: None,
+            tool_name: None,
         }
     }
 

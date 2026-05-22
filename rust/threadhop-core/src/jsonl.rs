@@ -86,6 +86,94 @@ pub fn clean_user_text(text: &str) -> String {
     s3.trim().to_string()
 }
 
+/// `<command-name>...</command-name>` — narrow regex used to extract the
+/// command name when we want to emit a CommandPill row alongside (or
+/// instead of) the user message it sat inside.
+static COMMAND_NAME_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?s)<command-name>(.*?)</command-name>").unwrap());
+
+/// Classification of a single user JSONL line's content, used by
+/// `parse_byte_range` to decide which row types to emit.
+///
+/// Mirrors the spirit of Python's `indexer.classify_user_text`, but designed
+/// for the Rust emitter's needs: if a user line contained both a slash-command
+/// invocation AND prose, the Python TUI joins them into one row whereas our
+/// emitter wants to surface a separate `command` row BEFORE the user row. We
+/// keep both pieces by tracking the slash-command name alongside the cleaned
+/// residue.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UserLineKind {
+    /// Pure slash-command invocation with no surrounding prose. Emit one
+    /// command row, no user row.
+    Command { name: String },
+    /// Skill-load banner. Emit one skill_load row, no user row.
+    SkillLoad { name: String },
+    /// Normal user prose. `cleaned` is the user-visible text; if
+    /// `command_prefix` is `Some`, the user typed prose alongside a
+    /// slash-command and the caller should emit a command row BEFORE
+    /// the user row.
+    User {
+        cleaned: String,
+        command_prefix: Option<String>,
+    },
+    /// Nothing user-visible after cleaning. Emit no row.
+    Empty,
+}
+
+/// Classify a user JSONL line's content (Wave 2.5).
+///
+/// Used by `parse_byte_range` to fan a single user line out into 0, 1, or 2
+/// rows (command + user combination). The classification reads the same
+/// markup that `clean_user_text` strips, but reports the kind first so the
+/// caller can choose which row(s) to emit.
+pub fn classify_user_text(text: &str) -> UserLineKind {
+    let s1 = SYSTEM_REMINDER_RE.replace_all(text, "");
+    let s2 = LOCAL_COMMAND_BLOCK_RE.replace_all(&s1, "");
+    let cleaned_pre: String = s2.into_owned();
+
+    let cmd_name: Option<String> = COMMAND_NAME_RE
+        .captures(&cleaned_pre)
+        .and_then(|c| c.get(1).map(|m| m.as_str().trim().to_string()))
+        .filter(|s| !s.is_empty());
+    let residue = COMMAND_BLOCK_RE
+        .replace_all(&cleaned_pre, "")
+        .trim()
+        .to_string();
+
+    if let Some(name) = &cmd_name {
+        if residue.is_empty() {
+            return UserLineKind::Command { name: name.clone() };
+        }
+    }
+
+    if !residue.is_empty() {
+        if let Some(banner) = SKILL_LOAD_BANNER_RE.captures(residue.trim_start()) {
+            let path = banner
+                .get(1)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
+            let name = if path.is_empty() {
+                "skill".to_string()
+            } else {
+                Path::new(&path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "skill".to_string())
+            };
+            return UserLineKind::SkillLoad { name };
+        }
+    }
+
+    if residue.is_empty() {
+        return UserLineKind::Empty;
+    }
+
+    UserLineKind::User {
+        cleaned: residue,
+        command_prefix: cmd_name,
+    }
+}
+
 /// Render a `tool_use` block as one human-readable line.
 ///
 /// Mirrors `indexer.abbreviate_tool_use`. Kept in lockstep with the TUI
@@ -181,17 +269,46 @@ pub fn abbreviate_tool_use(tool_name: &str, tool_input: &serde_json::Value) -> S
 
 // --- parse_byte_range --------------------------------------------------------
 
-/// One cleaned message group, mirroring the dict that Python's
-/// `indexer.parse_byte_range` yields. Field order and `null` shape match
-/// the Python output so the golden parity test compares as a JSON value.
+/// Per-assistant-row usage counters lifted from `message.usage`.
+///
+/// Wave 2.5 enrichment — Worker H's SessionDigest builder needs raw token
+/// counts (input/output/cache) to populate the digest header. Held on
+/// `CleanedMessage` only for `role == "assistant"`; everything else carries
+/// `None`. Field names mirror the JSONL keys exactly (`input_tokens`,
+/// `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`)
+/// so a future serde-driven path can deserialize them directly without a
+/// rename layer.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct MessageUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+}
+
+/// One cleaned message group.
+///
+/// Originally mirrored Python's `indexer.parse_byte_range` output dict
+/// (user + assistant rows). Wave 2.5 enriches the contract: the parser also
+/// emits `command`, `skill_load`, and `tool` rows so downstream widgets
+/// (CommandPill, tool-fold, SessionDigest) can reason about each turn type
+/// without re-parsing the JSONL. The Python TUI does the same classification
+/// in `tui/widgets/transcript.py::classify_user_text` and tool-block split —
+/// pushing it into `parse_byte_range` keeps the Rust port single-source.
 ///
 /// `is_sidechain` is serialized as 0 / 1 (matching Python's `int` cast) — the
 /// indexer's DB schema stores it as an integer and the Python contract is to
 /// emit the same shape from this function.
+///
+/// The Wave 2.5 fields (`usage`, `model`, `tool_name`) use
+/// `skip_serializing_if = "Option::is_none"` so rows that don't carry them
+/// (every non-assistant row for usage/model; every non-tool row for
+/// tool_name) stay byte-clean in golden-fixture comparisons.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct CleanedMessage {
     pub uuid: String,
     pub session_id: Option<String>,
+    /// One of: `"user"`, `"assistant"`, `"tool"`, `"command"`, `"skill_load"`.
     pub role: String,
     pub text: String,
     pub timestamp: Option<String>,
@@ -199,15 +316,59 @@ pub struct CleanedMessage {
     pub parent_uuid: Option<String>,
     pub is_sidechain: i64,
     pub message_id: Option<String>,
+    /// Token counters from `message.usage`. Populated on assistant rows
+    /// when the JSONL carries a `usage` object; `None` everywhere else.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub usage: Option<MessageUsage>,
+    /// `message.model` — populated on assistant rows when present.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub model: Option<String>,
+    /// Tool name (e.g. `"Bash"`, `"Read"`). Populated only on
+    /// `role == "tool"` rows; the human-readable summary lives in
+    /// `text`. `None` everywhere else.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tool_name: Option<String>,
 }
 
-/// Parse a JSONL byte range into cleaned message groups.
+/// One extracted tool_use block, with enough metadata to emit a `tool` row.
+struct ExtractedTool {
+    uuid: String,
+    name: String,
+    summary: String,
+}
+
+/// Parsed assistant blocks for one JSONL line: text content + tool_use blocks
+/// in order. `tool_use` rows are emitted AFTER the assistant text row, in
+/// document order across the merged chunks.
+struct AssistantBlocks {
+    /// Plain text parts (already cleaned via `strip_system_reminders`).
+    /// Joined `"\n\n"` to form the assistant row body.
+    text_parts: Vec<String>,
+    /// Tool calls in document order.
+    tools: Vec<ExtractedTool>,
+}
+
+/// Parse a JSONL byte range into cleaned message groups (Wave 2.5).
 ///
-/// Direct port of `threadhop_core.indexer.parse_byte_range`. Applies ADR-003
-/// chunk-merging (consecutive assistant lines sharing `message.id` collapse
-/// into one row), strips `<system-reminder>` blocks, skips tool-result user
-/// lines (those that carry a `toolUseResult`), and abbreviates `tool_use`
-/// blocks. Empty rows are dropped.
+/// Applies ADR-003 chunk-merging (consecutive assistant lines sharing
+/// `message.id` collapse into one row), strips `<system-reminder>` blocks,
+/// and classifies user lines via [`classify_user_text`].
+///
+/// Wave 2.5 expansion — emits new row types so downstream widgets can
+/// reason about each turn:
+/// * `role: "command"` — a slash-command invocation lifted from a user line.
+///   Followed by a `user` row if the line carried prose alongside the
+///   command.
+/// * `role: "skill_load"` — a Claude Code skill-load banner lifted from a
+///   user line.
+/// * `role: "tool"` — one per `tool_use` block, emitted after the
+///   corresponding assistant row. Carries the abbreviated summary in
+///   `text` and the tool name in `tool_name`. Tool-result user lines
+///   (carrying `toolUseResult`) are folded into the most recent tool row
+///   as a `↳ <result>` suffix on `text`.
+///
+/// Assistant rows additionally carry `message.usage` (input/output/cache
+/// token counts) and `message.model` when present in the JSONL.
 ///
 /// Malformed JSON lines and lines with non-object roots / unknown types are
 /// silently skipped — one corrupt line should not abort the rest.
@@ -228,10 +389,14 @@ pub fn parse_byte_range(
     let mut groups: Vec<CleanedMessage> = Vec::new();
     let mut current_chunk: Option<CleanedMessage> = None;
     let mut current_chunk_parts: Vec<String> = Vec::new();
+    // Tools accumulated for the in-flight assistant chunk; emitted after
+    // its text row when the chunk flushes.
+    let mut current_chunk_tools: Vec<ExtractedTool> = Vec::new();
 
     fn flush_chunk(
         current_chunk: &mut Option<CleanedMessage>,
         current_chunk_parts: &mut Vec<String>,
+        current_chunk_tools: &mut Vec<ExtractedTool>,
         groups: &mut Vec<CleanedMessage>,
     ) {
         if let Some(mut row) = current_chunk.take() {
@@ -244,13 +409,44 @@ pub fn parse_byte_range(
                 .collect::<Vec<_>>()
                 .join("\n\n");
             row.text = joined.trim().to_string();
+            // Carry session/timestamp/cwd from the assistant row onto each
+            // tool row so downstream consumers (digest, render, copy)
+            // don't have to back-reference the parent.
+            let parent_session = row.session_id.clone();
+            let parent_timestamp = row.timestamp.clone();
+            let parent_cwd = row.cwd.clone();
+            let parent_is_sidechain = row.is_sidechain;
+            let parent_message_id = row.message_id.clone();
+            let parent_uuid_of_tools = row.uuid.clone();
+            let emit_assistant = !row.text.is_empty();
             current_chunk_parts.clear();
-            if !row.text.is_empty() {
+            if emit_assistant {
                 groups.push(row);
+            }
+            // Emit one tool row per tool_use block. Tools are emitted even
+            // if the assistant row had no text — Claude often replies with
+            // a pure tool call (no preface), and we still need the tool
+            // row to drive the fold + digest counters.
+            for tool in current_chunk_tools.drain(..) {
+                groups.push(CleanedMessage {
+                    uuid: tool.uuid,
+                    session_id: parent_session.clone(),
+                    role: "tool".to_string(),
+                    text: tool.summary,
+                    timestamp: parent_timestamp.clone(),
+                    cwd: parent_cwd.clone(),
+                    parent_uuid: Some(parent_uuid_of_tools.clone()),
+                    is_sidechain: parent_is_sidechain,
+                    message_id: parent_message_id.clone(),
+                    usage: None,
+                    model: None,
+                    tool_name: Some(tool.name),
+                });
             }
         } else {
             // Nothing to flush; still clear parts to mirror Python's reset.
             current_chunk_parts.clear();
+            current_chunk_tools.clear();
         }
     }
 
@@ -272,24 +468,52 @@ pub fn parse_byte_range(
         }
 
         if mtype == "user" {
-            flush_chunk(&mut current_chunk, &mut current_chunk_parts, &mut groups);
-
-            // Skip tool-output user lines: anything with a non-null
-            // `toolUseResult` is the harness writing tool output, not a
-            // human message — would dominate FTS otherwise.
-            if obj
+            // Tool-result user line: fold its result text into the most
+            // recently emitted tool row (if any) as a `↳ <snippet>` suffix.
+            // This is the data the digest builder needs to compute success
+            // / failure rates, and what Worker E's fold uses to keep the
+            // collapsed summary informative.
+            let is_tool_result = obj
                 .get("toolUseResult")
                 .map(|v| !v.is_null())
-                .unwrap_or(false)
-            {
+                .unwrap_or(false);
+            if is_tool_result {
+                // Flush in-flight assistant FIRST so the tool rows it owns
+                // are already in `groups` and we can attach the result to
+                // the last one.
+                flush_chunk(
+                    &mut current_chunk,
+                    &mut current_chunk_parts,
+                    &mut current_chunk_tools,
+                    &mut groups,
+                );
+                let snippet = extract_tool_result_snippet(obj);
+                if !snippet.is_empty() {
+                    if let Some(last_tool) = groups
+                        .iter_mut()
+                        .rev()
+                        .find(|m| m.role == "tool")
+                    {
+                        // Only attach if the parent_uuid lines up with the
+                        // referenced tool_use_id (when available); otherwise
+                        // attach to the most-recent tool unconditionally.
+                        last_tool.text.push_str("\n↳ ");
+                        last_tool.text.push_str(&snippet);
+                    }
+                }
                 continue;
             }
+
+            flush_chunk(
+                &mut current_chunk,
+                &mut current_chunk_parts,
+                &mut current_chunk_tools,
+                &mut groups,
+            );
 
             let raw_text = match obj.get("message").and_then(|m| m.get("content")) {
                 Some(serde_json::Value::String(s)) => s.clone(),
                 Some(serde_json::Value::Array(arr)) => {
-                    // Python: " ".join(b.get("text","") for b in content
-                    //                   if isinstance(b, dict) and b.get("type") == "text")
                     let parts: Vec<String> = arr
                         .iter()
                         .filter_map(|b| {
@@ -311,11 +535,6 @@ pub fn parse_byte_range(
                 _ => continue,
             };
 
-            let cleaned = clean_user_text(&raw_text);
-            if cleaned.is_empty() {
-                continue;
-            }
-
             let uid = match obj.get("uuid").and_then(|x| x.as_str()) {
                 Some(u) => u.to_string(),
                 None => continue,
@@ -325,36 +544,109 @@ pub fn parse_byte_range(
                 .and_then(|x| x.as_str())
                 .map(|s| s.to_string())
                 .or_else(|| fallback_session_id.map(|s| s.to_string()));
+            let timestamp = obj
+                .get("timestamp")
+                .and_then(|x| x.as_str())
+                .map(String::from);
+            let cwd = obj.get("cwd").and_then(|x| x.as_str()).map(String::from);
+            let parent_uuid = obj
+                .get("parentUuid")
+                .and_then(|x| x.as_str())
+                .map(String::from);
+            let is_sidechain = if obj
+                .get("isSidechain")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false)
+            {
+                1
+            } else {
+                0
+            };
+            let message_id = obj
+                .get("message")
+                .and_then(|m| m.get("id"))
+                .and_then(|x| x.as_str())
+                .map(String::from);
 
-            groups.push(CleanedMessage {
-                uuid: uid,
-                session_id: sid,
-                role: "user".to_string(),
-                text: cleaned,
-                timestamp: obj
-                    .get("timestamp")
-                    .and_then(|x| x.as_str())
-                    .map(String::from),
-                cwd: obj.get("cwd").and_then(|x| x.as_str()).map(String::from),
-                parent_uuid: obj
-                    .get("parentUuid")
-                    .and_then(|x| x.as_str())
-                    .map(String::from),
-                is_sidechain: if obj
-                    .get("isSidechain")
-                    .and_then(|x| x.as_bool())
-                    .unwrap_or(false)
-                {
-                    1
-                } else {
-                    0
-                },
-                message_id: obj
-                    .get("message")
-                    .and_then(|m| m.get("id"))
-                    .and_then(|x| x.as_str())
-                    .map(String::from),
-            });
+            // Wave 2.5: classify the line. A pure slash-command emits ONE
+            // command row; a pure skill-load banner emits ONE skill_load
+            // row; user prose alongside a slash-command emits a command
+            // row FOLLOWED BY a user row sharing the same uuid (suffixed
+            // for the command row so the two rows have distinct ids).
+            match classify_user_text(&raw_text) {
+                UserLineKind::Empty => continue,
+                UserLineKind::Command { name } => {
+                    groups.push(CleanedMessage {
+                        uuid: uid,
+                        session_id: sid,
+                        role: "command".to_string(),
+                        text: name,
+                        timestamp,
+                        cwd,
+                        parent_uuid,
+                        is_sidechain,
+                        message_id,
+                        usage: None,
+                        model: None,
+                        tool_name: None,
+                    });
+                }
+                UserLineKind::SkillLoad { name } => {
+                    groups.push(CleanedMessage {
+                        uuid: uid,
+                        session_id: sid,
+                        role: "skill_load".to_string(),
+                        text: name,
+                        timestamp,
+                        cwd,
+                        parent_uuid,
+                        is_sidechain,
+                        message_id,
+                        usage: None,
+                        model: None,
+                        tool_name: None,
+                    });
+                }
+                UserLineKind::User {
+                    cleaned,
+                    command_prefix,
+                } => {
+                    if let Some(cmd) = command_prefix {
+                        // Distinct uuid for the command row so selection /
+                        // bookmark code never sees a uuid collision. Suffix
+                        // is stable + reproducible.
+                        let cmd_uuid = format!("{uid}::cmd");
+                        groups.push(CleanedMessage {
+                            uuid: cmd_uuid,
+                            session_id: sid.clone(),
+                            role: "command".to_string(),
+                            text: cmd,
+                            timestamp: timestamp.clone(),
+                            cwd: cwd.clone(),
+                            parent_uuid: parent_uuid.clone(),
+                            is_sidechain,
+                            message_id: message_id.clone(),
+                            usage: None,
+                            model: None,
+                            tool_name: None,
+                        });
+                    }
+                    groups.push(CleanedMessage {
+                        uuid: uid,
+                        session_id: sid,
+                        role: "user".to_string(),
+                        text: cleaned,
+                        timestamp,
+                        cwd,
+                        parent_uuid,
+                        is_sidechain,
+                        message_id,
+                        usage: None,
+                        model: None,
+                        tool_name: None,
+                    });
+                }
+            }
             continue;
         }
 
@@ -364,18 +656,38 @@ pub fn parse_byte_range(
             .and_then(|m| m.get("id"))
             .and_then(|x| x.as_str())
             .map(String::from);
-        let parts = extract_assistant_blocks(obj);
+        let blocks = extract_assistant_blocks(obj);
 
-        // ADR-003: continuing the same logical message → accumulate.
+        // ADR-003: continuing the same logical message → accumulate text
+        // AND tools onto the in-flight chunk.
         if let (Some(mid_ref), Some(current)) = (mid.as_ref(), current_chunk.as_ref()) {
             if current.message_id.as_ref() == Some(mid_ref) {
-                current_chunk_parts.extend(parts);
+                current_chunk_parts.extend(blocks.text_parts);
+                current_chunk_tools.extend(blocks.tools);
+                // If this continuation chunk carries a fresh usage/model
+                // (typically the final chunk of a streaming response), let
+                // it override the in-flight values. The earlier chunks
+                // typically don't have full usage stats anyway.
+                let (new_usage, new_model) = extract_usage_and_model(obj);
+                if let Some(row) = current_chunk.as_mut() {
+                    if new_usage.is_some() {
+                        row.usage = new_usage;
+                    }
+                    if new_model.is_some() {
+                        row.model = new_model;
+                    }
+                }
                 continue;
             }
         }
 
         // Different message.id (or no in-flight buffer) → flush + start fresh.
-        flush_chunk(&mut current_chunk, &mut current_chunk_parts, &mut groups);
+        flush_chunk(
+            &mut current_chunk,
+            &mut current_chunk_parts,
+            &mut current_chunk_tools,
+            &mut groups,
+        );
 
         let uid = match obj.get("uuid").and_then(|x| x.as_str()) {
             Some(u) => u.to_string(),
@@ -386,6 +698,7 @@ pub fn parse_byte_range(
             .and_then(|x| x.as_str())
             .map(|s| s.to_string())
             .or_else(|| fallback_session_id.map(|s| s.to_string()));
+        let (usage, model) = extract_usage_and_model(obj);
 
         current_chunk = Some(CleanedMessage {
             uuid: uid,
@@ -411,24 +724,34 @@ pub fn parse_byte_range(
                 0
             },
             message_id: mid,
+            usage,
+            model,
+            tool_name: None,
         });
-        current_chunk_parts = parts;
+        current_chunk_parts = blocks.text_parts;
+        current_chunk_tools = blocks.tools;
     }
 
     // Flush the last chunk.
-    flush_chunk(&mut current_chunk, &mut current_chunk_parts, &mut groups);
+    flush_chunk(
+        &mut current_chunk,
+        &mut current_chunk_parts,
+        &mut current_chunk_tools,
+        &mut groups,
+    );
     groups
 }
 
-/// Extract text + abbreviated tool-call snippets from one assistant JSONL
-/// object. `thinking` and other block types are dropped — same as
+/// Extract text + tool_use blocks from one assistant JSONL object.
+/// `thinking` and other block types are dropped — same as
 /// `indexer._extract_assistant_blocks(include_tool_calls=True)`.
-fn extract_assistant_blocks(obj: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
+fn extract_assistant_blocks(obj: &serde_json::Map<String, serde_json::Value>) -> AssistantBlocks {
     let content = match obj.get("message").and_then(|m| m.get("content")) {
         Some(serde_json::Value::Array(a)) => a,
-        _ => return Vec::new(),
+        _ => return AssistantBlocks { text_parts: Vec::new(), tools: Vec::new() },
     };
-    let mut out: Vec<String> = Vec::new();
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut tools: Vec<ExtractedTool> = Vec::new();
     for block in content {
         let bo = match block.as_object() {
             Some(b) => b,
@@ -440,19 +763,121 @@ fn extract_assistant_blocks(obj: &serde_json::Map<String, serde_json::Value>) ->
                     bo.get("text").and_then(|x| x.as_str()).unwrap_or(""),
                 );
                 if !t.is_empty() {
-                    out.push(t);
+                    text_parts.push(t);
                 }
             }
             Some("tool_use") => {
-                let name = bo.get("name").and_then(|x| x.as_str()).unwrap_or("Unknown");
+                let name = bo
+                    .get("name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("Unknown")
+                    .to_string();
                 let empty = serde_json::Value::Object(serde_json::Map::new());
                 let input = bo.get("input").unwrap_or(&empty);
-                out.push(abbreviate_tool_use(name, input));
+                let summary = abbreviate_tool_use(&name, input);
+                // tool_use blocks carry a per-call `id` field — prefer that
+                // when present so tool_result lines can be cross-referenced.
+                // Fall back to a derived uuid based on position so unique
+                // per-tool ids are still emitted.
+                let tool_uuid = bo
+                    .get("id")
+                    .and_then(|x| x.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| format!("tool-{}-{}", name, tools.len()));
+                tools.push(ExtractedTool {
+                    uuid: tool_uuid,
+                    name,
+                    summary,
+                });
             }
             _ => {} // thinking, etc. — skipped
         }
     }
-    out
+    AssistantBlocks { text_parts, tools }
+}
+
+/// Pull `message.usage` and `message.model` from a JSONL assistant object.
+/// Both fields are optional — older transcripts and synthetic streams may
+/// omit one or both. Returns `(None, None)` when neither is present.
+fn extract_usage_and_model(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> (Option<MessageUsage>, Option<String>) {
+    let message = match obj.get("message") {
+        Some(serde_json::Value::Object(m)) => m,
+        _ => return (None, None),
+    };
+    let model = message
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let usage = message
+        .get("usage")
+        .and_then(|v| v.as_object())
+        .map(|u| MessageUsage {
+            input_tokens: u
+                .get("input_tokens")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0),
+            output_tokens: u
+                .get("output_tokens")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0),
+            cache_creation_input_tokens: u
+                .get("cache_creation_input_tokens")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0),
+            cache_read_input_tokens: u
+                .get("cache_read_input_tokens")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0),
+        });
+    (usage, model)
+}
+
+/// Pull a one-line snippet from a `toolUseResult` payload. Result payloads
+/// arrive in a few shapes:
+/// * `{"output": "..."}` — Bash / Read / Grep — string output.
+/// * `{"content": [{"type": "text", "text": "..."}, ...]}` — Claude Code
+///   wrapper shape, mirroring tool_use block layout.
+/// * Bare strings — older transcripts.
+///
+/// We collapse newlines to spaces and trim to ~120 chars so the `↳` suffix
+/// stays a single visible line.
+fn extract_tool_result_snippet(obj: &serde_json::Map<String, serde_json::Value>) -> String {
+    let raw = match obj.get("toolUseResult") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Object(m)) => {
+            if let Some(s) = m.get("output").and_then(|v| v.as_str()) {
+                s.to_string()
+            } else if let Some(arr) = m.get("content").and_then(|v| v.as_array()) {
+                arr.iter()
+                    .filter_map(|b| {
+                        let bo = b.as_object()?;
+                        if bo.get("type").and_then(|t| t.as_str())? == "text" {
+                            Some(
+                                bo.get("text")
+                                    .and_then(|t| t.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                            )
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                return String::new();
+            }
+        }
+        _ => return String::new(),
+    };
+    let collapsed: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > 120 {
+        collapsed.chars().take(117).collect::<String>() + "..."
+    } else {
+        collapsed
+    }
 }
 
 // --- read_session_metadata ---------------------------------------------------
@@ -655,6 +1080,10 @@ mod tests {
     #[test]
     fn clean_user_text_drops_skill_load_banner() {
         let s = "Base directory for this skill: /path/to/skill\n\n# heading\n";
+        // clean_user_text() still drops the banner from the cleaned text
+        // it returns (the user row body); the parser separately emits a
+        // dedicated skill_load row via classify_user_text — covered by
+        // `parse_byte_range_emits_skill_load_row_for_banner` below.
         assert_eq!(clean_user_text(s), "");
     }
 
@@ -667,7 +1096,57 @@ mod tests {
     #[test]
     fn clean_user_text_strips_command_blocks() {
         let s = "<command-name>/foo</command-name>hello";
+        // Same as above: clean_user_text still strips the markup from the
+        // residue, while classify_user_text + parse_byte_range surface the
+        // slash-command name on a separate `command` row.
         assert_eq!(clean_user_text(s), "hello");
+    }
+
+    #[test]
+    fn classify_user_text_pure_command_returns_command_kind() {
+        let s = "<command-name>/foo</command-name>";
+        match classify_user_text(s) {
+            UserLineKind::Command { name } => assert_eq!(name, "/foo"),
+            other => panic!("expected Command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_user_text_skill_load_returns_skill_name() {
+        let s = "Base directory for this skill: /Users/x/.claude/skills/handoff\n# Title";
+        match classify_user_text(s) {
+            UserLineKind::SkillLoad { name } => assert_eq!(name, "handoff"),
+            other => panic!("expected SkillLoad, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_user_text_user_prose_alongside_command_carries_prefix() {
+        let s = "<command-name>/foo</command-name>some prose follows";
+        match classify_user_text(s) {
+            UserLineKind::User {
+                cleaned,
+                command_prefix,
+            } => {
+                assert_eq!(cleaned, "some prose follows");
+                assert_eq!(command_prefix.as_deref(), Some("/foo"));
+            }
+            other => panic!("expected User w/ prefix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_user_text_plain_returns_user() {
+        match classify_user_text("just chatting") {
+            UserLineKind::User {
+                cleaned,
+                command_prefix,
+            } => {
+                assert_eq!(cleaned, "just chatting");
+                assert!(command_prefix.is_none());
+            }
+            other => panic!("expected plain user, got {other:?}"),
+        }
     }
 
     #[test]
@@ -865,11 +1344,143 @@ mod tests {
         assert!(preview.ends_with('\u{1F600}'));
     }
 
+    // ---- Wave 2.5 parser enrichment -----------------------------------
+
     #[test]
-    fn parse_byte_range_matches_python_golden() {
-        // ADR-003 parity check. Fixture captured from the real Python
-        // `parse_byte_range` against a vendored threadhop session — see
-        // tests/fixtures/sample_session.jsonl and sample_session_expected.json.
+    fn parse_byte_range_emits_command_row_for_slash_command() {
+        // A user line whose content is ONLY `<command-name>/foo</command-name>`
+        // should emit a single `command` row carrying the slash-command name.
+        let raw = br#"{"type":"user","uuid":"u1","sessionId":"s1","message":{"content":"<command-name>/foo</command-name>"}}"#;
+        let got = parse_byte_range(raw, None);
+        assert_eq!(got.len(), 1, "expected one row, got {got:#?}");
+        assert_eq!(got[0].role, "command");
+        assert_eq!(got[0].text, "/foo");
+        assert_eq!(got[0].uuid, "u1");
+    }
+
+    #[test]
+    fn parse_byte_range_emits_command_then_user_for_mixed_content() {
+        // User typed prose alongside a slash-command — emit two rows:
+        // command first (suffixed uuid), then user (original uuid).
+        let raw = br#"{"type":"user","uuid":"u1","sessionId":"s1","message":{"content":"<command-name>/foo</command-name>some prose"}}"#;
+        let got = parse_byte_range(raw, None);
+        assert_eq!(got.len(), 2, "expected command + user, got {got:#?}");
+        assert_eq!(got[0].role, "command");
+        assert_eq!(got[0].text, "/foo");
+        assert_eq!(got[0].uuid, "u1::cmd");
+        assert_eq!(got[1].role, "user");
+        assert_eq!(got[1].text, "some prose");
+        assert_eq!(got[1].uuid, "u1");
+    }
+
+    #[test]
+    fn parse_byte_range_emits_skill_load_row_for_banner() {
+        let raw = br#"{"type":"user","uuid":"u1","sessionId":"s1","message":{"content":"Base directory for this skill: /Users/x/.claude/skills/handoff\n\n# body"}}"#;
+        let got = parse_byte_range(raw, None);
+        assert_eq!(got.len(), 1, "expected skill_load row only, got {got:#?}");
+        assert_eq!(got[0].role, "skill_load");
+        assert_eq!(got[0].text, "handoff");
+    }
+
+    #[test]
+    fn parse_byte_range_emits_tool_rows_after_assistant() {
+        // Assistant message with text + two tool_use blocks should produce
+        // 1 assistant row + 2 tool rows in that order.
+        let raw = br#"{"type":"assistant","uuid":"a1","sessionId":"s1","message":{"id":"m1","model":"claude-opus","content":[{"type":"text","text":"sure"},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls -la"}},{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"/a/b/c.txt"}}],"usage":{"input_tokens":10,"output_tokens":5}}}"#;
+        let got = parse_byte_range(raw, None);
+        assert_eq!(got.len(), 3, "expected assistant + 2 tools, got {got:#?}");
+        assert_eq!(got[0].role, "assistant");
+        assert_eq!(got[0].text, "sure");
+        assert_eq!(got[1].role, "tool");
+        assert_eq!(got[1].tool_name.as_deref(), Some("Bash"));
+        assert_eq!(got[1].text, "Running ls");
+        assert_eq!(got[1].uuid, "t1");
+        assert_eq!(got[2].role, "tool");
+        assert_eq!(got[2].tool_name.as_deref(), Some("Read"));
+        assert_eq!(got[2].text, "Reading c.txt");
+    }
+
+    #[test]
+    fn parse_byte_range_emits_tool_row_when_assistant_has_no_text() {
+        // Pure-tool-call turn (no preface text) still emits the tool row.
+        // Otherwise the digest would never see solo tool calls.
+        let raw = br#"{"type":"assistant","uuid":"a1","sessionId":"s1","message":{"id":"m1","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"pwd"}}]}}"#;
+        let got = parse_byte_range(raw, None);
+        assert_eq!(got.len(), 1, "expected just the tool row, got {got:#?}");
+        assert_eq!(got[0].role, "tool");
+        assert_eq!(got[0].tool_name.as_deref(), Some("Bash"));
+    }
+
+    #[test]
+    fn parse_byte_range_folds_tool_result_into_preceding_tool_row() {
+        // tool_use followed by a user line carrying toolUseResult should
+        // attach the result snippet to the tool row's text as `↳ <snippet>`.
+        let raw = br#"{"type":"assistant","uuid":"a1","sessionId":"s1","message":{"id":"m1","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"echo hi"}}]}}
+{"type":"user","uuid":"u1","sessionId":"s1","toolUseResult":{"output":"hi\n"},"message":{"content":""}}
+"#;
+        let got = parse_byte_range(raw, None);
+        assert_eq!(got.len(), 1, "tool row only, got {got:#?}");
+        assert_eq!(got[0].role, "tool");
+        assert!(
+            got[0].text.contains("↳ hi"),
+            "expected ↳ suffix, got {:?}",
+            got[0].text
+        );
+    }
+
+    #[test]
+    fn parse_byte_range_retains_message_usage_on_assistant_row() {
+        let raw = br#"{"type":"assistant","uuid":"a1","sessionId":"s1","message":{"id":"m1","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":12,"output_tokens":3,"cache_creation_input_tokens":1,"cache_read_input_tokens":2}}}"#;
+        let got = parse_byte_range(raw, None);
+        assert_eq!(got.len(), 1);
+        let u = got[0].usage.as_ref().expect("usage populated");
+        assert_eq!(u.input_tokens, 12);
+        assert_eq!(u.output_tokens, 3);
+        assert_eq!(u.cache_creation_input_tokens, 1);
+        assert_eq!(u.cache_read_input_tokens, 2);
+    }
+
+    #[test]
+    fn parse_byte_range_retains_model_on_assistant_row() {
+        let raw = br#"{"type":"assistant","uuid":"a1","sessionId":"s1","message":{"id":"m1","model":"claude-3-5-sonnet-20241022","content":[{"type":"text","text":"hi"}]}}"#;
+        let got = parse_byte_range(raw, None);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].model.as_deref(), Some("claude-3-5-sonnet-20241022"));
+    }
+
+    #[test]
+    fn parse_byte_range_assistant_without_usage_is_none() {
+        let raw = br#"{"type":"assistant","uuid":"a1","sessionId":"s1","message":{"id":"m1","content":[{"type":"text","text":"hi"}]}}"#;
+        let got = parse_byte_range(raw, None);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].usage.is_none());
+        assert!(got[0].model.is_none());
+    }
+
+    #[test]
+    fn parse_byte_range_merge_preserves_tool_blocks_in_order() {
+        // ADR-003: two assistant lines sharing message.id where the first
+        // carries a tool_use and the second carries text should produce
+        // ONE assistant text row + ONE tool row in the right order.
+        let raw = br#"{"type":"assistant","uuid":"a1","sessionId":"s1","message":{"id":"m1","content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/x.txt"}}]}}
+{"type":"assistant","uuid":"a2","sessionId":"s1","message":{"id":"m1","content":[{"type":"text","text":"and then"}]}}
+"#;
+        let got = parse_byte_range(raw, None);
+        assert_eq!(got.len(), 2, "expected assistant + tool, got {got:#?}");
+        assert_eq!(got[0].role, "assistant");
+        assert_eq!(got[0].text, "and then");
+        assert_eq!(got[1].role, "tool");
+        assert_eq!(got[1].tool_name.as_deref(), Some("Read"));
+    }
+
+    #[test]
+    fn parse_byte_range_matches_golden() {
+        // Snapshot test for the Rust parser. The fixture was originally
+        // captured from Python's `parse_byte_range`; Wave 2.5 expanded the
+        // Rust contract (tool / command / skill_load rows + usage / model
+        // retention) so the snapshot now represents the Rust output and is
+        // regenerated whenever the parser shape changes. See
+        // tests/fixtures/sample_session.jsonl + sample_session_expected.json.
         let raw = include_bytes!("../tests/fixtures/sample_session.jsonl");
         let expected_str = include_str!("../tests/fixtures/sample_session_expected.json");
         let got = parse_byte_range(raw, Some("test"));
@@ -877,7 +1488,7 @@ mod tests {
         let expected_json: serde_json::Value = serde_json::from_str(expected_str).unwrap();
         assert_eq!(
             got_json, expected_json,
-            "Rust parse_byte_range diverged from Python golden"
+            "Rust parse_byte_range output diverged from the captured snapshot"
         );
     }
 }

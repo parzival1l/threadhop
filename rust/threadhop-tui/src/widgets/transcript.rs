@@ -787,6 +787,31 @@ fn push_message_highlighted<'a>(
 }
 
 fn push_message<'a>(out: &mut Vec<Line<'a>>, msg: &CleanedMessage, theme: &Theme) {
+    // Wave 2.5 — `command` and `skill_load` rows render as a single dim
+    // one-liner: gutter + space + glyph + label. NO header row. Worker G
+    // (Wave 3) will polish this into a proper CommandPill; for now we
+    // only need a non-panicking render path that obeys the Phase A
+    // gutter invariant.
+    if is_command_pill_role(&msg.role) {
+        let muted = muted_style(theme).add_modifier(Modifier::DIM);
+        let role_style = style_for_role(&msg.role, theme);
+        // Pre-pop matches the Python CommandPill glyph convention:
+        //   command    → `▶ /name`
+        //   skill_load → `✦ skill:<name>`
+        let label = match msg.role.as_str() {
+            "command" => format!("▶ {}", msg.text),
+            "skill_load" => format!("✦ skill:{}", msg.text),
+            _ => msg.text.clone(),
+        };
+        let spans: Vec<Span<'a>> = vec![
+            gutter_span_bg(role_style, None),
+            Span::styled(" ", Style::default()),
+            Span::styled(label, muted),
+        ];
+        out.push(Line::from(spans));
+        return;
+    }
+
     let role_style = style_for_role(&msg.role, theme);
     let muted = muted_style(theme);
     let row_bg = role_bg(&msg.role, theme);
@@ -1734,6 +1759,9 @@ mod tests {
             parent_uuid: None,
             is_sidechain: 0,
             message_id: None,
+            usage: None,
+            model: None,
+            tool_name: None,
         }
     }
 
@@ -2855,6 +2883,64 @@ mod tests {
         // [collapsed tool] [blank] [user header] [user body] [blank] [collapsed tool]
         // = 6 lines.
         assert_eq!(lines.len(), 6, "got {} lines: {lines:?}", lines.len());
+    }
+
+    #[test]
+    fn build_lines_tool_fold_activates_against_real_jsonl_after_wave_2_5() {
+        // Wave 2.5 integration check — feed real-shape JSONL through
+        // `threadhop_core::jsonl::parse_byte_range` and confirm:
+        //   1. The parser now emits `role: "tool"` rows alongside the
+        //      assistant text row (it didn't before Wave 2.5).
+        //   2. `build_lines_with_tool_fold` with empty `expanded_tools` then
+        //      collapses the tool run into a `▶ N tool calls` summary line.
+        // Together these prove the Worker E fold activates against real
+        // session data, not just synthetic test inputs.
+        use threadhop_core::jsonl::parse_byte_range;
+        let raw = br#"{"type":"assistant","uuid":"a1","sessionId":"s1","message":{"id":"m1","model":"claude-opus","content":[{"type":"text","text":"sure"},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}},{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"/x.txt"}}]}}
+"#;
+        let msgs = parse_byte_range(raw, None);
+        let tool_rows = msgs.iter().filter(|m| m.role == "tool").count();
+        assert_eq!(
+            tool_rows, 2,
+            "parser must emit one tool row per tool_use block; got {msgs:#?}"
+        );
+        let theme = Theme::default_dark();
+        let lines = build_lines_with_tool_fold(&msgs, &theme, None);
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(
+            joined.contains("▶ 2 tool calls"),
+            "expected fold summary in rendered lines, got {joined:?}"
+        );
+    }
+
+    #[test]
+    fn command_role_renders_as_single_dim_pill_with_gutter() {
+        // Wave 2.5 — `command` rows should render as ONE line starting
+        // with the gutter glyph and the `▶ /name` label. No header row.
+        let theme = Theme::default_dark();
+        let mut m = cm("command", "/foo");
+        m.uuid = "c1".into();
+        let lines = build_lines(&[m], &theme);
+        assert_eq!(lines.len(), 1, "command should be one line, got {lines:#?}");
+        assert_eq!(lines[0].spans[0].content.as_ref(), GUTTER_GLYPH);
+        let joined: String = lines[0].spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(joined.contains("▶ /foo"), "got {joined:?}");
+    }
+
+    #[test]
+    fn skill_load_role_renders_as_single_dim_pill_with_gutter() {
+        let theme = Theme::default_dark();
+        let mut m = cm("skill_load", "handoff");
+        m.uuid = "s1".into();
+        let lines = build_lines(&[m], &theme);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].spans[0].content.as_ref(), GUTTER_GLYPH);
+        let joined: String = lines[0].spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(joined.contains("✦ skill:handoff"), "got {joined:?}");
     }
 
     #[test]
