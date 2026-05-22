@@ -25,6 +25,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Paragraph, Widget},
 };
+use std::collections::HashSet;
 use threadhop_core::{
     jsonl::CleanedMessage,
     theme::{blend, hex_to_rgb, Theme},
@@ -82,6 +83,15 @@ pub struct TranscriptWidget<'a> {
     /// paints the selected message(s) with a warning-tinted bg + warning
     /// gutter, overriding the role-derived gutter color.
     pub selection: Option<SelectionState>,
+    /// Phase C task 3 (Wave 2, Worker E): set of message UUIDs whose
+    /// folded tool-run is currently expanded. A run of consecutive tool
+    /// messages collapses to a single `▶ N tool calls` line by default;
+    /// if the first message uuid in the run is present in this set, the
+    /// run renders fully expanded as if no fold had taken place.
+    ///
+    /// `None` is equivalent to an empty set (everything folded). The
+    /// borrow lives as long as the parent App's `expanded_tools` field.
+    pub expanded_tools: Option<&'a HashSet<String>>,
 }
 
 impl<'a> TranscriptWidget<'a> {
@@ -95,12 +105,21 @@ impl<'a> TranscriptWidget<'a> {
             find_state: None,
             message_cursor: None,
             selection: None,
+            expanded_tools: None,
         }
     }
 
     /// Attach selection-mode state (Phase A). Builder-style.
     pub fn selection(mut self, selection: Option<SelectionState>) -> Self {
         self.selection = selection;
+        self
+    }
+
+    /// Attach the App's `expanded_tools` set (Phase C task 3 / Wave 2).
+    /// Builder-style. When not called, the widget renders with every
+    /// tool run folded.
+    pub fn expanded_tools(mut self, set: Option<&'a HashSet<String>>) -> Self {
+        self.expanded_tools = set;
         self
     }
 
@@ -128,7 +147,16 @@ impl<'a> Widget for TranscriptWidget<'a> {
             Some(fs) if !fs.matches.is_empty() => {
                 build_lines_with_highlights(self.messages, self.theme, fs)
             }
-            _ => build_lines(self.messages, self.theme),
+            // Phase C task 3 (Wave 2, Worker E): default path now folds
+            // consecutive tool messages into a single `▶ N tool calls`
+            // summary line, unless the user expanded a specific run via
+            // `o`. find-mode above stays fully expanded so search hits
+            // inside tool bodies remain visible.
+            _ => build_lines_with_tool_fold(
+                self.messages,
+                self.theme,
+                self.expanded_tools,
+            ),
         };
         // Phase A: replace `Paragraph::wrap` with a width-aware shaper that
         // re-emits the role gutter on every visual row. The shaper preserves
@@ -198,6 +226,15 @@ impl<'a> Widget for TranscriptWidget<'a> {
         // (which works in source-line coordinates and so under-shoots on
         // wrapped / markdown-expanded transcripts — the bug commit `2789914`
         // tried to fix and `4c83cf7` half-fixed).
+        //
+        // Wave 2 Worker F: every other scroll-jump call site (search-result
+        // open, find-bar Enter, deferred pending-jump, bookmark-browser
+        // open) now routes through `App::set_scroll_to_message`, which
+        // already does the source→visual translation App-side. The widget
+        // self-correction stays as a safety net specifically for selection
+        // mode — `scroll_selection_into_view` still works in source-line
+        // coordinates, so the tinted-range override below catches the
+        // residual under-shoot before paint.
         if let Some((first, last)) = tinted_range {
             let view_top = clamped as usize;
             let view_bottom = view_top.saturating_add(area.height as usize);
@@ -521,6 +558,100 @@ pub fn build_lines<'a>(messages: &[CleanedMessage], theme: &Theme) -> Vec<Line<'
         }
     }
     lines
+}
+
+/// Returns true for roles that participate in the tool-message fold.
+/// Mirrors the Python `transcript.py::ToolMessage` predicate (`role in
+/// ("tool", "tool_result")`). Other roles always render as full
+/// role-tinted cards.
+pub fn is_tool_role(role: &str) -> bool {
+    matches!(role, "tool" | "tool_result")
+}
+
+/// Phase C task 3 (Wave 2) — fold-aware variant of [`build_lines`].
+///
+/// Walks `messages`, batching every run of N consecutive tool / tool_result
+/// rows into a single `▶ N tool calls` summary line by default. If
+/// `expanded_tools` is `Some` and contains the run's first message uuid,
+/// the run renders fully expanded as if no fold had taken place — keeping
+/// `push_message` as the single source of truth for the expanded shape.
+///
+/// **Phase A invariant** — every emitted line still starts with the
+/// `GUTTER_GLYPH + " "` prefix, so `apply_selection_tint`'s gutter walker
+/// continues to detect message rows correctly.
+pub fn build_lines_with_tool_fold<'a>(
+    messages: &[CleanedMessage],
+    theme: &Theme,
+    expanded_tools: Option<&HashSet<String>>,
+) -> Vec<Line<'a>> {
+    let mut lines: Vec<Line<'a>> = Vec::new();
+    let mut idx = 0;
+    while idx < messages.len() {
+        let msg = &messages[idx];
+        if is_tool_role(&msg.role) {
+            let mut run_end = idx + 1;
+            while run_end < messages.len() && is_tool_role(&messages[run_end].role) {
+                run_end += 1;
+            }
+            let run_len = run_end - idx;
+            let expanded = expanded_tools
+                .map(|set| set.contains(&msg.uuid))
+                .unwrap_or(false);
+            if expanded {
+                for off in 0..run_len {
+                    push_message(&mut lines, &messages[idx + off], theme);
+                    if idx + off + 1 < messages.len() {
+                        lines.push(Line::from(""));
+                    }
+                }
+            } else {
+                push_collapsed_tool_run(&mut lines, msg, run_len, theme);
+                if run_end < messages.len() {
+                    lines.push(Line::from(""));
+                }
+            }
+            idx = run_end;
+            continue;
+        }
+        push_message(&mut lines, msg, theme);
+        if idx + 1 < messages.len() {
+            lines.push(Line::from(""));
+        }
+        idx += 1;
+    }
+    lines
+}
+
+/// Emit the one-row collapsed summary for a tool run. Keeps the
+/// `GUTTER_GLYPH + " "` prefix that `apply_selection_tint` relies on.
+fn push_collapsed_tool_run<'a>(
+    out: &mut Vec<Line<'a>>,
+    first: &CleanedMessage,
+    run_len: usize,
+    theme: &Theme,
+) {
+    let role_style = style_for_role(&first.role, theme);
+    let muted = muted_style(theme).add_modifier(Modifier::DIM);
+    let row_bg = role_bg(&first.role, theme);
+    let label = if run_len == 1 {
+        "▶ 1 tool call".to_string()
+    } else {
+        format!("▶ {run_len} tool calls")
+    };
+    let muted_with_bg = match row_bg {
+        Some(bg) => muted.bg(bg),
+        None => muted,
+    };
+    let spans: Vec<Span<'a>> = vec![
+        gutter_span_bg(role_style, row_bg),
+        Span::styled(" ", base_row_style(row_bg)),
+        Span::styled(label, muted_with_bg),
+    ];
+    let mut line = Line::from(spans);
+    if let Some(bg) = row_bg {
+        line = line.style(Style::default().bg(bg));
+    }
+    out.push(line);
 }
 
 /// Like `build_lines` but splices find-bar highlight spans into each body
@@ -2604,5 +2735,152 @@ mod tests {
             .filter(|s| s.content.as_ref() == "│ ")
             .count();
         assert_eq!(accent_count, 2, "expected 2 accent glyphs for `> > `: {:?}", lines[0].spans);
+    }
+
+    // ---- Phase C task 3: tool message fold (Wave 2, Worker E) ----------
+
+    /// Helper for fold tests — `cm()` derives uuid from `text.len()` so
+    /// two same-text tool messages collapse to the same uuid. Use unique
+    /// per-test uuids instead.
+    fn tool(uuid: &str, text: &str) -> CleanedMessage {
+        let mut m = cm("tool", text);
+        m.uuid = uuid.to_string();
+        m
+    }
+
+    #[test]
+    fn build_lines_collapses_consecutive_tool_messages_by_default() {
+        let theme = Theme::default_dark();
+        let msgs = vec![
+            tool("t1", "ls /tmp"),
+            tool("t2", "cat foo.txt"),
+            tool("t3", "rm bar.txt"),
+        ];
+        let lines = build_lines_with_tool_fold(&msgs, &theme, None);
+        assert_eq!(lines.len(), 1, "expected 1 collapsed line, got {lines:?}");
+        let joined: String = lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(
+            joined.contains("▶ 3 tool calls"),
+            "expected `▶ 3 tool calls`, got {joined:?}"
+        );
+        assert_eq!(lines[0].spans[0].content.as_ref(), GUTTER_GLYPH);
+        assert_eq!(lines[0].spans[1].content.as_ref(), " ");
+    }
+
+    #[test]
+    fn build_lines_expands_tool_run_when_uuid_in_expanded_tools() {
+        let theme = Theme::default_dark();
+        let msgs = vec![
+            tool("t1", "ls /tmp"),
+            tool("t2", "cat foo.txt"),
+            tool("t3", "rm bar.txt"),
+        ];
+        let mut set = HashSet::new();
+        set.insert("t1".to_string());
+        let lines = build_lines_with_tool_fold(&msgs, &theme, Some(&set));
+        let baseline = build_lines(&msgs, &theme);
+        assert_eq!(
+            lines.len(),
+            baseline.len(),
+            "expanded run should match unfolded build_lines length"
+        );
+        let tool_headers = lines
+            .iter()
+            .filter(|line| {
+                line.spans.iter().any(|s| s.content.as_ref() == "Tool")
+            })
+            .count();
+        assert_eq!(
+            tool_headers, 3,
+            "expected 3 `Tool` header rows when expanded, got {tool_headers}"
+        );
+    }
+
+    #[test]
+    fn collapsed_tool_line_starts_with_gutter_glyph_to_preserve_selection_tint_walker() {
+        let theme = Theme::default_dark();
+        let msgs = vec![tool("t1", "alpha"), tool("t2", "beta")];
+        let mut term = Terminal::new(TestBackend::new(40, 4)).unwrap();
+        term.draw(|f| {
+            let w = TranscriptWidget::new(&msgs, 0, &theme);
+            f.render_widget(w, f.area());
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        assert_eq!(
+            buf[(0, 0)].symbol(),
+            GUTTER_GLYPH,
+            "collapsed tool row must start with the gutter glyph"
+        );
+        let mut whole = String::new();
+        for x in 0..buf.area().width {
+            whole.push_str(buf[(x, 0)].symbol());
+        }
+        assert!(
+            whole.contains("▶ 2 tool calls"),
+            "row 0 missing collapsed summary; got {whole:?}"
+        );
+    }
+
+    #[test]
+    fn build_lines_tool_fold_handles_singleton_run() {
+        let theme = Theme::default_dark();
+        let msgs = vec![tool("t1", "ls")];
+        let lines = build_lines_with_tool_fold(&msgs, &theme, None);
+        assert_eq!(lines.len(), 1);
+        let joined: String = lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(
+            joined.contains("▶ 1 tool call") && !joined.contains("calls"),
+            "singleton should use singular `tool call`: {joined:?}"
+        );
+    }
+
+    #[test]
+    fn build_lines_tool_fold_first_and_last_message_in_transcript() {
+        let theme = Theme::default_dark();
+        let msgs = vec![
+            tool("t1", "first"),
+            cm("user", "hello"),
+            tool("t2", "last"),
+        ];
+        let lines = build_lines_with_tool_fold(&msgs, &theme, None);
+        // [collapsed tool] [blank] [user header] [user body] [blank] [collapsed tool]
+        // = 6 lines.
+        assert_eq!(lines.len(), 6, "got {} lines: {lines:?}", lines.len());
+    }
+
+    #[test]
+    fn build_lines_tool_fold_separates_two_runs_with_user_message() {
+        let theme = Theme::default_dark();
+        let msgs = vec![
+            tool("t1", "a"),
+            tool("t2", "b"),
+            cm("user", "ok"),
+            tool("t3", "c"),
+            tool("t4", "d"),
+        ];
+        let lines = build_lines_with_tool_fold(&msgs, &theme, None);
+        // collapsed1 + blank + user header + user body + blank + collapsed2 = 6.
+        assert_eq!(lines.len(), 6, "got {lines:?}");
+        let summary_count = lines
+            .iter()
+            .filter(|line| {
+                let joined: String = line
+                    .spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect();
+                joined.contains("tool call")
+            })
+            .count();
+        assert_eq!(summary_count, 2, "expected 2 separate collapsed rows");
     }
 }

@@ -371,11 +371,16 @@ const MAIN_SCREEN_BINDINGS: &[CommandBinding] = &[
         command: Command::CopyResumeCommand,
         label: "copy resume",
     },
+    // Phase C task 3 (Wave 2, Worker E): `o` toggles the tool-message
+    // fold when the message cursor sits on a tool/tool_result row.
+    // ObserveSession was bound to `o` in Phase 0 but is a stub today;
+    // the binding is reclaimed for the fold action until the
+    // observe-wave lands ObserveSession on a dedicated key.
     CommandBinding {
         key: key(KeyCode::Char('o'), KeyModifiers::NONE),
         scope: Scope::MainScreen,
-        command: Command::ObserveSession,
-        label: "observe",
+        command: Command::ToggleToolFold,
+        label: "fold tools",
     },
     CommandBinding {
         key: key(KeyCode::Char('O'), KeyModifiers::SHIFT),
@@ -1240,7 +1245,9 @@ mod tests {
         let cases: &[(KeyEvent, Command)] = &[
             (ev(KeyCode::Char('r'), KeyModifiers::NONE), Command::RefreshSessions),
             (ev(KeyCode::Char('n'), KeyModifiers::NONE), Command::RenameSession),
-            (ev(KeyCode::Char('o'), KeyModifiers::NONE), Command::ObserveSession),
+            // Wave 2 (Worker E, Phase C task 3): `o` was rebound from
+            // ObserveSession to ToggleToolFold.
+            (ev(KeyCode::Char('o'), KeyModifiers::NONE), Command::ToggleToolFold),
             (ev(KeyCode::Char('O'), KeyModifiers::SHIFT), Command::ResumeObservation),
             (ev(KeyCode::Char('a'), KeyModifiers::NONE), Command::ArchiveSession),
             (ev(KeyCode::Char('A'), KeyModifiers::SHIFT), Command::ToggleArchivedView),

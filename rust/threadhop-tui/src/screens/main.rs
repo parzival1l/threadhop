@@ -175,10 +175,19 @@ pub fn draw(app: &App, frame: &mut Frame) {
     // cursor needs to be scrolled into the viewport. Updated every frame —
     // resizes are picked up on the next render.
     app.last_transcript_height.set(transcript_area.height);
+    // Wave 2 Worker F: stamp the transcript pane WIDTH too so
+    // `App::set_scroll_to_message` can re-shape source-line targets into
+    // visual-row targets via `source_to_visual_line` (which needs the same
+    // width budget the renderer hands to `shape_lines`).
+    app.last_transcript_width.set(transcript_area.width);
     let transcript = TranscriptWidget::new(&app.transcript, app.scroll, &app.theme)
         .find_state(app.find_state.as_ref())
         .message_cursor(Some(app.message_cursor))
-        .selection(app.selection_state);
+        .selection(app.selection_state)
+        // Wave 2 Worker E (Phase C task 3): borrow the App's
+        // `expanded_tools` set so the widget can fold consecutive tool
+        // runs into a single `▶ N tool calls` summary line.
+        .expanded_tools(Some(&app.expanded_tools));
     // Phase E: remember the transcript rect so the mouse dispatcher can
     // route scroll-wheel events to it.
     app.last_transcript_rect.set(transcript_area);
@@ -253,6 +262,19 @@ pub fn draw(app: &App, frame: &mut Frame) {
         let modal_area =
             crate::screens::label_prompt::centered_rect(60, 60, frame.area());
         crate::screens::label_prompt::draw(
+            state,
+            &app.theme,
+            modal_area,
+            frame.buffer_mut(),
+        );
+    }
+    if let Some(state) = app.bookmark_note_prompt.as_ref() {
+        // Selection-mode `L` opens this on top of any underlying screen.
+        // Narrower than label_prompt — single-line input doesn't need the
+        // status-picker height.
+        let modal_area =
+            crate::screens::bookmark_note_prompt::centered_rect(60, 35, frame.area());
+        crate::screens::bookmark_note_prompt::draw(
             state,
             &app.theme,
             modal_area,
@@ -398,6 +420,26 @@ mod tests {
         let app = App::new();
         let mut term = Terminal::new(TestBackend::new(10, 5)).unwrap();
         term.draw(|f| draw(&app, f)).unwrap();
+    }
+
+    #[test]
+    fn transcript_width_recorded_for_app_scroll_math() {
+        // Wave 2 Worker F: rendering one frame must publish the transcript
+        // pane width into `app.last_transcript_width` so the scroll-to-
+        // message helper has a real width budget instead of falling back
+        // to the conservative 40-cell estimate.
+        let app = App::new();
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| draw(&app, f)).unwrap();
+        assert!(
+            app.last_transcript_width.get() > 0,
+            "last_transcript_width must be stamped after one frame; got {}",
+            app.last_transcript_width.get()
+        );
+        // Sanity check the height is stamped too — the existing Phase A
+        // fix-up does this; we're just confirming the new width sibling
+        // lands alongside it without breaking that path.
+        assert!(app.last_transcript_height.get() > 0);
     }
 
     #[test]

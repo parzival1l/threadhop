@@ -27,6 +27,7 @@ use crate::keys::{self, Command, Scope};
 use crate::screens::bookmark_browser::{
     self as bb, BookmarkBrowserResult, BookmarkRow,
 };
+use crate::screens::bookmark_note_prompt::{self as bnp, NoteAction};
 use crate::screens::confirm::{self as cf, ConfirmResult};
 use crate::screens::conflict_viewer::{
     self as cv, ConflictRow, ConflictViewerResult,
@@ -39,7 +40,7 @@ use crate::screens::label_prompt::{
 use crate::screens::search::{SearchResult, SearchState};
 use crate::widgets::find_bar::{FindResult, FindState};
 use crate::widgets::session_list::SessionListItem;
-use crate::widgets::transcript::{message_to_line_index, SelectionState};
+use crate::widgets::transcript::{message_to_line_index, source_to_visual_line, SelectionState};
 
 /// Half-page step size for `ScrollDownHalf` / `ScrollUpHalf`. A constant
 /// rather than a function of terminal height because the App doesn't know
@@ -230,6 +231,13 @@ pub struct App {
     /// Label / status prompt modal state. `Some` while open.
     pub label_prompt: Option<lp::State>,
 
+    /// Bookmark-note prompt modal state. `Some` while open. Opened from
+    /// selection mode (`L`) when the cursored message already has a
+    /// bookmark — lets the user edit/clear the attached note. Closes via
+    /// Enter (save) or Esc (cancel) per
+    /// [`crate::screens::bookmark_note_prompt::NoteAction`].
+    pub bookmark_note_prompt: Option<bnp::State>,
+
     /// When a modal stacks over another modal, the inner modal saves the outer
     /// modal's scope here so confirm/closure logic can pop back to it without
     /// hardcoded branches. None when no modal stack is active.
@@ -299,6 +307,19 @@ pub struct App {
     /// non-zero estimate so scroll math still works the moment the user
     /// presses `m`.
     pub last_transcript_height: std::cell::Cell<u16>,
+
+    /// Wave 2 Worker F: last-known transcript pane width in cells, recorded
+    /// by the screen renderer each frame. Drives [`Self::set_scroll_to_message`]
+    /// so the source-line target gets re-shaped into a visual-row target via
+    /// [`source_to_visual_line`] — without this, markdown-heavy / soft-wrapped
+    /// transcripts under-shoot the requested jump by dozens of rows.
+    ///
+    /// `Cell<u16>` so the renderer (`&self`) can update it without taking
+    /// `&mut App`. Default `0` — pre-first-frame callers fall back to a
+    /// conservative non-zero estimate inside the helper so scroll math still
+    /// works the moment the user opens the find bar / search modal /
+    /// bookmark browser before the first paint.
+    pub last_transcript_width: std::cell::Cell<u16>,
 
     /// Phase E: which pane currently owns focus. Drives the focus-aware
     /// border on the sidebar (`PaneFocus::Sidebar` → accent border, anything
@@ -516,6 +537,7 @@ impl App {
             bookmark_browser: None,
             confirm: None,
             label_prompt: None,
+            bookmark_note_prompt: None,
             previous_scope: None,
             kanban: None,
             conflict_viewer: None,
@@ -529,6 +551,7 @@ impl App {
             days_filter: None,
             spinner_tick: 0,
             last_transcript_height: std::cell::Cell::new(0),
+            last_transcript_width: std::cell::Cell::new(0),
             pane_focus: PaneFocus::default(),
             last_sidebar_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
             last_sidebar_rows: std::cell::RefCell::new(Vec::new()),
@@ -617,6 +640,55 @@ impl App {
         // don't double-write here.
     }
 
+    /// Wave 2 Worker F: scroll-to-message normalisation.
+    ///
+    /// Translate a target message uuid into a scroll target that lands the
+    /// message ~1/3 from the top of the transcript viewport, accounting for
+    /// the renderer's source-line → visual-row expansion via
+    /// [`source_to_visual_line`]. Every scroll-jump call site that has a
+    /// message uuid (search-result open, bookmark-browser open, find-bar
+    /// Enter, deferred pending-jump) funnels through here rather than
+    /// writing `self.scroll = message_to_line_index(...)` directly — the
+    /// raw source-line offset under-shoots dramatically on markdown-heavy
+    /// transcripts where `shape_lines` inflates row counts (long body lines,
+    /// table rows, syntect fences).
+    ///
+    /// The eased motion (Phase D `set_scroll`) provides the visual approach;
+    /// this helper just picks the right *target*.
+    ///
+    /// Fallbacks when the screen hasn't published a rect yet:
+    ///   * width  → 40 cells (matches the `shape_lines` tests)
+    ///   * height → 8  cells (matches `scroll_selection_into_view`'s estimate)
+    ///
+    /// The widget-side selection self-correction (in `TranscriptWidget`)
+    /// stays as a safety net — App-side normalisation usually makes it a
+    /// no-op now, but the widget still owns the final clamp + tinted-range
+    /// follow-up that App-side math can't see (e.g. tinted spans that
+    /// expand across visual rows on the cursored row).
+    ///
+    /// No-op when `msg_uuid` isn't in `self.transcript`.
+    pub fn set_scroll_to_message(&mut self, msg_uuid: &str) {
+        let Some(source_line) = message_to_line_index(&self.transcript, msg_uuid) else {
+            return;
+        };
+        let width = self.last_transcript_width.get().max(40);
+        let viewport = self.last_transcript_height.get().max(8);
+        let visual_row = source_to_visual_line(
+            &self.transcript,
+            source_line as usize,
+            width,
+        )
+        .unwrap_or(source_line as usize);
+        // Place the target ~1/3 from the top of the pane — same heuristic
+        // `scroll_selection_into_view` uses, same Textual `scroll_visible`
+        // default the Python TUI gives selection mode.
+        let target_offset = (viewport as usize) / 3;
+        let new_scroll = visual_row
+            .saturating_sub(target_offset)
+            .min(u16::MAX as usize) as u16;
+        self.set_scroll(new_scroll);
+    }
+
     /// Phase D: stamp the modal-fade timer. Any modal opener calls this so
     /// the renderer can fade the backdrop in from `0 -> MODAL_BACKDROP_ALPHA`
     /// across `MODAL_FADE_DURATION`. Stacking a new modal over an existing
@@ -638,6 +710,7 @@ impl App {
             && self.conflict_viewer.is_none()
             && self.kanban.is_none()
             && self.label_prompt.is_none()
+            && self.bookmark_note_prompt.is_none()
             && self.bookmark_browser.is_none()
         {
             self.modal_opened_at = None;
@@ -746,6 +819,10 @@ impl App {
             self.dispatch_label_prompt(key);
             return None;
         }
+        if self.bookmark_note_prompt.is_some() {
+            self.dispatch_bookmark_note_prompt(key);
+            return None;
+        }
         if self.bookmark_browser.is_some() {
             self.dispatch_bookmark_browser(key);
             return None;
@@ -809,12 +886,14 @@ impl App {
                     self.scope = Scope::MainScreen;
                 }
                 Some(FindResult::JumpedToMatch { message_index }) => {
+                    // Wave 2 Worker F: route through the source-vs-visual
+                    // normalisation helper so the find-bar's "Enter on a
+                    // match" lands the message ~1/3 from the top, not at the
+                    // raw source-line offset (which under-shoots on
+                    // markdown-heavy bodies once `shape_lines` expands them).
                     if let Some(msg) = self.transcript.get(message_index) {
-                        if let Some(line) =
-                            message_to_line_index(&self.transcript, &msg.uuid)
-                        {
-                            self.set_scroll(line);
-                        }
+                        let uuid = msg.uuid.clone();
+                        self.set_scroll_to_message(&uuid);
                     }
                     self.find_state = None;
                     self.scope = Scope::MainScreen;
@@ -949,7 +1028,7 @@ impl App {
             // deferrals-cleanup wave. Worker D wires
             // `OpenBookmarkNotePrompt`; Worker E wires `ToggleToolFold`.
             Command::OpenBookmarkNotePrompt => self.stub_command("edit bookmark note"),
-            Command::ToggleToolFold => self.stub_command("toggle tool fold"),
+            Command::ToggleToolFold => self.toggle_tool_fold_at_cursor(),
             // Cancel is owned by the modal-first dispatch; modal-only
             // commands never fire on the main screen.
             Command::Cancel
@@ -1185,10 +1264,7 @@ impl App {
                 }
             }
             Command::EditBookmarkNote => {
-                // Defer to Phase E for the full bookmark-note prompt path —
-                // surface the action so the user knows it was caught.
-                self.status_message =
-                    Some("Edit bookmark note — not wired yet (Phase E)".into());
+                self.open_bookmark_note_prompt_for_cursor();
             }
             Command::EnterSelectionMode | Command::Cancel => {
                 self.exit_selection_mode();
@@ -1301,6 +1377,51 @@ impl App {
         }
     }
 
+    /// Phase C task 3 (Wave 2, Worker E) — toggle the folded/expanded
+    /// state for the tool run the message cursor is parked on. Walks
+    /// backwards from `message_cursor` until a non-tool message is hit
+    /// (or the transcript start) to find the run's "first message"; the
+    /// first message's UUID is what `expanded_tools` keys on so subsequent
+    /// renders agree about which run is open regardless of where inside
+    /// the run the cursor sits.
+    ///
+    /// When the cursor is not on a tool message at all, we emit a hint
+    /// via `status_message` and leave `expanded_tools` unchanged. The
+    /// footer already advertises the binding (`fold tools`) so the user
+    /// sees the key is recognised — the message just clarifies the
+    /// precondition.
+    fn toggle_tool_fold_at_cursor(&mut self) {
+        let Some(msg) = self.transcript.get(self.message_cursor) else {
+            self.status_message = Some(
+                "Press `o` on a tool message to expand/collapse".into(),
+            );
+            return;
+        };
+        if !crate::widgets::transcript::is_tool_role(&msg.role) {
+            self.status_message = Some(
+                "Press `o` on a tool message to expand/collapse".into(),
+            );
+            return;
+        }
+        // Walk backwards to find the first tool message in this run.
+        let mut first_idx = self.message_cursor;
+        while first_idx > 0
+            && crate::widgets::transcript::is_tool_role(
+                &self.transcript[first_idx - 1].role,
+            )
+        {
+            first_idx -= 1;
+        }
+        let first_uuid = self.transcript[first_idx].uuid.clone();
+        if self.expanded_tools.contains(&first_uuid) {
+            self.expanded_tools.remove(&first_uuid);
+            self.status_message = Some("Folded tool calls".into());
+        } else {
+            self.expanded_tools.insert(first_uuid);
+            self.status_message = Some("Expanded tool calls".into());
+        }
+    }
+
     /// Phase 0 stub: emit a `tracing::warn!` and surface a status_message
     /// for a Python-parity binding whose real handler hasn't shipped yet.
     /// Keeping the binding live (instead of dropping the key) means muscle
@@ -1398,6 +1519,103 @@ impl App {
                 } else {
                     tracing::warn!("toggle_bookmark failed: {e}");
                     self.status_message = Some(format!("bookmark error: {e}"));
+                }
+            }
+        }
+    }
+
+    /// Selection-mode `L`: open the bookmark-note prompt for the message
+    /// under the selection cursor. Requires the message to already carry a
+    /// bookmark — otherwise we surface a status hint pointing at `Space` so
+    /// the user can create one first.
+    ///
+    /// Persistence runs through `db::upsert_bookmark` on save (see
+    /// [`Self::dispatch_bookmark_note_prompt`]), which updates the existing
+    /// row in place — keyed by `message_uuid` rather than rowid, so the
+    /// original `bookmarks.id` is preserved.
+    fn open_bookmark_note_prompt_for_cursor(&mut self) {
+        let idx = self
+            .selection_state
+            .map(|s| s.cursor)
+            .unwrap_or(self.message_cursor);
+        let Some(msg) = self.transcript.get(idx) else {
+            self.status_message = Some("no message under cursor".into());
+            return;
+        };
+        let uuid = msg.uuid.clone();
+        let Some(sid) = self.selected_session_id.clone() else {
+            self.status_message = Some("no session selected".into());
+            return;
+        };
+        let bookmarks = match threadhop_core::db::bookmarks_for_session(&self.db, &sid) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("bookmarks_for_session({sid}) failed: {e}");
+                self.status_message = Some(format!("bookmark lookup failed: {e}"));
+                return;
+            }
+        };
+        let Some(bm) = bookmarks.into_iter().find(|b| b.message_uuid == uuid) else {
+            self.status_message =
+                Some("Press Space first to bookmark this message".into());
+            return;
+        };
+        let id = bm.id.unwrap_or(0);
+        self.bookmark_note_prompt =
+            Some(bnp::State::open_for(id, uuid, bm.kind, bm.note));
+        self.stamp_modal_open();
+    }
+
+    /// Dispatch one keystroke into the bookmark-note prompt. On `Save`,
+    /// upsert the note (preserving the bookmark's original `kind`); on
+    /// `Cancel`, drop the buffer.
+    fn dispatch_bookmark_note_prompt(&mut self, key: KeyEvent) {
+        let state = self
+            .bookmark_note_prompt
+            .as_mut()
+            .expect("dispatch_bookmark_note_prompt precondition");
+        let result = bnp::handle_key(state, key);
+        let Some(result) = result else {
+            return;
+        };
+        let state = self
+            .bookmark_note_prompt
+            .take()
+            .expect("bookmark_note_prompt was Some above");
+        match result {
+            NoteAction::Cancel => {}
+            NoteAction::Save(text) => {
+                if self.read_only {
+                    self.status_message = Some("Read-only — DB unavailable".into());
+                    return;
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0);
+                let note_opt = if text.is_empty() {
+                    None
+                } else {
+                    Some(text.as_str())
+                };
+                match threadhop_core::db::upsert_bookmark(
+                    &self.db,
+                    &state.message_uuid,
+                    state.kind,
+                    note_opt,
+                    now,
+                ) {
+                    Ok(_) => {
+                        self.status_message = Some(if note_opt.is_some() {
+                            "note saved".into()
+                        } else {
+                            "note cleared".into()
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!("upsert_bookmark failed: {e}");
+                        self.status_message = Some(format!("note save error: {e}"));
+                    }
                 }
             }
         }
@@ -2040,12 +2258,22 @@ impl App {
     /// the event loop after `TranscriptRefreshed` (and synchronously from
     /// `handle_key` when the jump target is the same session — no reload
     /// will arrive in that case).
+    ///
+    /// Wave 2 Worker F: funnels through [`Self::set_scroll_to_message`] so
+    /// the search-modal / bookmark-browser / conflict-viewer jump paths all
+    /// land their target ~1/3 from the top of the viewport even on
+    /// markdown-heavy bodies. Previously we set `self.scroll = source_line`
+    /// directly, which under-shoots on transcripts whose visual rows
+    /// expanded under `shape_lines`.
     pub fn try_resolve_pending_jump(&mut self) {
         let Some(uuid) = self.pending_jump_message_uuid.clone() else {
             return;
         };
-        if let Some(line) = message_to_line_index(&self.transcript, &uuid) {
-            self.set_scroll(line);
+        // Use `message_to_line_index` purely as a presence check — the
+        // helper itself re-derives the source line and translates it to a
+        // visual row.
+        if message_to_line_index(&self.transcript, &uuid).is_some() {
+            self.set_scroll_to_message(&uuid);
             self.pending_jump_message_uuid = None;
         }
         // Otherwise: leave pending_jump set; a later TranscriptRefreshed may
@@ -2450,8 +2678,15 @@ mod tests {
         }
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.find_state.is_none());
-        // Expected scroll: message 0 header(1) + body(1) + sep(1) = 3.
-        assert_eq!(app.scroll, 3);
+        // Wave 2 Worker F: scroll now routes through
+        // `set_scroll_to_message`, which lands the target ~1/3 from the top
+        // of the viewport rather than parking it at the raw source-line
+        // offset.
+        //   * source-line for msg #1 = 1 header + 1 body + 1 sep = 3
+        //   * visual-row = 3 (short body, no soft-wrap at fallback width 40)
+        //   * viewport fallback height = 8 → target_offset = 8 / 3 = 2
+        //   * scroll = 3 - 2 = 1
+        assert_eq!(app.scroll, 1);
     }
 
     #[test]
@@ -2488,8 +2723,14 @@ mod tests {
         ];
         app.pending_jump_message_uuid = Some("b".into());
         app.try_resolve_pending_jump();
-        // Message "b" starts after message "a" (1 header + 1 body) + 1 sep = 3.
-        assert_eq!(app.scroll, 3);
+        // Wave 2 Worker F: `try_resolve_pending_jump` now funnels through
+        // `set_scroll_to_message`, which subtracts viewport/3 to put the
+        // target ~1/3 from the top of the viewport.
+        //   * source-line for "b" = 1 header + 1 body + 1 sep = 3
+        //   * visual-row = 3 (short body, no soft-wrap at fallback width 40)
+        //   * viewport fallback height = 8 → target_offset = 8 / 3 = 2
+        //   * scroll = 3 - 2 = 1
+        assert_eq!(app.scroll, 1);
         assert!(app.pending_jump_message_uuid.is_none());
     }
 
@@ -3672,5 +3913,309 @@ mod tests {
             !s.contains("not yet wired"),
             "stub message must not appear: {s:?}"
         );
+    }
+
+    // ---- Wave 2 Worker D: bookmark-note prompt integration --------------
+
+    /// Helper — put the App into selection mode with the cursor on the
+    /// seeded message. Mirrors what `enter_selection_mode` produces without
+    /// going through the keystroke path (which would also flip scope and
+    /// reset `previous_scope`, neither of which these focused tests care
+    /// about).
+    fn enter_selection_at(app: &mut App, cursor: usize) {
+        app.selection_state = Some(SelectionState {
+            cursor,
+            range_start: None,
+        });
+        app.scope = Scope::Selection;
+    }
+
+    #[test]
+    fn selection_mode_l_opens_prompt_when_cursored_msg_has_bookmark() {
+        let (mut app, _sid, uuid) = seeded_app();
+        // Pre-create a bookmark on the cursored message via the existing
+        // Space toggle so we know there's an actual row to edit.
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert_eq!(count_bookmarks(&app.db), 1, "bookmark seeded");
+        enter_selection_at(&mut app, 0);
+        // Selection-mode `L` (shift-L) — the binding registry maps this to
+        // `EditBookmarkNote`, which now opens the prompt.
+        app.handle_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT));
+        let state = app
+            .bookmark_note_prompt
+            .as_ref()
+            .expect("prompt should be open");
+        assert_eq!(state.message_uuid, uuid);
+        assert!(state.text.is_empty(), "new bookmark starts with no note");
+    }
+
+    #[test]
+    fn selection_mode_l_emits_hint_status_when_no_bookmark() {
+        let (mut app, _sid, _uuid) = seeded_app();
+        assert_eq!(count_bookmarks(&app.db), 0, "no bookmark seeded");
+        enter_selection_at(&mut app, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT));
+        assert!(
+            app.bookmark_note_prompt.is_none(),
+            "prompt must NOT open when there's no bookmark"
+        );
+        let s = app.status_message.as_deref().unwrap_or("");
+        assert!(
+            s.contains("Press Space"),
+            "expected hint pointing at Space; got {s:?}"
+        );
+    }
+
+    #[test]
+    fn prompt_save_persists_note_to_bookmark() {
+        let (mut app, _sid, uuid) = seeded_app();
+        // Bootstrap: bookmark the cursored message first.
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        enter_selection_at(&mut app, 0);
+        // Open the prompt, type a note, hit Enter.
+        app.handle_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT));
+        for c in "hello".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            app.bookmark_note_prompt.is_none(),
+            "modal closes after Enter"
+        );
+        // Verify the note hit the DB.
+        let note: Option<String> = app
+            .db
+            .query_row(
+                "SELECT note FROM bookmarks WHERE message_uuid = ?",
+                [&uuid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(note.as_deref(), Some("hello"));
+        // Still exactly one bookmark — the save is an UPDATE, not an INSERT.
+        assert_eq!(count_bookmarks(&app.db), 1);
+        assert_eq!(app.status_message.as_deref(), Some("note saved"));
+    }
+
+    #[test]
+    fn prompt_cancel_leaves_note_unchanged() {
+        let (mut app, _sid, uuid) = seeded_app();
+        // Seed a bookmark with an existing note via upsert_bookmark — that's
+        // also what the App's save path uses.
+        threadhop_core::db::upsert_bookmark(
+            &app.db,
+            &uuid,
+            threadhop_core::models::BookmarkKind::Bookmark,
+            Some("original"),
+            1234.0,
+        )
+        .unwrap();
+        enter_selection_at(&mut app, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT));
+        // Mutate the buffer then Esc — the DB should stay on "original".
+        for c in "edit".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.bookmark_note_prompt.is_none(), "modal closes after Esc");
+        let note: Option<String> = app
+            .db
+            .query_row(
+                "SELECT note FROM bookmarks WHERE message_uuid = ?",
+                [&uuid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(note.as_deref(), Some("original"));
+    }
+
+    #[test]
+    fn prompt_save_blank_clears_note_to_null() {
+        let (mut app, _sid, uuid) = seeded_app();
+        threadhop_core::db::upsert_bookmark(
+            &app.db,
+            &uuid,
+            threadhop_core::models::BookmarkKind::Bookmark,
+            Some("kill me"),
+            1234.0,
+        )
+        .unwrap();
+        enter_selection_at(&mut app, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT));
+        // Backspace through the pre-populated text, then Enter.
+        for _ in 0.."kill me".len() {
+            app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let note: Option<String> = app
+            .db
+            .query_row(
+                "SELECT note FROM bookmarks WHERE message_uuid = ?",
+                [&uuid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(note, None);
+        assert_eq!(app.status_message.as_deref(), Some("note cleared"));
+    }
+
+    // ---- Wave 2 Worker F: scroll-to-message normalisation ----------------
+
+    /// Helper: build a markdown-heavy fixture matching Phase A fix-up #2's
+    /// shape — N messages with M-row bodies — so the source-line → visual-row
+    /// expansion under `shape_lines` actually inflates row counts when the
+    /// fallback width (40) is exercised.
+    fn heavy_transcript(n_msgs: usize, body_rows: usize) -> Vec<CleanedMessage> {
+        let mut out = Vec::with_capacity(n_msgs);
+        for i in 0..n_msgs {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            // body_rows lines, each short enough not to soft-wrap at 40 but
+            // distinct enough that source-line and visual-row indices stay
+            // aligned (no wrap means visual = source).
+            let body: Vec<String> = (0..body_rows)
+                .map(|r| format!("msg-{i}-row-{r}-short-ish"))
+                .collect();
+            let mut m = msg(&format!("u{i}"), role, &body.join("\n"));
+            m.uuid = format!("u{i}");
+            out.push(m);
+        }
+        out
+    }
+
+    #[test]
+    fn set_scroll_to_message_lands_target_near_one_third_from_top_when_message_is_below_fold() {
+        // Bottom of a 30-message transcript with 5-row bodies — well below
+        // the fold. The helper should re-shape source-line → visual-row and
+        // park the scroll at `visual_row - viewport/3`.
+        let mut app = App::new();
+        app.transcript = heavy_transcript(30, 5);
+        // Pretend the screen stamped a 40-wide / 24-row pane (typical
+        // terminal). Without this the helper uses the (40, 8) fallbacks
+        // and we'd be back to the conservative under-shoot.
+        app.last_transcript_width.set(40);
+        app.last_transcript_height.set(24);
+        // Source-line layout: each msg = 1 header + 5 body + 1 sep = 7 rows
+        // (last msg has no trailing sep). At width 40 every body row fits
+        // in a single visual row, so visual_row == source_line.
+        //   source for u29 = 29 * 7 + 0 = 203
+        //   viewport / 3 = 24 / 3 = 8
+        //   expected scroll = 203 - 8 = 195
+        let target_uuid = app.transcript.last().unwrap().uuid.clone();
+        app.set_scroll_to_message(&target_uuid);
+        // Allow ±2 slack — the helper's source→visual translation walks
+        // exactly the same build sequence the renderer uses, but future
+        // body-row tweaks could shift the count by a row or two.
+        let expected: i32 = 203 - 8;
+        let got = app.scroll_target as i32;
+        assert!(
+            (got - expected).abs() <= 2,
+            "scroll_target should sit within ±2 of {expected}; got {got}"
+        );
+    }
+
+    #[test]
+    fn set_scroll_to_message_at_top_of_transcript_sets_scroll_zero() {
+        // The first message lives at source-line 0 — viewport/3 is non-zero
+        // but the saturating_sub clamps the helper to 0.
+        let mut app = App::new();
+        app.transcript = heavy_transcript(10, 3);
+        app.last_transcript_width.set(40);
+        app.last_transcript_height.set(24);
+        let target_uuid = app.transcript[0].uuid.clone();
+        app.set_scroll_to_message(&target_uuid);
+        assert_eq!(
+            app.scroll_target, 0.0,
+            "first-message target must clamp to 0 via saturating_sub"
+        );
+    }
+
+    #[test]
+    fn set_scroll_to_message_is_noop_when_uuid_missing() {
+        // Helper bails out cleanly when the uuid isn't in the transcript —
+        // existing scroll position must NOT move.
+        let mut app = App::new();
+        app.transcript = heavy_transcript(5, 2);
+        app.last_transcript_width.set(40);
+        app.last_transcript_height.set(24);
+        app.scroll = 12;
+        app.set_scroll_to_message("does-not-exist");
+        assert_eq!(app.scroll, 12, "missing uuid must not move scroll");
+    }
+
+    #[test]
+    fn set_scroll_to_message_empty_transcript_is_safe_noop() {
+        // Defensive: an empty transcript still mustn't panic. The helper
+        // bails out at the `message_to_line_index` presence check.
+        let mut app = App::new();
+        assert!(app.transcript.is_empty());
+        app.scroll = 7;
+        app.set_scroll_to_message("anything");
+        assert_eq!(app.scroll, 7);
+    }
+
+    #[test]
+    fn set_scroll_to_message_single_message_transcript_lands_at_zero() {
+        // One-message transcript — source line 0, visual row 0, scroll
+        // should clamp to 0 via saturating_sub.
+        let mut app = App::new();
+        app.transcript = vec![msg("only", "user", "just one body line")];
+        app.last_transcript_width.set(40);
+        app.last_transcript_height.set(24);
+        app.set_scroll_to_message("only");
+        assert_eq!(app.scroll_target, 0.0);
+    }
+
+    #[test]
+    fn set_scroll_to_message_handles_extremely_narrow_width_gracefully() {
+        // Pathological width — narrower than the gutter (2 cells). The
+        // helper takes `last_transcript_width.max(40)` so the rendered
+        // width is treated as 40, and the helper still produces a sane
+        // scroll target rather than panicking on a zero text_width.
+        let mut app = App::new();
+        app.transcript = heavy_transcript(5, 2);
+        app.last_transcript_width.set(1); // → clamped to 40 inside helper
+        app.last_transcript_height.set(24);
+        let target_uuid = app.transcript[3].uuid.clone();
+        app.set_scroll_to_message(&target_uuid);
+        // Just assert the helper produced *some* in-range scroll target,
+        // not garbage. With 5 msgs * 4 rows = 20 source lines, the target
+        // must sit comfortably under that.
+        assert!(
+            app.scroll_target >= 0.0 && app.scroll_target < 25.0,
+            "scroll_target must stay in-range for narrow-width edge case; got {}",
+            app.scroll_target
+        );
+    }
+
+    #[test]
+    fn search_result_jump_through_set_scroll_to_message_lands_in_viewport() {
+        // Integration: enqueue a pending search-result jump, dispatch the
+        // resolver, then assert the targeted message's visual row is
+        // inside [scroll, scroll + viewport). This is the contract Wave 2
+        // Worker F generalisation is meant to enforce — before this fix,
+        // the scroll under-shot on transcripts whose visual rows expanded
+        // under `shape_lines`.
+        let mut app = App::new();
+        app.transcript = heavy_transcript(30, 3);
+        app.last_transcript_width.set(40);
+        app.last_transcript_height.set(24);
+        let target_uuid = app.transcript[20].uuid.clone();
+        // Simulate the search-modal's deferred-jump channel.
+        app.pending_jump_message_uuid = Some(target_uuid.clone());
+        app.try_resolve_pending_jump();
+        let source_line = crate::widgets::transcript::message_to_line_index(
+            &app.transcript,
+            &target_uuid,
+        )
+        .unwrap() as i32;
+        let scroll = app.scroll_target as i32;
+        let viewport = 24;
+        assert!(
+            scroll <= source_line && source_line < scroll + viewport,
+            "target message row {source_line} must sit inside viewport \
+             [{scroll}, {})",
+            scroll + viewport
+        );
+        assert!(app.pending_jump_message_uuid.is_none(), "pending must clear");
     }
 }
