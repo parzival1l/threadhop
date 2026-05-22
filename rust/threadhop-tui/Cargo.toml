@@ -20,6 +20,15 @@ tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
+# Sidebar truncation needs cell-width-aware string measurement so CJK + emoji
+# session names don't overflow the 22-cell display column.
+unicode-width = "0.1"
+# Phase B — syntect for fenced-code syntax highlighting in the transcript.
+# `default-fancy` is the pure-Rust feature combo (fancy-regex, no onig/C FFI).
+# We bundle the default syntax + theme sets and pick `base16-ocean.dark` to
+# pair with the OpenCode dark theme; only the fg color is propagated to spans
+# (we keep the role-tinted row background — see widgets::transcript::md).
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -884,6 +884,43 @@ pub mod md {
     use super::{theme_color, Theme};
     use ratatui::style::{Color, Modifier, Style};
     use ratatui::text::{Line, Span};
+    use std::sync::OnceLock;
+    use syntect::easy::HighlightLines;
+    use syntect::highlighting::{FontStyle, Style as SynStyle, Theme as SynTheme, ThemeSet};
+    use syntect::parsing::SyntaxSet;
+
+    // Phase B — syntect resources cached for the lifetime of the process.
+    //
+    // `SyntaxSet::load_defaults_newlines()` parses ~1.7MB of YAML-derived
+    // metadata on first call (millisecond-scale, but enough to be visible at
+    // 60fps if done per frame). Same for `ThemeSet::load_defaults()`. We
+    // amortize via `OnceLock` so the first transcript render pays the cost
+    // once and every subsequent render is a pointer-chase.
+    //
+    // Rationale for `OnceLock` over an `App`-state field: the cache is pure
+    // (input → output map), shared across all transcript widgets, and never
+    // mutated after init. Threading it through `App → screen → widget` would
+    // add four reference parameters for no semantic gain. `OnceLock` keeps
+    // the lifetime story trivial without `lazy_static!`'s macro overhead.
+    fn syntax_set() -> &'static SyntaxSet {
+        static SS: OnceLock<SyntaxSet> = OnceLock::new();
+        SS.get_or_init(SyntaxSet::load_defaults_newlines)
+    }
+
+    fn theme_for_code() -> &'static SynTheme {
+        static TH: OnceLock<SynTheme> = OnceLock::new();
+        TH.get_or_init(|| {
+            let ts = ThemeSet::load_defaults();
+            // `base16-ocean.dark` pairs with the OpenCode dark surface
+            // (deep blue-grey panel, warm syntax accents). Fallback to any
+            // built-in if the key ever vanishes upstream — never panic.
+            ts.themes
+                .get("base16-ocean.dark")
+                .cloned()
+                .or_else(|| ts.themes.values().next().cloned())
+                .unwrap_or_else(SynTheme::default)
+        })
+    }
 
     /// Render `body` into a `Vec<Line>` styled for the transcript pane.
     ///
@@ -897,36 +934,106 @@ pub mod md {
         row_bg: Option<Color>,
     ) -> Vec<Line<'a>> {
         let mut out: Vec<Line<'a>> = Vec::new();
-        let mut in_fence = false;
         let code_bg = theme_color(&theme.background_element, Color::DarkGray);
         let code_fg = theme_color(&theme.foreground, Color::White);
         let header_color = theme_color(&theme.accent, Color::Magenta);
         let bullet_color = theme_color(&theme.text_muted, Color::Gray);
         let info_color = theme_color(&theme.info, Color::Blue);
+        let muted_color = theme_color(&theme.text_muted, Color::Gray);
 
-        for raw_line in body.split('\n') {
-            // Fence open/close: a line whose trimmed start is ``` toggles
-            // the state. We don't bother parsing the language tag.
+        let lines: Vec<&str> = body.split('\n').collect();
+        let mut i = 0;
+        while i < lines.len() {
+            let raw_line = lines[i];
             let trimmed = raw_line.trim_start();
-            if trimmed.starts_with("```") {
-                in_fence = !in_fence;
-                // Render the fence line itself as an empty code-styled row so
-                // the user sees the block boundary visually (rather than the
-                // literal backticks bleeding through).
-                let span = Span::styled(
-                    " ".repeat(raw_line.len().max(1)),
-                    base_text.bg(code_bg).fg(code_fg).add_modifier(Modifier::DIM),
-                );
-                out.push(apply_bg(Line::from(vec![span]), row_bg));
+
+            // ---- Fenced code (B1) -------------------------------------
+            // Treat `\`\`\`<lang>` as the opener. Accumulate body lines
+            // until the next `\`\`\`` (or end-of-input). Then run syntect.
+            if let Some(rest) = trimmed.strip_prefix("```") {
+                let lang_tag = rest.trim();
+                // Open marker as a styled empty row (visual block boundary).
+                out.push(apply_bg(
+                    Line::from(vec![Span::styled(
+                        " ".repeat(raw_line.len().max(1)),
+                        base_text.bg(code_bg).fg(code_fg).add_modifier(Modifier::DIM),
+                    )]),
+                    row_bg,
+                ));
+                i += 1;
+                // Collect fence body up to (exclusive) the closing fence.
+                let mut body_lines: Vec<&str> = Vec::new();
+                let mut found_close = false;
+                while i < lines.len() {
+                    let l = lines[i];
+                    if l.trim_start().starts_with("```") {
+                        found_close = true;
+                        break;
+                    }
+                    body_lines.push(l);
+                    i += 1;
+                }
+                // Render the body via syntect (or plain fallback if no lang
+                // match or highlight error).
+                let highlighted =
+                    highlight_fence(&body_lines, lang_tag, base_text, code_bg, code_fg);
+                for hl in highlighted {
+                    out.push(apply_bg(hl, row_bg));
+                }
+                // Closing marker (if any).
+                if found_close {
+                    out.push(apply_bg(
+                        Line::from(vec![Span::styled(
+                            " ".repeat(lines[i].len().max(1)),
+                            base_text.bg(code_bg).fg(code_fg).add_modifier(Modifier::DIM),
+                        )]),
+                        row_bg,
+                    ));
+                    i += 1;
+                }
                 continue;
             }
-            if in_fence {
-                // Inside a fence: emit verbatim with the code background.
-                let span = Span::styled(
-                    raw_line.to_string(),
-                    base_text.bg(code_bg).fg(code_fg),
-                );
-                out.push(apply_bg(Line::from(vec![span]), row_bg));
+
+            // ---- Table detection (B2) ---------------------------------
+            // A table starts with a `|`-prefixed line whose successor is a
+            // separator row matching `^\s*\|[\s\-:|]+\|\s*$`. Once detected,
+            // consume contiguous `|`-prefixed lines as body rows.
+            if raw_line.trim_start().starts_with('|') {
+                if let Some(consumed) = try_render_table(
+                    &lines,
+                    i,
+                    base_text,
+                    row_bg,
+                    muted_color,
+                    &mut out,
+                ) {
+                    i += consumed;
+                    continue;
+                }
+            }
+
+            // ---- Blockquote (B3) --------------------------------------
+            // One or more leading `> ` markers. Each marker becomes an
+            // accent `│` glyph in the muted color; remaining text follows
+            // in muted style.
+            if let Some((depth, rest)) = blockquote_body(raw_line) {
+                let mut spans: Vec<Span<'a>> = Vec::with_capacity(depth * 2 + 1);
+                for _ in 0..depth {
+                    spans.push(Span::styled(
+                        "│ ".to_string(),
+                        base_text.fg(muted_color),
+                    ));
+                }
+                spans.extend(render_inline(
+                    rest,
+                    theme,
+                    base_text.fg(muted_color),
+                    info_color,
+                    code_bg,
+                    code_fg,
+                ));
+                out.push(apply_bg(Line::from(spans), row_bg));
+                i += 1;
                 continue;
             }
 
@@ -940,6 +1047,7 @@ pub mod md {
                         .add_modifier(Modifier::BOLD),
                 )]);
                 out.push(apply_bg(line, row_bg));
+                i += 1;
                 continue;
             }
 
@@ -955,6 +1063,7 @@ pub mod md {
                 ));
                 spans.extend(render_inline(rest, theme, base_text, info_color, code_bg, code_fg));
                 out.push(apply_bg(Line::from(spans), row_bg));
+                i += 1;
                 continue;
             }
 
@@ -970,6 +1079,7 @@ pub mod md {
                 ));
                 spans.extend(render_inline(rest, theme, base_text, info_color, code_bg, code_fg));
                 out.push(apply_bg(Line::from(spans), row_bg));
+                i += 1;
                 continue;
             }
 
@@ -981,9 +1091,275 @@ pub mod md {
                 Line::from(spans)
             };
             out.push(apply_bg(line, row_bg));
+            i += 1;
         }
 
         out
+    }
+
+    /// Highlight fenced-code body via syntect, returning one `Line` per body
+    /// line. Falls back to a plain (code-bg only) span row on any syntect
+    /// error, an unknown language tag, or empty input. Never panics.
+    fn highlight_fence<'a>(
+        body_lines: &[&str],
+        lang_tag: &str,
+        base_text: Style,
+        code_bg: Color,
+        code_fg: Color,
+    ) -> Vec<Line<'a>> {
+        let ss = syntax_set();
+        let theme = theme_for_code();
+        let syntax = if lang_tag.is_empty() {
+            ss.find_syntax_plain_text()
+        } else {
+            ss.find_syntax_by_token(lang_tag)
+                .unwrap_or_else(|| ss.find_syntax_plain_text())
+        };
+        let mut highlighter = HighlightLines::new(syntax, theme);
+        let mut out: Vec<Line<'a>> = Vec::with_capacity(body_lines.len());
+        for raw in body_lines {
+            // syntect expects a trailing newline in `highlight_line`; we
+            // synthesize one so the highlighter's state machine doesn't
+            // stall on the last line of a fence.
+            let with_nl = format!("{raw}\n");
+            match highlighter.highlight_line(&with_nl, ss) {
+                Ok(regions) => {
+                    let mut spans: Vec<Span<'a>> = Vec::with_capacity(regions.len());
+                    for (sty, text) in regions {
+                        // Strip trailing newline so it doesn't get rendered.
+                        let mut t = text.to_string();
+                        if t.ends_with('\n') {
+                            t.pop();
+                        }
+                        if t.is_empty() {
+                            continue;
+                        }
+                        spans.push(Span::styled(t, syn_style_to_ratatui(sty, base_text, code_bg)));
+                    }
+                    if spans.is_empty() {
+                        // empty highlighted line — still emit one row so the
+                        // fence body height matches the source line count.
+                        spans.push(Span::styled(
+                            String::new(),
+                            base_text.bg(code_bg).fg(code_fg),
+                        ));
+                    }
+                    out.push(Line::from(spans));
+                }
+                Err(_) => {
+                    // Graceful fallback: plain text on the code background.
+                    out.push(Line::from(vec![Span::styled(
+                        raw.to_string(),
+                        base_text.bg(code_bg).fg(code_fg),
+                    )]));
+                }
+            }
+        }
+        out
+    }
+
+    /// Convert a syntect highlight style to a ratatui style. The syntect bg
+    /// is discarded in favor of the panel's `code_bg` so the fence reads as
+    /// a single visual block rather than the patchy per-region tinting
+    /// syntect themes typically produce. Bold/italic carry through.
+    fn syn_style_to_ratatui(sty: SynStyle, base: Style, code_bg: Color) -> Style {
+        let fg = Color::Rgb(sty.foreground.r, sty.foreground.g, sty.foreground.b);
+        let mut out = base.bg(code_bg).fg(fg);
+        if sty.font_style.contains(FontStyle::BOLD) {
+            out = out.add_modifier(Modifier::BOLD);
+        }
+        if sty.font_style.contains(FontStyle::ITALIC) {
+            out = out.add_modifier(Modifier::ITALIC);
+        }
+        if sty.font_style.contains(FontStyle::UNDERLINE) {
+            out = out.add_modifier(Modifier::UNDERLINED);
+        }
+        out
+    }
+
+    /// Try to render a markdown table starting at `lines[start]`. Returns
+    /// `Some(consumed)` on success (consumed = number of source lines used
+    /// by the table including header + separator + body) or `None` if the
+    /// pattern doesn't hold (e.g. no separator row on the second line).
+    fn try_render_table<'a>(
+        lines: &[&str],
+        start: usize,
+        base_text: Style,
+        row_bg: Option<Color>,
+        muted_color: Color,
+        out: &mut Vec<Line<'a>>,
+    ) -> Option<usize> {
+        if start + 1 >= lines.len() {
+            return None;
+        }
+        let sep_line = lines[start + 1].trim();
+        if !is_separator_row(sep_line) {
+            return None;
+        }
+        // Parse header.
+        let header_cells = parse_row(lines[start]);
+        let sep_cells = parse_row(lines[start + 1]);
+        let col_count = header_cells.len().max(sep_cells.len()).max(1);
+        // Gather body rows (any contiguous `|`-prefixed lines after the
+        // separator).
+        let mut consumed = 2;
+        let mut body_rows: Vec<Vec<String>> = Vec::new();
+        while start + consumed < lines.len()
+            && lines[start + consumed].trim_start().starts_with('|')
+        {
+            body_rows.push(parse_row(lines[start + consumed]));
+            consumed += 1;
+        }
+        // Compute column widths. Cap each column at a sane width so a
+        // pathological cell doesn't overflow the pane. The shaper soft-wraps
+        // anything that overshoots, so this is a guardrail not a contract.
+        let mut col_widths = vec![0usize; col_count];
+        let mut measure = |row: &[String]| {
+            for (idx, cell) in row.iter().enumerate() {
+                if idx < col_widths.len() {
+                    col_widths[idx] = col_widths[idx].max(cell.chars().count());
+                }
+            }
+        };
+        measure(&header_cells);
+        for r in &body_rows {
+            measure(r);
+        }
+        // Clamp each column to <= 24 chars; cells are truncated with `…` if
+        // they exceed.
+        for w in col_widths.iter_mut() {
+            *w = (*w).clamp(1, 24);
+        }
+        // Header row — bold.
+        out.push(apply_bg(
+            Line::from(render_table_row(
+                &header_cells,
+                &col_widths,
+                base_text.add_modifier(Modifier::BOLD),
+                muted_color,
+            )),
+            row_bg,
+        ));
+        // Separator row — repeat `─` per column width, joined by `┼`.
+        let mut sep_spans: Vec<Span<'a>> = Vec::with_capacity(col_widths.len() * 2);
+        for (idx, w) in col_widths.iter().enumerate() {
+            sep_spans.push(Span::styled(
+                "─".repeat(*w + 2),
+                base_text.fg(muted_color),
+            ));
+            if idx + 1 < col_widths.len() {
+                sep_spans.push(Span::styled("┼".to_string(), base_text.fg(muted_color)));
+            }
+        }
+        out.push(apply_bg(Line::from(sep_spans), row_bg));
+        // Body rows.
+        for r in &body_rows {
+            out.push(apply_bg(
+                Line::from(render_table_row(r, &col_widths, base_text, muted_color)),
+                row_bg,
+            ));
+        }
+        Some(consumed)
+    }
+
+    /// `^\s*\|[\s\-:|]+\|\s*$` — accept the canonical separator row.
+    fn is_separator_row(s: &str) -> bool {
+        let t = s.trim();
+        if !t.starts_with('|') || !t.ends_with('|') || t.len() < 3 {
+            return false;
+        }
+        // Body chars between leading/trailing `|`.
+        let body = &t[1..t.len() - 1];
+        if body.is_empty() {
+            return false;
+        }
+        body.chars()
+            .all(|c| c == '-' || c == ':' || c == ' ' || c == '|')
+            && body.contains('-')
+    }
+
+    /// Parse a `|a|b|c|` row into `vec!["a", "b", "c"]`. Leading/trailing
+    /// pipes are stripped; cell text is trimmed.
+    fn parse_row(line: &str) -> Vec<String> {
+        let t = line.trim();
+        let t = t.strip_prefix('|').unwrap_or(t);
+        let t = t.strip_suffix('|').unwrap_or(t);
+        t.split('|').map(|c| c.trim().to_string()).collect()
+    }
+
+    /// Render a row's cells into spans with column-aligned padding and a
+    /// `│` separator between cells. Cells longer than the column width are
+    /// truncated with `…`.
+    fn render_table_row<'a>(
+        cells: &[String],
+        col_widths: &[usize],
+        cell_style: Style,
+        muted_color: Color,
+    ) -> Vec<Span<'a>> {
+        let mut spans: Vec<Span<'a>> = Vec::with_capacity(col_widths.len() * 2 + 1);
+        for (idx, w) in col_widths.iter().enumerate() {
+            let raw = cells.get(idx).map(|s| s.as_str()).unwrap_or("");
+            let text = pad_or_truncate(raw, *w);
+            spans.push(Span::styled(format!(" {text} "), cell_style));
+            if idx + 1 < col_widths.len() {
+                spans.push(Span::styled("│".to_string(), cell_style.fg(muted_color)));
+            }
+        }
+        spans
+    }
+
+    fn pad_or_truncate(s: &str, width: usize) -> String {
+        let count = s.chars().count();
+        if count == width {
+            s.to_string()
+        } else if count < width {
+            let mut t = s.to_string();
+            for _ in 0..(width - count) {
+                t.push(' ');
+            }
+            t
+        } else {
+            // Truncate with ellipsis. Reserve 1 char for `…`.
+            let take = width.saturating_sub(1);
+            let mut out: String = s.chars().take(take).collect();
+            out.push('…');
+            out
+        }
+    }
+
+    /// `> text`, `>> text`, etc. Returns `(depth, body)` where depth is the
+    /// count of consecutive `>` markers and body is the post-marker text.
+    fn blockquote_body(line: &str) -> Option<(usize, &str)> {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with('>') {
+            return None;
+        }
+        let mut rest = trimmed;
+        let mut depth = 0usize;
+        loop {
+            if let Some(r) = rest.strip_prefix("> ") {
+                depth += 1;
+                rest = r;
+            } else if let Some(r) = rest.strip_prefix('>').and_then(|r| {
+                // Allow `>` followed by EOL (empty quoted line).
+                if r.is_empty() {
+                    Some(r)
+                } else {
+                    None
+                }
+            }) {
+                depth += 1;
+                rest = r;
+                break;
+            } else {
+                break;
+            }
+        }
+        if depth == 0 {
+            None
+        } else {
+            Some((depth, rest))
+        }
     }
 
     fn apply_bg<'a>(line: Line<'a>, row_bg: Option<Color>) -> Line<'a> {
@@ -1973,5 +2349,220 @@ mod tests {
                 "missing gutter at row {y}"
             );
         }
+    }
+
+    // ---- Phase B: syntect fences + tables + blockquotes ---------------
+
+    /// B1 — fenced `\`\`\`rust` block runs through syntect and produces at
+    /// least one cell whose foreground is neither the theme foreground nor
+    /// the theme background_panel. Also asserts the gutter survives on the
+    /// fence body row, preserving the Phase A invariant.
+    #[test]
+    fn b1_syntect_recolors_rust_fence_keyword() {
+        let theme = Theme::default_dark();
+        let body = "```rust\nfn main() {}\n```";
+        let msgs = vec![cm("assistant", body)];
+        let mut term = Terminal::new(TestBackend::new(40, 6)).unwrap();
+        term.draw(|f| {
+            let w = TranscriptWidget::new(&msgs, 0, &theme);
+            f.render_widget(w, f.area());
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        // (1) Find at least one cell whose fg is an Rgb color (syntect
+        // returns Color::Rgb; the base theme uses indexed/hex-derived Rgb
+        // too, so we look specifically for a syntect-emitted cell by
+        // matching anywhere inside the body region with a non-default fg).
+        let mut found_syntect_fg = false;
+        for y in 1..buf.area().height {
+            for x in 0..buf.area().width {
+                let cell = &buf[(x, y)];
+                if matches!(cell.fg, Color::Rgb(_, _, _)) && cell.symbol() != " " {
+                    found_syntect_fg = true;
+                    break;
+                }
+            }
+            if found_syntect_fg {
+                break;
+            }
+        }
+        assert!(
+            found_syntect_fg,
+            "expected at least one syntect-colored Rgb cell in the fence body"
+        );
+        // (2) Gutter invariant — column 0 on each rendered row carries
+        // GUTTER_GLYPH (excluding any blank separator rows after the msg).
+        // We assert it for the first 4 rows of this single-message render.
+        for y in 0..4u16 {
+            assert_eq!(
+                buf[(0, y)].symbol(),
+                GUTTER_GLYPH,
+                "Phase A gutter invariant broken on row {y} of a syntect fence"
+            );
+        }
+        // (3) `fn` cells carry the base16-ocean.dark keyword color. The
+        // theme's keyword scope resolves to #B48EAD (a soft purple); that
+        // hex is documented at base16's color palette page. Don't pin the
+        // exact value too tightly — base16-ocean is stable in syntect 5
+        // but a minor upstream tweak could shift one channel. We assert
+        // the cell is purple-ish (R > B > G is a defensible band for
+        // ocean's purple keyword) instead of brittle exact-match.
+        let mut found_fn_color = None;
+        for y in 1..buf.area().height {
+            for x in 0..buf.area().width.saturating_sub(1) {
+                if buf[(x, y)].symbol() == "f" && buf[(x + 1, y)].symbol() == "n" {
+                    if let Color::Rgb(r, g, b) = buf[(x, y)].fg {
+                        found_fn_color = Some((r, g, b));
+                    }
+                    break;
+                }
+            }
+        }
+        let (r, g, b) =
+            found_fn_color.expect("expected to find the `fn` keyword in the rendered buffer");
+        // base16-ocean.dark keyword fg = (180, 142, 173) → R ~ 180, G ~ 142, B ~ 173.
+        // Allow ±8 per channel to absorb minor upstream drift.
+        assert!(
+            r.abs_diff(180) <= 8 && g.abs_diff(142) <= 8 && b.abs_diff(173) <= 8,
+            "expected base16-ocean.dark keyword color (~180,142,173) for `fn`, got ({r},{g},{b})"
+        );
+    }
+
+    /// B1 fallback — fenced block with no language tag still falls through
+    /// syntect (plain-text syntax). Body content survives verbatim (the
+    /// pre-existing `md_code_fence_preserves_content_verbatim` test
+    /// already covers this; this one is a focused sanity check that
+    /// adding syntect didn't accidentally drop characters).
+    #[test]
+    fn b1_unknown_language_falls_back_gracefully() {
+        let theme = Theme::default_dark();
+        let body = "```nosuchlang\nhello world\n```";
+        let lines = md::render(body, &theme, Style::default(), None);
+        // open + body + close = 3 lines.
+        assert_eq!(lines.len(), 3);
+        let body_text: String = lines[1]
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(
+            body_text.contains("hello world"),
+            "unknown-language fence dropped content: {body_text:?}"
+        );
+    }
+
+    /// B2 — 2-row 2-col table renders header bold, a `─`-filled separator
+    /// row, and column-aligned body cells.
+    #[test]
+    fn b2_table_renders_header_separator_and_body() {
+        let theme = Theme::default_dark();
+        let body = "| col1 | col2 |\n|------|------|\n| val1 | val2 |";
+        let lines = md::render(body, &theme, Style::default(), None);
+        assert_eq!(lines.len(), 3, "expected 3 lines (header + sep + body)");
+        // Header — at least one span bold.
+        let header_bold = lines[0]
+            .spans
+            .iter()
+            .any(|s| s.style.add_modifier.contains(Modifier::BOLD));
+        assert!(header_bold, "header row must contain a BOLD span");
+        // Separator — joined text contains `─`.
+        let sep_text: String = lines[1]
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(sep_text.contains("─"), "separator row missing `─`: {sep_text:?}");
+        // Body row — contains both `val1` and `val2`.
+        let body_text: String = lines[2]
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(
+            body_text.contains("val1") && body_text.contains("val2"),
+            "body row missing cell content: {body_text:?}"
+        );
+    }
+
+    /// B2 — frame-buffer level: a table message renders with the gutter
+    /// preserved on every row, and the rendered separator row contains
+    /// `─` somewhere.
+    #[test]
+    fn b2_table_frame_buffer_preserves_gutter_and_renders_separator() {
+        let theme = Theme::default_dark();
+        let body = "| a | b |\n|---|---|\n| x | y |";
+        let msgs = vec![cm("assistant", body)];
+        let mut term = Terminal::new(TestBackend::new(40, 6)).unwrap();
+        term.draw(|f| {
+            let w = TranscriptWidget::new(&msgs, 0, &theme);
+            f.render_widget(w, f.area());
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        // First 4 rows = header (msg header), then table header / sep / body.
+        for y in 0..4u16 {
+            assert_eq!(
+                buf[(0, y)].symbol(),
+                GUTTER_GLYPH,
+                "Phase A gutter invariant broken on table row {y}"
+            );
+        }
+        // Find the row containing `─`.
+        let mut found_sep = false;
+        for y in 0..buf.area().height {
+            for x in 0..buf.area().width {
+                if buf[(x, y)].symbol() == "─" {
+                    found_sep = true;
+                    break;
+                }
+            }
+            if found_sep {
+                break;
+            }
+        }
+        assert!(found_sep, "expected the separator row to render `─` somewhere");
+    }
+
+    /// B3 — `> hello` renders an accent `│` glyph in `theme.text_muted`
+    /// color, immediately after the gutter+space prefix.
+    #[test]
+    fn b3_blockquote_inserts_accent_glyph_in_muted_color() {
+        let theme = Theme::default_dark();
+        let body = "> hello";
+        let msgs = vec![cm("assistant", body)];
+        let mut term = Terminal::new(TestBackend::new(40, 4)).unwrap();
+        term.draw(|f| {
+            let w = TranscriptWidget::new(&msgs, 0, &theme);
+            f.render_widget(w, f.area());
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        // Layout on the body row (y=1):
+        //   col 0 = GUTTER_GLYPH
+        //   col 1 = ' '  (push_message body prefix)
+        //   col 2 = '│'  (accent — B3)
+        assert_eq!(buf[(0, 1)].symbol(), GUTTER_GLYPH);
+        assert_eq!(buf[(2, 1)].symbol(), "│", "expected accent glyph at col 2");
+        // The accent fg must match the muted color from the theme.
+        let muted = theme_color(&theme.text_muted, Color::Gray);
+        assert_eq!(
+            buf[(2, 1)].fg, muted,
+            "accent glyph must use theme.text_muted color"
+        );
+    }
+
+    /// B3 — nested `>> ...` produces two accent glyphs in a row.
+    #[test]
+    fn b3_nested_blockquote_doubles_accent_glyph() {
+        let theme = Theme::default_dark();
+        let lines = md::render("> > hi", &theme, Style::default(), None);
+        assert_eq!(lines.len(), 1);
+        // Count `│ ` spans at the start of the line.
+        let accent_count = lines[0]
+            .spans
+            .iter()
+            .filter(|s| s.content.as_ref() == "│ ")
+            .count();
+        assert_eq!(accent_count, 2, "expected 2 accent glyphs for `> > `: {:?}", lines[0].spans);
     }
 }
