@@ -93,6 +93,10 @@ pub struct State {
     /// Buffer for [`Mode::CustomName`]. Pre-populated from
     /// `session_display_name` so the user can edit rather than retype.
     pub custom_name_input: String,
+
+    /// Phase D: instant the modal was opened. Drives the backdrop fade-in
+    /// via the main screen renderer.
+    pub opened_at: std::time::Instant,
 }
 
 impl State {
@@ -116,6 +120,7 @@ impl State {
             mode: Mode::StatusPicker,
             selected_index,
             custom_name_input: display_name,
+            opened_at: std::time::Instant::now(),
         }
     }
 }
@@ -349,12 +354,17 @@ fn render_status_list(state: &State, theme: &Theme, area: Rect, buf: &mut Buffer
 }
 
 fn render_name_input(state: &State, theme: &Theme, area: Rect, buf: &mut Buffer) {
+    let field_bg = theme_color(&theme.background_element, Color::Reset);
     let prompt_style = Style::default()
         .fg(theme_color(&theme.primary, Color::Yellow))
+        .bg(field_bg)
         .add_modifier(Modifier::BOLD);
+    let text_style = Style::default()
+        .fg(theme_color(&theme.foreground, Color::White))
+        .bg(field_bg);
     let caret_style = Style::default()
         .bg(theme_color(&theme.foreground, Color::White))
-        .fg(theme_color(&theme.background, Color::Black));
+        .fg(theme_color(&theme.background_element, Color::Black));
     let muted = Style::default()
         .fg(theme_color(&theme.text_muted, Color::DarkGray))
         .add_modifier(Modifier::DIM);
@@ -371,12 +381,23 @@ fn render_name_input(state: &State, theme: &Theme, area: Rect, buf: &mut Buffer)
     )))
     .render(v[0], buf);
 
+    // Paint the input row with the field bg so it reads as a text field.
+    for y in v[1].y..v[1].y.saturating_add(v[1].height) {
+        for x in v[1].x..v[1].x.saturating_add(v[1].width) {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_bg(field_bg);
+            }
+        }
+    }
+
     let line = Line::from(vec![
         Span::styled(" > ", prompt_style),
-        Span::raw(state.custom_name_input.clone()),
+        Span::styled(state.custom_name_input.clone(), text_style),
         Span::styled(" ", caret_style),
     ]);
-    Paragraph::new(line).render(v[1], buf);
+    Paragraph::new(line)
+        .style(Style::default().bg(field_bg))
+        .render(v[1], buf);
 }
 
 fn render_footer(_state: &State, theme: &Theme, area: Rect, buf: &mut Buffer) {

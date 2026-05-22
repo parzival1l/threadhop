@@ -92,6 +92,10 @@ pub struct SearchState {
     /// opens. Surfaced in [`draw`] when the input is empty so the user has a
     /// fallback list to choose from before typing anything.
     pub recents: Vec<String>,
+
+    /// Phase D: instant the modal was opened. Drives the backdrop fade-in
+    /// via the main screen renderer.
+    pub opened_at: Instant,
 }
 
 impl SearchState {
@@ -107,6 +111,7 @@ impl SearchState {
             error: None,
             last_keystroke_at: Instant::now(),
             recents: Vec::new(),
+            opened_at: Instant::now(),
         }
     }
 
@@ -385,20 +390,43 @@ fn render_pills(filters: &Filters, theme: &Theme, area: Rect, buf: &mut Buffer) 
 /// ratatui's cursor positioning because the modal may not have OS focus
 /// during tests; rendering an explicit caret span keeps snapshot tests
 /// deterministic.
+///
+/// The row sits on a `background_element` strip so it reads like a real
+/// text field — the panel background flush with the input row was
+/// indistinguishable from canvas chrome.
 fn render_input(query: &str, theme: &Theme, area: Rect, buf: &mut Buffer) {
+    let field_bg = theme_color(&theme.background_element, Color::Reset);
+    // Paint the whole row with the field bg first so leading/trailing
+    // padding cells share the tint.
+    for y in area.y..area.y.saturating_add(area.height) {
+        for x in area.x..area.x.saturating_add(area.width) {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_bg(field_bg);
+            }
+        }
+    }
+
     let prompt_style = Style::default()
         .fg(theme_color(&theme.primary, Color::Yellow))
+        .bg(field_bg)
         .add_modifier(Modifier::BOLD);
+    let text_style = Style::default()
+        .fg(theme_color(&theme.foreground, Color::White))
+        .bg(field_bg);
+    // Caret inverts fg/bg against the field so it stays visible on top
+    // of the field tint.
     let caret_style = Style::default()
         .bg(theme_color(&theme.foreground, Color::White))
-        .fg(theme_color(&theme.background, Color::Black));
+        .fg(theme_color(&theme.background_element, Color::Black));
 
     let line = Line::from(vec![
         Span::styled("> ", prompt_style),
-        Span::raw(query.to_string()),
+        Span::styled(query.to_string(), text_style),
         Span::styled(" ", caret_style),
     ]);
-    Paragraph::new(line).render(area, buf);
+    Paragraph::new(line)
+        .style(Style::default().bg(field_bg))
+        .render(area, buf);
 }
 
 /// Hit list. Each row: `<session-id-short> │ <snippet>`.
