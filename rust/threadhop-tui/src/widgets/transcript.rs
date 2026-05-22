@@ -223,7 +223,11 @@ impl<'a> Widget for TranscriptWidget<'a> {
 /// row index after `shape_lines` has expanded soft-wraps. Walks the same
 /// build sequence used by `build_lines` and applies the shaper's width
 /// budget per-line.
-fn source_to_visual_line(
+///
+/// Made `pub` in pre-pop for Worker F so scroll-jump call sites in
+/// `app.rs` / `event.rs` can map source-line targets to the eased
+/// visual position rather than the raw paragraph offset.
+pub fn source_to_visual_line(
     messages: &[CleanedMessage],
     source_line: usize,
     width: u16,
@@ -830,6 +834,18 @@ pub fn role_bg(role: &str, theme: &Theme) -> Option<Color> {
         _ => &theme.background_element,
     };
     hex_to_rgb(hex).map(|(r, g, b)| Color::Rgb(r, g, b))
+}
+
+/// Returns true for roles that should render as a CommandPill — a
+/// dim, gutter-less one-liner rather than a full role-tinted message
+/// card. Worker G's render-path branch reads this; pre-pop just
+/// canonicalises the two roles that Python's TUI treats as commands.
+///
+/// The Python source of truth: `tui/widgets/transcript.py::CommandPill`
+/// fires for `command` and `skill_load` roles. Anything else gets the
+/// normal role gutter.
+pub fn is_command_pill_role(role: &str) -> bool {
+    matches!(role, "command" | "skill_load")
 }
 
 /// Pure helper — exposed for tests. Maps a role string to the user-facing
@@ -1597,6 +1613,30 @@ mod tests {
         assert_eq!(role_label("tool"), "Tool");
         assert_eq!(role_label("tool_result"), "Tool Result");
         assert_eq!(role_label("???"), "Message");
+    }
+
+    #[test]
+    fn is_command_pill_role_matches_python_roles() {
+        // Pre-pop: Python's CommandPill renders for these two roles.
+        assert!(is_command_pill_role("command"));
+        assert!(is_command_pill_role("skill_load"));
+        // Everything else is a regular role-tinted card.
+        assert!(!is_command_pill_role("user"));
+        assert!(!is_command_pill_role("assistant"));
+        assert!(!is_command_pill_role("tool"));
+        assert!(!is_command_pill_role(""));
+    }
+
+    #[test]
+    fn source_to_visual_line_is_callable_from_outside_module() {
+        // Pre-pop accessibility check — Worker F drives this from
+        // app.rs / event.rs scroll-jump call sites, so the `pub`
+        // visibility needs to stick. The test simply proves the symbol
+        // is reachable from a non-module path (and the call doesn't
+        // panic on a trivial input).
+        use crate::widgets::transcript::source_to_visual_line;
+        let messages = vec![cm("user", "hello world")];
+        let _ = source_to_visual_line(&messages, 0, 80);
     }
 
     #[test]

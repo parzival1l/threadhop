@@ -14,6 +14,7 @@ use std::time::Duration;
 use crossterm::event::{KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use threadhop_core::{
+    digest::SessionDigest,
     jsonl::CleanedMessage,
     models::Session,
     observations::{Observation, ObservationSummary},
@@ -246,6 +247,21 @@ pub struct App {
     /// freshest observation file without a per-frame disk read.
     pub digest_summary_cache: HashMap<String, ObservationSummary>,
 
+    /// Per-session [`SessionDigest`] cache for the right-column panel.
+    /// **Pre-pop scaffolding.** Worker H populates entries by calling
+    /// [`threadhop_core::digest::compute_session_digest`] from the
+    /// fs_watcher refresh handler; until then the map stays empty and
+    /// the panel renders its empty-state branch.
+    pub digest_cache: HashMap<String, SessionDigest>,
+
+    /// Set of message UUIDs whose tool-call body is currently expanded
+    /// in the transcript pane. Pre-pop initialises this to empty; the
+    /// renderer treats absence as "folded" (the Python TUI default
+    /// per the parity plan §6 of Open Questions). Worker E wires the
+    /// `Command::ToggleToolFold` handler that inserts/removes UUIDs
+    /// from this set.
+    pub expanded_tools: HashSet<String>,
+
     /// Set of session ids that have at least one bookmark. Drives the
     /// digest-bar `★ bookmarked` marker and avoids re-querying SQLite on
     /// every frame.
@@ -357,6 +373,29 @@ pub fn find_bar_close_col(bar: ratatui::layout::Rect) -> Option<u16> {
     Some(bar.x + bar.width - 2)
 }
 
+/// Read the user-configured theme name from
+/// `~/.config/threadhop/config.json`. Recognises both `theme` and
+/// `theme_name` keys (the Python TUI has shipped both at various
+/// points). Returns `None` for any failure — missing file, bad JSON,
+/// missing key — so callers fall back to the built-in default.
+///
+/// Pre-pop helper for `App::new_with_theme_name`. Worker H+1 (or
+/// whichever theme-loading follow-up lands first) can grow this into a
+/// full config struct without disturbing the call site in `App::new`.
+fn read_theme_name_from_config() -> Option<String> {
+    let path = threadhop_core::paths::config_path();
+    let bytes = std::fs::read(&path).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let obj = v.as_object()?;
+    if let Some(name) = obj.get("theme").and_then(|x| x.as_str()) {
+        return Some(name.to_string());
+    }
+    if let Some(name) = obj.get("theme_name").and_then(|x| x.as_str()) {
+        return Some(name.to_string());
+    }
+    None
+}
+
 /// Phase E: which pane owns focus. Drives the focus-aware border highlight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PaneFocus {
@@ -381,6 +420,22 @@ impl App {
     /// but the rest of the TUI stays usable. The failure is surfaced via
     /// `status_message`.
     pub fn new() -> Self {
+        Self::new_with_theme_name(None)
+    }
+
+    /// Construct an App with an explicit theme name (or `None` to read
+    /// from the on-disk config). Pre-pop entry point so tests can pin
+    /// the theme without touching `~/.config/threadhop/config.json`.
+    ///
+    /// The lookup order:
+    ///   1. `theme_name` argument when `Some`.
+    ///   2. The `theme` (or `theme_name`) string in
+    ///      `~/.config/threadhop/config.json`.
+    ///   3. The built-in `default_dark` theme.
+    ///
+    /// Unknown names fall back to `default_dark` per
+    /// [`Theme::load_by_name`] semantics.
+    pub fn new_with_theme_name(theme_name: Option<String>) -> Self {
         let (active_session_tx, _initial_rx) = watch::channel::<Option<String>>(None);
         // Fall back to an in-memory DB if the on-disk open fails. Set
         // `read_only = true` so write helpers short-circuit instead of
@@ -421,6 +476,19 @@ impl App {
         if cfg!(test) {
             no_anim = true;
         }
+        // Theme resolution. The explicit arg wins; otherwise we peek at
+        // the config JSON for a `theme` or `theme_name` field and fall
+        // back to the built-in default_dark. The config read is
+        // best-effort — a missing file, bad JSON, or unrecognised name
+        // all degrade silently to the default theme so the TUI always
+        // boots.
+        let theme = {
+            let resolved = theme_name.or_else(read_theme_name_from_config);
+            match resolved {
+                Some(name) => Theme::load_by_name(&name),
+                None => Theme::default_dark(),
+            }
+        };
         Self {
             should_quit: false,
             sessions: Vec::new(),
@@ -435,7 +503,7 @@ impl App {
             no_anim,
             modal_opened_at: None,
             transcript: Vec::new(),
-            theme: Theme::default_dark(),
+            theme,
             status_message,
             read_only,
             scope: Scope::MainScreen,
@@ -452,6 +520,8 @@ impl App {
             kanban: None,
             conflict_viewer: None,
             digest_summary_cache: HashMap::new(),
+            digest_cache: HashMap::new(),
+            expanded_tools: HashSet::new(),
             has_bookmarks_for_session: HashSet::new(),
             conflict_counts: HashMap::new(),
             help: None,
@@ -875,6 +945,11 @@ impl App {
             }
             Command::EnterSelectionMode => self.enter_selection_mode(),
             Command::EditBookmarkNote => self.stub_command("edit bookmark note"),
+            // Pre-pop: reserved variants whose handlers land in the
+            // deferrals-cleanup wave. Worker D wires
+            // `OpenBookmarkNotePrompt`; Worker E wires `ToggleToolFold`.
+            Command::OpenBookmarkNotePrompt => self.stub_command("edit bookmark note"),
+            Command::ToggleToolFold => self.stub_command("toggle tool fold"),
             // Cancel is owned by the modal-first dispatch; modal-only
             // commands never fire on the main screen.
             Command::Cancel
@@ -2075,6 +2150,40 @@ mod tests {
             is_sidechain: 0,
             message_id: None,
         }
+    }
+
+    #[test]
+    fn new_with_theme_name_loads_named_theme() {
+        // Pre-pop: `App::new_with_theme_name` should resolve a known
+        // theme name and the resulting App's `theme` field should
+        // visibly differ from the built-in default on at least one
+        // cell (the accent). This proves the config-driven lookup
+        // actually ran rather than silently falling through.
+        let default_accent = Theme::default_dark().accent.clone();
+        let app = App::new_with_theme_name(Some("cursor-dark".to_string()));
+        assert_eq!(app.theme.name, "cursor-dark");
+        assert_ne!(
+            app.theme.accent, default_accent,
+            "cursor-dark theme should distinguish its accent from default_dark"
+        );
+    }
+
+    #[test]
+    fn new_with_theme_name_unknown_falls_back_to_default_dark() {
+        // Pre-pop: an unrecognised name must NOT panic — the lookup
+        // degrades to default_dark so the TUI always boots.
+        let app = App::new_with_theme_name(Some("not-a-theme".to_string()));
+        assert_eq!(app.theme.name, Theme::default_dark().name);
+    }
+
+    #[test]
+    fn new_app_initialises_pre_pop_caches_empty() {
+        // Pre-pop scaffolding: `expanded_tools` and `digest_cache` must
+        // initialise empty so Worker E / Worker H can rely on absence
+        // meaning "no entries cached yet".
+        let app = App::new();
+        assert!(app.expanded_tools.is_empty());
+        assert!(app.digest_cache.is_empty());
     }
 
     #[test]

@@ -11,6 +11,7 @@
 //! Module bodies are populated by Phase 1 tasks 1.2–1.15 of the Rust TUI port plan.
 
 pub mod db;
+pub mod digest;
 pub mod error;
 pub mod fts;
 pub mod jsonl;

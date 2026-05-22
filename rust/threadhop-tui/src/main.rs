@@ -7,6 +7,7 @@
 
 mod anim;
 mod app;
+mod clipboard;
 mod event;
 mod keys;
 mod screens;

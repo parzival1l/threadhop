@@ -164,6 +164,17 @@ pub enum Command {
     /// Edit the focused bookmark's note (`Shift+L`). Stub on MainScreen;
     /// real handler lives in the bookmark browser scope (Wave 2).
     EditBookmarkNote,
+    // ---- Deferrals-cleanup pre-pop additions -----------------------------
+    /// Open the bookmark-note prompt modal for editing the note on the
+    /// currently-selected bookmark. Pre-pop reserves this variant so
+    /// Worker D can wire the `L` handler in selection mode and the
+    /// bookmark-browser modal without touching the enum again.
+    OpenBookmarkNotePrompt,
+    /// Toggle the folded/expanded state of the tool message under the
+    /// transcript message cursor. Pre-pop reserves the variant; Worker E
+    /// adds the key binding (`o` per the Phase C task 3 spec) and the
+    /// dispatch branch that flips `App::expanded_tools`.
+    ToggleToolFold,
 }
 
 /// Single binding row. `label` drives the contextual footer + help overlay.

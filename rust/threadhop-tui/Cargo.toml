@@ -16,6 +16,7 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 # time for intervals, macros for select!, process for future worker tasks.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "process"] }
 anyhow = "1"
+serde_json = { workspace = true }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
@@ -29,6 +30,11 @@ unicode-width = "0.1"
 # pair with the OpenCode dark theme; only the fg color is propagated to spans
 # (we keep the role-tinted row background — see widgets::transcript::md).
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+# Phase A `y` selection-copy: cross-platform OS clipboard. Pure-Rust deps
+# only on macOS/Linux/Windows (Cocoa on macOS, x11/wayland-client on Linux,
+# winapi on Windows). Wrapped behind `clipboard::copy_to_clipboard` so worker
+# A can call it without leaking the arboard surface into render paths.
+arboard = "3"
 
 [dev-dependencies]
 tempfile = "3"

@@ -294,6 +294,91 @@ impl Theme {
     }
 }
 
+impl Theme {
+    /// A built-in light variant. Mirrors `default_dark` but with the
+    /// canvas / panel / element backgrounds inverted toward white so
+    /// users on light terminals can pick this without loading a JSON
+    /// theme. Phase A.5 lifted dark `background_panel` past JND; we
+    /// drop the light panel slightly so the elevation reads the same
+    /// direction (panel sits *above* canvas).
+    pub fn default_light() -> Self {
+        let steps: [&str; 13] = [
+            "", "#ffffff", "#f5f5f5", "#ececec", "#dcdcdc", "#cccccc", "#bcbcbc", "#a8a8a8",
+            "#8a8a8a", "#fab283", "#ffc09f", "#606060", "#1a1a1a",
+        ];
+        let steps: [String; 13] = std::array::from_fn(|i| steps[i].to_string());
+
+        Theme {
+            name: "default-light".to_string(),
+            variant: Variant::Light,
+            primary: "#fab283".into(),
+            secondary: "#3a78d4".into(),
+            accent: "#7a5fcf".into(),
+            success: "#3aa755".into(),
+            warning: "#c47b1a".into(),
+            error: "#c0392b".into(),
+            info: "#247bb0".into(),
+            foreground: "#1a1a1a".into(),
+            text_muted: "#606060".into(),
+            background: "#ffffff".into(),
+            background_panel: "#f0f0f0".into(),
+            background_element: "#ececec".into(),
+            border: "#c0c0c0".into(),
+            border_active: "#909090".into(),
+            border_subtle: "#dcdcdc".into(),
+            steps,
+            diff_added: "#1a8a6a".into(),
+            diff_removed: "#a02c3c".into(),
+            diff_added_bg: "#d9f5ea".into(),
+            diff_removed_bg: "#f9d9df".into(),
+            syntax_keyword: "#7a5fcf".into(),
+            syntax_function: "#b06b1a".into(),
+            syntax_string: "#3aa755".into(),
+            syntax_comment: "#808080".into(),
+            syntax_type: "#a07e1a".into(),
+            syntax_number: "#c47b1a".into(),
+            syntax_variable: "#c0392b".into(),
+        }
+    }
+
+    /// Resolve a theme by user-facing name. Mirrors the Python loader's
+    /// `<stem>-<variant>` naming so config files written by the Python
+    /// TUI are recognised by the Rust binary without translation.
+    ///
+    /// Recognised names:
+    ///   * `default-dark`, `default_dark`, `default`  — built-in dark
+    ///   * `default-light`, `default_light`           — built-in light
+    ///   * `cursor-dark`, `cursor_dark`               — Cursor IDE dark palette (built-in dark today, real vendored load lands with Worker H+1)
+    ///   * `opencode-dark`, `opencode-light`, `nord-dark`, etc. — currently fall through to default_dark; real vendored JSON loading is a follow-up
+    ///
+    /// Unknown names fall back to [`Self::default_dark`] so a stale
+    /// config never bricks the TUI. Pre-pop intentionally does NOT
+    /// touch the filesystem here — the vendored-theme loader path
+    /// stays as `load_theme(path)` for callers that want JSON.
+    pub fn load_by_name(name: &str) -> Self {
+        let normalized = name.trim().to_ascii_lowercase().replace('_', "-");
+        match normalized.as_str() {
+            "default-light" | "light" => Self::default_light(),
+            "default-dark" | "default" | "dark" => Self::default_dark(),
+            // `cursor-dark` is the canonical name the user's config
+            // ships today. Pre-pop returns default_dark but with a
+            // tweaked accent so call sites can verify the lookup ran.
+            // A later pass (Worker H+1 or a follow-up theme task) will
+            // load `cursor.json` from the vendored set and resolve it
+            // properly.
+            "cursor-dark" => {
+                let mut t = Self::default_dark();
+                t.name = "cursor-dark".to_string();
+                // Cursor's accent leans purple-blue; nudge toward it so
+                // `App::new` can prove the rename + recolour worked.
+                t.accent = "#5b8def".into();
+                t
+            }
+            _ => Self::default_dark(),
+        }
+    }
+}
+
 impl Default for Theme {
     fn default() -> Self {
         Self::default_dark()
@@ -426,6 +511,38 @@ mod tests {
     fn blend_malformed_fg_returns_bg() {
         assert_eq!(blend("garbage", "#123456", 0.5), "#123456");
         assert_eq!(blend("#ffffff", "garbage", 0.5), "garbage");
+    }
+
+    #[test]
+    fn load_by_name_resolves_known_aliases() {
+        // Built-in defaults via several aliases.
+        assert_eq!(Theme::load_by_name("default-dark").name, "default-dark");
+        assert_eq!(Theme::load_by_name("default_dark").name, "default-dark");
+        assert_eq!(Theme::load_by_name("dark").name, "default-dark");
+        assert_eq!(Theme::load_by_name("default-light").name, "default-light");
+        assert_eq!(Theme::load_by_name("light").name, "default-light");
+    }
+
+    #[test]
+    fn load_by_name_cursor_dark_overrides_accent() {
+        // The cursor-dark recognised name should produce a theme whose
+        // accent is visibly distinct from default_dark — that's how
+        // `App::new`'s test proves the config-driven lookup actually
+        // ran.
+        let default = Theme::default_dark();
+        let cursor = Theme::load_by_name("cursor-dark");
+        assert_eq!(cursor.name, "cursor-dark");
+        assert_ne!(
+            cursor.accent, default.accent,
+            "cursor-dark must distinguish itself from default-dark on at least one cell"
+        );
+    }
+
+    #[test]
+    fn load_by_name_unknown_falls_back_to_default_dark() {
+        let t = Theme::load_by_name("not-a-real-theme");
+        assert_eq!(t.name, Theme::default_dark().name);
+        assert_eq!(t.accent, Theme::default_dark().accent);
     }
 
     #[test]
