@@ -1,7 +1,5 @@
-#![allow(dead_code)] // Worker A wires this into the selection-mode `y` handler.
-
-//! OS-clipboard helper. Pre-pop scaffolding for the Phase A `y`
-//! selection-copy keybinding (Worker A wires the call site).
+//! OS-clipboard helper for the Phase A `y` selection-copy keybinding.
+//! Wired into [`crate::app::App::copy_selection_to_clipboard`] in Wave 1.
 //!
 //! The implementation wraps `arboard::Clipboard` so the rest of the TUI
 //! depends on a single small surface rather than scattering arboard

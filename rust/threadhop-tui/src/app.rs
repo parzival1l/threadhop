@@ -1213,16 +1213,54 @@ impl App {
         }
     }
 
-    /// Phase A: copy the selected message(s) to the system clipboard.
-    /// Deferred — `arboard` is not yet a workspace dep and the task brief
-    /// said to NOT add it unilaterally. Surface the deferral via
-    /// status_message so the binding still feels live.
+    /// Phase A.6 (Wave 1, Worker A): copy the selected message(s) to the
+    /// system clipboard via [`crate::clipboard::copy_to_clipboard`]. Uses the
+    /// same body-building shape as [`Self::export_selection`] (role label +
+    /// optional timestamp + body) so what you copy matches what you'd export.
+    ///
+    /// In CI / headless environments the clipboard backend may be
+    /// unreachable; we surface that as a friendly status_message instead of
+    /// panicking, matching the pre-pop helper's `ClipboardError::Unavailable`
+    /// contract.
     fn copy_selection_to_clipboard(&mut self) {
-        // TODO(phase A.6): wire `arboard` (macOS-only initially) and copy
-        // the selected message bodies, mirroring Python's
-        // TranscriptView._copy_selection (session label + role + text).
-        self.status_message =
-            Some("Clipboard backend not yet wired (Phase A.6)".into());
+        let Some(sel) = self.selection_state else {
+            // Defensive — `y` is only dispatched while in selection mode,
+            // but if a future caller invokes this without a live selection
+            // we want a no-panic soft message rather than silence.
+            self.status_message = Some("No selection to copy".into());
+            return;
+        };
+        if self.transcript.is_empty() {
+            self.status_message = Some("No selection to copy".into());
+            return;
+        }
+        let (lo, hi) = sel.range();
+        let max = self.transcript.len().saturating_sub(1);
+        let hi = hi.min(max);
+        let mut body = String::new();
+        for msg in self.transcript.iter().take(hi + 1).skip(lo) {
+            body.push_str("## ");
+            body.push_str(crate::widgets::transcript::role_label(&msg.role));
+            if let Some(ts) = &msg.timestamp {
+                body.push_str("  ");
+                body.push_str(ts);
+            }
+            body.push_str("\n\n");
+            body.push_str(&msg.text);
+            body.push_str("\n\n");
+        }
+        let n = body.chars().count();
+        match crate::clipboard::copy_to_clipboard(&body) {
+            Ok(()) => {
+                self.status_message = Some(format!("Copied {n} chars to clipboard"));
+            }
+            Err(crate::clipboard::ClipboardError::Unavailable) => {
+                self.status_message = Some("Clipboard unavailable".into());
+            }
+            Err(crate::clipboard::ClipboardError::Backend(e)) => {
+                self.status_message = Some(format!("Clipboard unavailable: {e}"));
+            }
+        }
     }
 
     /// Phase A: export the selected message(s) to a temp file under
@@ -3583,5 +3621,56 @@ mod tests {
         app.scroll_current = 50.0;
         app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
         assert_eq!(app.scroll, 50 + HALF_PAGE);
+    }
+
+    // ---- Phase A.6 (Wave 1, Worker A): clipboard `y` wiring ---------------
+
+    #[test]
+    fn selection_mode_y_emits_clipboard_status_message_on_success() {
+        // Enter selection mode and dispatch `y`. CI may or may not have a
+        // reachable clipboard backend, so we accept either the success
+        // ("Copied N chars to clipboard") or the soft-failure
+        // ("Clipboard unavailable...") branch — both prove the deferral
+        // stub was replaced with a real call.
+        let mut app = App::new();
+        app.transcript = vec![
+            msg("u1", "user", "alpha line"),
+            msg("u2", "assistant", "beta line"),
+        ];
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert_eq!(app.scope, Scope::Selection);
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        let s = app.status_message.as_deref().unwrap_or("");
+        let copied = s.starts_with("Copied ") && s.contains("chars to clipboard");
+        let unavailable = s.starts_with("Clipboard unavailable");
+        assert!(
+            copied || unavailable,
+            "expected copy success or unavailable status; got {s:?}"
+        );
+        // The deferral stub must be gone.
+        assert!(
+            !s.contains("not yet wired"),
+            "stub message still present: {s:?}"
+        );
+    }
+
+    #[test]
+    fn selection_mode_y_does_not_panic_when_no_selection() {
+        // Defensive: call the helper directly with no selection_state. This
+        // shouldn't happen via the key dispatcher (selection_state is
+        // populated when scope==Selection) but the helper must degrade to a
+        // safe no-panic status rather than unwrap on None.
+        let mut app = App::new();
+        assert!(app.selection_state.is_none());
+        app.copy_selection_to_clipboard();
+        let s = app.status_message.as_deref().unwrap_or("");
+        assert!(
+            !s.is_empty(),
+            "expected a soft status message when no selection; got empty"
+        );
+        assert!(
+            !s.contains("not yet wired"),
+            "stub message must not appear: {s:?}"
+        );
     }
 }
