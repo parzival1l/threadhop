@@ -5,6 +5,7 @@
 //! the terminal, enters raw mode + alternate screen, and runs the event loop
 //! until the user quits.
 
+mod anim;
 mod app;
 mod event;
 mod keys;

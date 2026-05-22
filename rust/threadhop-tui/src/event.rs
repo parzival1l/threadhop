@@ -88,6 +88,10 @@ pub async fn run(
             return Ok(());
         }
 
+        // Phase D: advance any in-flight animation (currently just the
+        // scroll easing tween) and reconcile the modal-fade timer. Cheap
+        // when no tween is active — early-out inside the App.
+        app.tick_animations();
         terminal.draw(|f| app.draw(f))?;
     }
 }
@@ -144,8 +148,9 @@ pub(crate) fn handle_worker_event(app: &mut App, event: WorkerEvent) {
                     app.sidebar.first().map(|i| i.session_id.clone());
                 let _ = app.active_session_tx.send(app.selected_session_id.clone());
                 // Selection changed → reset the scroll so we don't carry an
-                // out-of-range value into the new transcript.
-                app.scroll = 0;
+                // out-of-range value into the new transcript. Routes through
+                // the Phase D setter so the tween state stays in sync.
+                app.set_scroll(0);
             }
         }
         WorkerEvent::ActiveDetectorRefreshed(active) => {

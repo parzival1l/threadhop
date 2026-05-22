@@ -9,14 +9,17 @@
 //! `session_scanner` worker via `SessionsRefreshed`. The screen renders it
 //! straight through — no derivation.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use ratatui::{
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
+    style::Color,
     Frame,
 };
+use threadhop_core::theme::{blend, hex_to_rgb};
 
-use crate::app::App;
+use crate::anim::Easing;
+use crate::app::{App, MODAL_BACKDROP_ALPHA, MODAL_FADE_DURATION};
 use crate::widgets::{
     contextual_footer::ContextualFooterWidget,
     digest_bar::{DigestBarContext, DigestBarWidget},
@@ -177,6 +180,20 @@ pub fn draw(app: &App, frame: &mut Frame) {
         .status(app.status_message.as_deref());
     frame.render_widget(footer, outer[2]);
 
+    // Phase D: modal backdrop fade-in. Identify the topmost modal's
+    // `opened_at` (z-order matches the if-chain below), compute the
+    // current alpha via `EaseOutCubic` over MODAL_FADE_DURATION, and paint
+    // a blended overlay across the FULL frame area. Each modal's own
+    // `Clear` call wipes the modal rect, leaving only the cells outside
+    // the modal carrying the dim — that's exactly the backdrop tint the
+    // spec calls for.
+    if let Some(opened_at) = topmost_modal_opened_at(app) {
+        let alpha = compute_fade_alpha(opened_at, app);
+        if alpha > 0.0 {
+            paint_backdrop(frame, area, alpha, app);
+        }
+    }
+
     // Modals are stacked in z-order (later = on top). `ratatui::widgets::Clear`
     // (called inside each modal's draw) wipes the background, so the
     // underlying main layout never bleeds through. The confirm modal lands
@@ -266,6 +283,57 @@ fn now_epoch() -> f64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+/// Phase D: when did the topmost modal open? The App stamps
+/// `modal_opened_at` on every modal-open path so we don't have to
+/// reach into per-modal state structs (one of which lives in a file
+/// with uncommitted in-flight changes from another session). Stacking
+/// a confirm over the bookmark browser re-stamps the timer so the
+/// backdrop fades in again from 0 alpha — exactly what we want.
+fn topmost_modal_opened_at(app: &App) -> Option<Instant> {
+    app.modal_opened_at
+}
+
+/// Phase D: sample the fade-in alpha given the modal's `opened_at`.
+/// Honors `app.no_anim` (env override or test-mode default) by snapping
+/// straight to the peak alpha.
+pub(crate) fn compute_fade_alpha(opened_at: Instant, app: &App) -> f32 {
+    if app.no_anim {
+        return MODAL_BACKDROP_ALPHA;
+    }
+    let now = app.clock.now();
+    if now <= opened_at {
+        return 0.0;
+    }
+    let elapsed = now.duration_since(opened_at);
+    if elapsed >= MODAL_FADE_DURATION {
+        return MODAL_BACKDROP_ALPHA;
+    }
+    let t = elapsed.as_secs_f32() / MODAL_FADE_DURATION.as_secs_f32();
+    let eased = Easing::EaseOutCubic.apply(t);
+    eased * MODAL_BACKDROP_ALPHA
+}
+
+/// Phase D: paint a uniform blended background across the entire frame
+/// area. Cells outside the modal rect keep this tint; cells inside get
+/// overwritten by the modal's own `Clear`. Uses `theme::blend` to mix
+/// foreground into background by `alpha`, exactly the same primitive the
+/// selection-mode tint uses.
+fn paint_backdrop(frame: &mut Frame, area: Rect, alpha: f32, app: &App) {
+    let blended_hex = blend(&app.theme.foreground, &app.theme.background, alpha);
+    let bg = match hex_to_rgb(&blended_hex) {
+        Some((r, g, b)) => Color::Rgb(r, g, b),
+        None => return,
+    };
+    let buf = frame.buffer_mut();
+    for y in area.y..area.y.saturating_add(area.height) {
+        for x in area.x..area.x.saturating_add(area.width) {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_bg(bg);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -425,6 +493,84 @@ mod tests {
         assert!(
             footer_row.contains("quit"),
             "expected quit hint on footer row, got {footer_row:?}"
+        );
+    }
+
+    // ---- Phase D: modal backdrop fade-in --------------------------------
+    //
+    // State-only checks for alpha, plus one frame-buffer test that the
+    // backdrop region carries the blended bg color after the fade has
+    // completed. The frame-buffer test is the one that actually catches
+    // render-pipeline regressions (Phase A taught us state alone is not
+    // enough).
+
+    use crate::anim::Clock;
+    use crate::screens::bookmark_browser as bb;
+    use std::time::Instant;
+
+    #[test]
+    fn modal_fade_in_at_zero_elapsed_is_transparent() {
+        // Pin the clock to opened_at; alpha is 0 at t=0.
+        let mut app = App::new();
+        app.no_anim = false;
+        let now = Instant::now();
+        app.clock = Clock::Frozen(now);
+        app.modal_opened_at = Some(now);
+        let alpha = compute_fade_alpha(now, &app);
+        assert!(alpha.abs() < 1e-5, "alpha at t=0 should be ~0; got {alpha}");
+    }
+
+    #[test]
+    fn modal_fade_in_after_80ms_is_full() {
+        let mut app = App::new();
+        app.no_anim = false;
+        let now = Instant::now();
+        app.clock = Clock::Frozen(now + MODAL_FADE_DURATION);
+        let alpha = compute_fade_alpha(now, &app);
+        assert!(
+            (alpha - MODAL_BACKDROP_ALPHA).abs() < 1e-5,
+            "alpha at t=duration should be {}; got {alpha}",
+            MODAL_BACKDROP_ALPHA
+        );
+    }
+
+    #[test]
+    fn modal_with_no_anim_renders_full_alpha_immediately() {
+        let app = App::new();
+        // cfg(test) default is `no_anim = true`; this is the path we expect
+        // headless tests to use unless they explicitly opt in.
+        assert!(app.no_anim);
+        let alpha = compute_fade_alpha(Instant::now(), &app);
+        assert!(
+            (alpha - MODAL_BACKDROP_ALPHA).abs() < 1e-5,
+            "no_anim alpha must snap to peak; got {alpha}"
+        );
+    }
+
+    #[test]
+    fn bookmark_browser_backdrop_carries_blended_bg_after_fade_completes() {
+        // Frame-buffer test: open the bookmark browser, ensure the fade has
+        // run to completion (no_anim default snaps to peak), and confirm
+        // at least one cell *outside* the modal rect carries the blended
+        // backdrop background color.
+        let mut app = App::new();
+        app.bookmark_browser = Some(bb::State::new());
+        // Set modal_opened_at directly to simulate the open-path stamp.
+        app.modal_opened_at = Some(Instant::now());
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| draw(&app, f)).unwrap();
+        let buf = term.backend().buffer();
+        let blended_hex =
+            blend(&app.theme.foreground, &app.theme.background, MODAL_BACKDROP_ALPHA);
+        let (r, g, b) = hex_to_rgb(&blended_hex).expect("default theme colors are valid hex");
+        let want = Color::Rgb(r, g, b);
+        // Sample (0, 1) — row 1 is below the digest bar and outside the
+        // centered modal rect for these dimensions.
+        let cell = &buf[(0u16, 1u16)];
+        assert_eq!(
+            cell.bg, want,
+            "expected blended backdrop bg at (0,1) after fade; got {:?}",
+            cell.bg
         );
     }
 }
