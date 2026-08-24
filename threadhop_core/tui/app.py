@@ -81,7 +81,9 @@ from .theme import get_available_themes
 from .utils import (
     app_bindings_from_registry,
     build_observe_command,
+    compute_visible_sessions,
     copy_to_clipboard,
+    resolve_action_session,
 )
 from .widgets.contextual_footer import ContextualFooter
 from .widgets.find_bar import FindBar
@@ -151,6 +153,10 @@ class ClaudeSessions(App):
         self.days_filter = days
         self.sessions = []
         self._selected_session_id = None
+        # Search-jump pin: a session the user jumped to that isn't in
+        # the current days/cap/archive window. Survives the 5s refresh
+        # until they highlight a different sidebar row (issue #76).
+        self._pinned_session: dict | None = None
         self._spinner_frame = 0
         self._renaming_session_id = None
         self._show_archived = False
@@ -596,26 +602,61 @@ class ClaudeSessions(App):
         Within-bucket ordering is preserved (the master list is already
         sorted by ``(status_rank, manual_sort_order)``).
         """
-        per_bucket: dict[str, list[dict]] = {}
-        for s in self.sessions:
-            status = s.get("status", "active")
-            if status == "archived" and not self._show_archived:
-                continue
-            bucket = per_bucket.setdefault(status, [])
-            if len(bucket) < MAX_SESSIONS:
-                bucket.append(s)
+        return compute_visible_sessions(
+            self.sessions,
+            show_archived=self._show_archived,
+            pinned_session=self._pinned_session,
+        )
 
-        out: list[dict] = []
-        for status in STATUS_ORDER:
-            out.extend(per_bucket.get(status, []))
-        # Catch-all for unknown statuses (defensive — shouldn't fire given
-        # the CHECK constraint in storage/db.py, but matches the same
-        # tail-append the sidebar already does).
-        for status, bucket in per_bucket.items():
-            if status in STATUS_RANK:
-                continue
-            out.extend(bucket)
-        return out
+    def _session_dict_from_db(
+        self, session_id: str, session_path: Path, row: dict
+    ) -> dict:
+        """Build a sidebar session dict for a DB row outside the current scan."""
+        try:
+            stat = session_path.stat()
+            created = stat.st_ctime
+            modified = stat.st_mtime
+        except OSError:
+            created = row.get("created_at") or 0
+            modified = row.get("modified_at") or 0
+        custom = row.get("custom_name") or ""
+        return {
+            "path": session_path,
+            "project": row.get("project") or session_path.parent.name,
+            "cwd": row.get("cwd"),
+            "session_id": session_id,
+            "created": created,
+            "modified": modified,
+            "title": custom or session_id[:8],
+            "custom_title": custom,
+            "ai_title": "",
+            "first_user_msg": None,
+            "is_active": False,
+            "is_working": False,
+            "turn_count": 0,
+            "status": row.get("status") or "active",
+            "has_observations": False,
+        }
+
+    def _current_session_data(self) -> dict | None:
+        """Session that copy-resume / reply / observe should act on.
+
+        Prefers ``_selected_session_id`` (search jump, explicit pick)
+        over the sidebar highlight so actions follow the transcript
+        the user is looking at (issue #76).
+        """
+        highlighted = None
+        try:
+            list_view = self.query_one("#session-list", ListView)
+            if isinstance(list_view.highlighted_child, SessionItem):
+                highlighted = list_view.highlighted_child.session_data
+        except Exception:
+            highlighted = None
+        return resolve_action_session(
+            selected_session_id=self._selected_session_id,
+            sessions=self._visible_sessions(),
+            highlighted_session_data=highlighted,
+        )
 
     def _apply_stable_ordering(self) -> None:
         if "session_order" not in self.config:
@@ -812,6 +853,11 @@ class ClaudeSessions(App):
         if isinstance(event.item, SessionItem):
             session_id = event.item.session_data.get("session_id")
             self._selected_session_id = session_id
+            if (
+                self._pinned_session
+                and session_id != self._pinned_session.get("session_id")
+            ):
+                self._pinned_session = None
             transcript = self.query_one("#transcript-scroll", TranscriptView)
 
             # Manual sidebar navigation ends any in-progress search-jump
@@ -947,13 +993,9 @@ class ClaudeSessions(App):
         if self._find_is_active():
             self.action_find_next()
             return
-        list_view = self.query_one("#session-list", ListView)
-        if not list_view.highlighted_child or not isinstance(
-            list_view.highlighted_child, SessionItem
-        ):
+        session = self._current_session_data()
+        if not session:
             return
-
-        session = list_view.highlighted_child.session_data
         session_id = session.get("session_id", "")
         current_name = self.config.get("session_names", {}).get(session_id, "")
 
@@ -966,12 +1008,10 @@ class ClaudeSessions(App):
 
     def action_copy_session_id(self) -> None:
         """Copy 'claude -r <session_id>' to clipboard"""
-        list_view = self.query_one("#session-list", ListView)
-        if not list_view.highlighted_child or not isinstance(
-            list_view.highlighted_child, SessionItem
-        ):
+        session = self._current_session_data()
+        if not session:
             return
-        session_id = list_view.highlighted_child.session_data.get("session_id", "")
+        session_id = session.get("session_id", "")
         cmd = f"claude -r {session_id}"
         try:
             if not copy_to_clipboard(cmd):
@@ -982,7 +1022,22 @@ class ClaudeSessions(App):
             self.notify(f"Resume: {cmd}", timeout=10)
 
     def _highlighted_session_item(self) -> SessionItem | None:
-        list_view = self.query_one("#session-list", ListView)
+        """Sidebar row for the session actions should target.
+
+        Looks up ``_selected_session_id`` first so observe/copy/reply
+        follow a search jump even when the highlight was stale.
+        """
+        data = self._current_session_data()
+        if not data:
+            return None
+        sid = data.get("session_id")
+        try:
+            list_view = self.query_one("#session-list", ListView)
+        except Exception:
+            return None
+        for item in list_view.children:
+            if isinstance(item, SessionItem) and item.session_data.get("session_id") == sid:
+                return item
         item = list_view.highlighted_child
         if isinstance(item, SessionItem):
             return item
@@ -1246,13 +1301,6 @@ class ClaudeSessions(App):
         """Focus the reply input"""
         text_area = self.query_one("#reply-input", TextArea)
         if not text_area.has_focus:
-            list_view = self.query_one("#session-list", ListView)
-            if list_view.highlighted_child and isinstance(
-                list_view.highlighted_child, SessionItem
-            ):
-                self._selected_session_id = (
-                    list_view.highlighted_child.session_data.get("session_id")
-                )
             text_area.focus()
 
     def action_open_search(self) -> None:
@@ -1687,28 +1735,24 @@ class ClaudeSessions(App):
             return
 
         self._selected_session_id = session_id
-        # Lock the foreign session in so the 5s refresh tick doesn't
-        # reload the sidebar's selection over the top of this panel.
-        # Cleared by the user selecting anything in the sidebar.
-        transcript._foreign_session_path = session_path
-        transcript.queue_scroll_to_uuid(message_uuid, search_terms)
-        # load_transcript is async; schedule and let the pending scroll
-        # fire at the end of the load.
-        self.call_later(transcript.load_transcript, session_path)
-
-        # Put the foreign session's identity in the transcript border
-        # title so the user knows the panel is showing a session that
-        # isn't in their sidebar. Gets reset to "Transcript" by the
-        # normal selection-exit flow when they click back into a
-        # sidebar session.
-        name = row.get("custom_name") or row.get("project") or session_id[:8]
-        project = row.get("project") or ""
-        label = f"Transcript ── [{project}] {name}" if project else f"Transcript ── {name}"
-        transcript.border_title = label + "  (from search — not in sidebar)"
-        self.notify(
-            f"Jumped to out-of-view session: {name}",
-            timeout=4,
+        self._pinned_session = self._session_dict_from_db(
+            session_id, session_path, row
         )
+        # Sidebar now owns this session, so the 5s refresh can follow
+        # the highlight instead of needing the foreign-session lock.
+        transcript._foreign_session_path = None
+        transcript.queue_scroll_to_uuid(message_uuid, search_terms)
+        self._update_session_list(force_rebuild=True)
+        for idx, item in enumerate(list_view.children):
+            if (
+                isinstance(item, SessionItem)
+                and item.session_data.get("session_id") == session_id
+            ):
+                list_view.index = idx
+                break
+        list_view.focus()
+        name = row.get("custom_name") or row.get("project") or session_id[:8]
+        self.notify(f"Jumped to {name}", timeout=4)
 
     def check_action(self, action: str, parameters):
         """Disable the priority Enter binding while a modal is up OR the
@@ -1734,13 +1778,6 @@ class ClaudeSessions(App):
         if text_area.has_focus:
             self._submit_reply()
         else:
-            list_view = self.query_one("#session-list", ListView)
-            if list_view.highlighted_child and isinstance(
-                list_view.highlighted_child, SessionItem
-            ):
-                self._selected_session_id = (
-                    list_view.highlighted_child.session_data.get("session_id")
-                )
             text_area.focus()
 
     def action_insert_newline(self) -> None:
@@ -1820,17 +1857,17 @@ class ClaudeSessions(App):
         if not input_text:
             return
 
-        # Find the selected session
-        list_view = self.query_one("#session-list", ListView)
-        if not list_view.highlighted_child or not isinstance(
-            list_view.highlighted_child, SessionItem
-        ):
+        # Find the selected session — prefer the jumped-to / explicitly
+        # selected id over the sidebar highlight (issue #76).
+        session = self._current_session_data()
+        if not session:
             self.notify("No session selected", severity="error")
             return
 
-        session = list_view.highlighted_child.session_data
         session_id = session.get("session_id", "")
         session_cwd = session.get("cwd")
+        list_view = self.query_one("#session-list", ListView)
+        current_item = self._highlighted_session_item()
 
         # Clear input and show sending state
         text_area.clear()
@@ -1839,12 +1876,12 @@ class ClaudeSessions(App):
 
         # Mark session as working immediately
         session["is_working"] = True
-        if isinstance(list_view.highlighted_child, SessionItem):
-            list_view.highlighted_child.session_data["is_working"] = True
+        if isinstance(current_item, SessionItem):
+            current_item.session_data["is_working"] = True
             try:
-                label = list_view.highlighted_child.query_one(".session-label", Static)
+                label = current_item.query_one(".session-label", Static)
                 label.add_class("working")
-                list_view.highlighted_child.update_spinner(self._spinner_frame)
+                current_item.update_spinner(self._spinner_frame)
             except:
                 pass
 
