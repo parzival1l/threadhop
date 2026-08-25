@@ -48,6 +48,14 @@ def _parse_claude_process_args(args: str) -> tuple[bool, str | None]:
                     explicit_id = candidate
         elif a in ("-c", "--continue") and "-p" not in arg_parts:
             is_interactive = True
+        elif (a == "--worktree" or a.startswith("--worktree=")) and "-p" not in arg_parts:
+            # `claude --worktree <name>` is an interactive session. The
+            # live argv often has no `--resume`, last-arg is the worktree
+            # name (not `claude`), and the binary token is the bare word
+            # `claude` which does not end with `/claude` — so the fallback
+            # below used to miss it and `threadhop tag` failed to detect
+            # the current session (issue #70).
+            is_interactive = True
     if not is_interactive:
         if arg_parts[-1] == "claude" or (
             arg_parts[0].endswith("/claude")

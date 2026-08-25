@@ -20,9 +20,12 @@ from threadhop_core import indexer
 
 from .constants import (
     DISPLAY_NAME_WIDTH,
+    MAX_SESSIONS,
     OBSERVATION_MARKER,
     OBSERVATION_MARKER_FALLBACK,
     SPINNER_FRAMES,
+    STATUS_ORDER,
+    STATUS_RANK,
 )
 from .keybindings import COMMAND_REGISTRY, Command, format_key
 
@@ -65,6 +68,64 @@ def app_bindings_from_registry() -> list[Binding]:
     # it doubles as "close find bar" when the bar is up (see
     # action_cancel_reply). Registered via the SCOPE_REPLY entry above.
     return bindings
+
+
+def compute_visible_sessions(
+    sessions: list[dict],
+    *,
+    show_archived: bool = False,
+    pinned_session: dict | None = None,
+) -> list[dict]:
+    """Filter and cap sessions the same way the sidebar and Kanban do.
+
+    Applies the per-status ``MAX_SESSIONS`` budget and the archived
+    toggle. ``pinned_session`` is prepended when a search jump lands on
+    a session that would otherwise be filtered out of the window, so
+    copy-resume and reply still have a row to target (issue #76).
+    """
+    per_bucket: dict[str, list[dict]] = {}
+    for s in sessions:
+        status = s.get("status", "active")
+        if status == "archived" and not show_archived:
+            continue
+        bucket = per_bucket.setdefault(status, [])
+        if len(bucket) < MAX_SESSIONS:
+            bucket.append(s)
+
+    out: list[dict] = []
+    for status in STATUS_ORDER:
+        out.extend(per_bucket.get(status, []))
+    for status, bucket in per_bucket.items():
+        if status in STATUS_RANK:
+            continue
+        out.extend(bucket)
+
+    if pinned_session:
+        pid = pinned_session.get("session_id")
+        if pid and not any(s.get("session_id") == pid for s in out):
+            out.insert(0, pinned_session)
+    return out
+
+
+def resolve_action_session(
+    *,
+    selected_session_id: str | None,
+    sessions: list[dict],
+    highlighted_session_data: dict | None,
+) -> dict | None:
+    """Pick the session that copy-resume / reply / observe should act on.
+
+    ``selected_session_id`` (search jump, explicit pick) wins. If that
+    id is not in ``sessions``, return None rather than the stale
+    sidebar highlight — sending a reply to the previously highlighted
+    thread is worse than refusing.
+    """
+    if selected_session_id:
+        for s in sessions:
+            if s.get("session_id") == selected_session_id:
+                return s
+        return None
+    return highlighted_session_data
 
 
 def format_age(timestamp: float) -> str:
@@ -208,11 +269,13 @@ __all__ = [
     "app_bindings_from_registry",
     "build_observe_command",
     "commands_for_scope",
+    "compute_visible_sessions",
     "copy_to_clipboard",
     "format_age",
     "format_command_keys",
     "format_msg_clock",
     "render_session_label_text",
+    "resolve_action_session",
     "_observation_marker_text",
     "_session_display_name",
     "_supports_observation_emoji",
