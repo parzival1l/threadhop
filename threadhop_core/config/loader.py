@@ -20,17 +20,17 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 # App-level keys that live in config.json post-migration. Session-level
 # state (session_names, session_order, last_viewed) lives in SQLite per
 # ADR-001. Anything unknown is preserved on save so future settings
-# (sidebar_width, export_retention_days, observe.enabled, user-added keys)
-# don't get silently dropped.
+# (sidebar_width, export_retention_days, user-added keys) don't get
+# silently dropped.
 APP_CONFIG_KEYS = {
     "theme",
     "sidebar_width",
     "export_retention_days",
-    "observe.enabled",
 }
 
-# Subset of keys writable by the ``threadhop config set`` CLI surface.
-CLI_CONFIG_KEYS = {"observe.enabled"}
+# Subset of keys writable by a CLI config surface. Currently empty —
+# repopulate when a CLI-managed setting returns.
+CLI_CONFIG_KEYS: set[str] = set()
 
 
 def _coerce_retention_days(value) -> int:
@@ -44,8 +44,8 @@ def _coerce_retention_days(value) -> int:
 def load_config(conn):
     """Return the combined in-memory config.
 
-    App-level keys (`theme`, `sidebar_width`, `export_retention_days`,
-    `observe.enabled`) come from config.json.
+    App-level keys (`theme`, `sidebar_width`, `export_retention_days`)
+    come from config.json.
     Session-level keys (`session_names`, `session_order`, `last_viewed`)
     come from the SQLite `sessions` table — this is the ADR-001 split.
 
@@ -72,7 +72,6 @@ def load_config(conn):
     config["export_retention_days"] = _coerce_retention_days(
         config.get("export_retention_days", EXPORT_RETENTION_DAYS_DEFAULT)
     )
-    config.setdefault("observe.enabled", False)
 
     # 2. Session-level from SQLite.
     try:
@@ -93,7 +92,7 @@ def load_config(conn):
 
 def save_app_config(config) -> bool:
     """Persist only app-level keys (theme, sidebar_width,
-    export_retention_days, observe.enabled, unknown extras) to config.json.
+    export_retention_days, unknown extras) to config.json.
 
     Session-level keys are deliberately excluded — they live in SQLite
     now and are written through at each mutation site (rename, reorder,
@@ -149,12 +148,9 @@ def _config_value_to_text(value) -> str:
 
 
 def _coerce_config_value(key: str, raw_value: str):
-    """Validate and normalize supported config values."""
-    if key == "observe.enabled":
-        parsed = _parse_boolish(raw_value)
-        if parsed is None:
-            raise ValueError(
-                "observe.enabled expects true/false (also accepts 1/0, on/off, yes/no)."
-            )
-        return parsed
+    """Validate and normalize supported config values.
+
+    No CLI-managed keys exist right now; add per-key coercion branches
+    here when CLI_CONFIG_KEYS is repopulated.
+    """
     raise ValueError(f"Unsupported config key: {key}")

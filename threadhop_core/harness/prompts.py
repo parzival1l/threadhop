@@ -4,8 +4,7 @@ All bundled prompts live in ``<repo_root>/prompts/*.md``. This module is
 the single point of resolution; previously each caller computed
 ``Path(__file__).resolve().parents[N] / "prompts" / ...`` with ``N``
 depending on its own depth in the tree, which broke during the Phase 1
-reorganization (observer/reflector use ``parents[2]``, handoff used
-``parents[1]``).
+reorganization.
 """
 from __future__ import annotations
 
@@ -29,9 +28,8 @@ def load_prompt(name: str) -> str:
 def prompt_path(name: str) -> Path:
     """Return the on-disk :class:`Path` to ``prompts/<name>.md``.
 
-    Useful for callers that still accept a ``prompt_path`` override
-    parameter (observer / reflector / handoff all do — tests inject a
-    custom prompt for some scenarios). When no override is given they
-    fall back to this default.
+    Useful for callers that accept a ``prompt_path`` override parameter
+    (tests inject a custom prompt for some scenarios). When no override
+    is given they fall back to this default.
     """
     return PROMPTS_DIR / f"{name}.md"

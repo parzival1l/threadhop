@@ -123,8 +123,6 @@ COMMAND_REGISTRY: list[Command] = [
     ),
     Command(("n",), "Rename session", SCOPE_SESSION_LIST, "rename_session", footer=True),
     Command(("g",), "Copy resume command", SCOPE_SESSION_LIST, "copy_session_id"),
-    Command(("o",), "Copy observation path / start observing", SCOPE_SESSION_LIST, "observe_session"),
-    Command(("O",), "Resume observation", SCOPE_SESSION_LIST, "resume_observation"),
     Command(("s",), "Cycle status forward", SCOPE_SESSION_LIST, "cycle_status_forward"),
     Command(("S",), "Cycle status backward", SCOPE_SESSION_LIST, "cycle_status_backward"),
     Command(("a",), "Archive session", SCOPE_SESSION_LIST, "archive_session"),

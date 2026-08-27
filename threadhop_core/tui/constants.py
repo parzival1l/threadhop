@@ -14,8 +14,6 @@ from ..storage import db
 
 
 DISPLAY_NAME_WIDTH = 22
-OBSERVATION_MARKER = "🗒"
-OBSERVATION_MARKER_FALLBACK = "≡"
 MAX_SESSIONS = 50
 REFRESH_INTERVAL = 5
 SPINNER_INTERVAL = 0.25
@@ -41,12 +39,6 @@ COMMAND_TAG_RE = re.compile(
     r"</?(?:command-name|command-message|command-args)>"
 )
 
-# Filter observer/reflector subprocess sessions out of the sidebar.
-OBSERVER_SUBPROCESS_SIGNATURES: tuple[str, ...] = (
-    "# ThreadHop Observer Prompt",
-    "# ThreadHop Reflector Prompt",
-)
-
 # Status display order + labels (ADR-004) — duplicated from db.py so the
 # TUI doesn't reach into storage internals.
 STATUS_ORDER: list[str] = db.SESSION_STATUS_ORDER
@@ -63,8 +55,6 @@ STATUS_CYCLE: list[str] = [s for s in STATUS_ORDER if s != "archived"]
 
 __all__ = [
     "DISPLAY_NAME_WIDTH",
-    "OBSERVATION_MARKER",
-    "OBSERVATION_MARKER_FALLBACK",
     "MAX_SESSIONS",
     "REFRESH_INTERVAL",
     "SPINNER_INTERVAL",
@@ -73,7 +63,6 @@ __all__ = [
     "SYSTEM_REMINDER_RE",
     "LOCAL_COMMAND_RE",
     "COMMAND_TAG_RE",
-    "OBSERVER_SUBPROCESS_SIGNATURES",
     "STATUS_ORDER",
     "STATUS_LABELS",
     "STATUS_RANK",

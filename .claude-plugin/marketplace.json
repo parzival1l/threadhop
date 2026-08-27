@@ -4,20 +4,20 @@
     "name": "parzival1l"
   },
   "metadata": {
-    "description": "Persistent, searchable, cross-session memory for Claude Code — browse sessions, extract TODOs/decisions, produce handoff briefs."
+    "description": "Persistent, searchable, cross-session memory for Claude Code — browse sessions, peek into other sessions verbatim, and carry context forward with transfer tickets."
   },
   "plugins": [
     {
       "name": "threadhop",
       "source": "./plugin",
-      "description": "Persistent, searchable, cross-session memory for Claude Code — browse sessions, extract TODOs/decisions, produce handoff briefs.",
-      "version": "0.3.2",
+      "description": "Persistent, searchable, cross-session memory for Claude Code — browse sessions, peek into other sessions verbatim, and carry context forward with transfer tickets.",
+      "version": "0.4.0",
       "author": {
         "name": "parzival1l"
       },
       "homepage": "https://github.com/parzival1l/threadhop",
       "repository": "https://github.com/parzival1l/threadhop",
-      "keywords": ["claude-code", "sessions", "memory", "search", "handoff"],
+      "keywords": ["claude-code", "sessions", "memory", "search", "transfer", "context"],
       "category": "productivity"
     }
   ]

@@ -1,7 +1,7 @@
 {
   "name": "threadhop",
-  "version": "0.3.2",
-  "description": "Browse, search, and carry context across Claude Code sessions. Exposes /threadhop:handoff, /threadhop:observe, /threadhop:tag.",
+  "version": "0.4.0",
+  "description": "Browse, search, and carry context across Claude Code sessions. Exposes /threadhop:peek, /threadhop:prepare, /threadhop:receive, /threadhop:tag, /threadhop:bookmark, /threadhop:copy.",
   "author": {
     "name": "ThreadHop",
     "url": "https://github.com/parzival1l/threadhop"

@@ -1,5 +1,14 @@
 # Skill packaging research (resolves Q4)
 
+> **Status note (2026-08-27, ADR-029):** the final plugin shape changed.
+> The plugin now ships **commands only, no skills** — the handoff skill
+> and observe command were removed along with the observer/reflector
+> architecture, replaced by the borrow surface
+> (`/threadhop:peek`, `/threadhop:prepare`, `/threadhop:receive`, plus
+> `tag` / `bookmark` / `copy`). The Model B PATH-dependency decision and
+> the command frontmatter conventions documented below still stand. The
+> rest of this document is kept as historical research.
+
 Answers to _Open Question Q4_ in `DESIGN-DECISIONS.md`: how Claude Code
 plugins and their in-session entry points are distributed and loaded.
 
