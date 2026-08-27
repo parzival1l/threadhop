@@ -115,7 +115,8 @@ def _search_prefix(
         "mend": FTS_MATCH_END,
     }
     sql, params = _apply_message_filters(sql, params, role=role, project=project)
-    sql += " ORDER BY rank LIMIT :lim"
+    # Recency-first: newest matches lead, bm25 `rank` breaks timestamp ties.
+    sql += " ORDER BY m.timestamp DESC, rank LIMIT :lim"
     params["lim"] = limit
     return db.query_all(conn, sql, params)
 
@@ -276,7 +277,13 @@ def _search_trigram_fallback(
         trigram_rank = float(row.get("trigram_rank") or 0.0)
         scored.append((score, trigram_rank, row, highlight_term))
 
-    scored.sort(key=lambda item: (-item[0], item[1], item[2].get("timestamp") or ""))
+    # Recency-first to match the prefix path: newest leads, then fuzzy score
+    # (higher better), then trigram bm25 (lower better). `reverse=True` flips
+    # every key, so the bm25 rank is negated to keep it effectively ascending.
+    scored.sort(
+        key=lambda item: (item[2].get("timestamp") or "", item[0], -item[1]),
+        reverse=True,
+    )
 
     results: list[dict[str, Any]] = []
     for score, _, row, highlight_term in scored[:limit]:

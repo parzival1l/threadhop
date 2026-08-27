@@ -26,7 +26,7 @@ class CLIContext:
 
     Held inside the ``cli_bootstrap()`` context manager so callers never
     need to remember the close. ``config`` is loaded on demand because
-    a number of subcommands (``observe``, ``copy``, ``tag``) only need
+    a number of subcommands (``copy``, ``tag``) only need
     the DB.
     """
 

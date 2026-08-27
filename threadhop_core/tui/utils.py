@@ -7,21 +7,15 @@ their owning screens; keep this file scoped to "general TUI plumbing".
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 from datetime import datetime
-from pathlib import Path
 
 from rich.text import Text
 from textual.binding import Binding
 
-from threadhop_core import indexer
-
 from .constants import (
     DISPLAY_NAME_WIDTH,
-    OBSERVATION_MARKER,
-    OBSERVATION_MARKER_FALLBACK,
     SPINNER_FRAMES,
 )
 from .keybindings import COMMAND_REGISTRY, Command, format_key
@@ -100,25 +94,6 @@ def format_msg_clock(ts: str | float | None) -> str:
         return ""
 
 
-def _supports_observation_emoji() -> bool:
-    """Return whether the current terminal can safely encode the emoji marker."""
-    if os.environ.get("THREADHOP_ASCII_OBSERVATION_MARKER") == "1":
-        return False
-    encoding = sys.stdout.encoding or "utf-8"
-    try:
-        OBSERVATION_MARKER.encode(encoding)
-    except (LookupError, UnicodeEncodeError):
-        return False
-    return True
-
-
-def _observation_marker_text() -> Text:
-    """Return the ADR-021 observed-session marker."""
-    if _supports_observation_emoji():
-        return Text(OBSERVATION_MARKER, style="dim")
-    return Text(OBSERVATION_MARKER_FALLBACK, style="dim cyan")
-
-
 def _session_display_name(session_data: dict, custom_name: str | None) -> str:
     """Resolve the user-facing session label before sidebar truncation."""
     title = session_data.get("title", "")
@@ -145,23 +120,6 @@ def copy_to_clipboard(text: str) -> bool:
         return False
 
 
-def _threadhop_script_path() -> Path:
-    """Locate the ``./threadhop`` executable that owns this checkout.
-
-    The script lives at the project root, one level above the
-    ``threadhop_core`` package. Resolved through the package's
-    ``__file__`` so we follow symlinks (e.g. ``~/.local/bin/threadhop``
-    pointing at the cloned checkout) rather than guessing from
-    ``sys.argv[0]``.
-    """
-    return Path(indexer.__file__).resolve().parents[1] / "threadhop"
-
-
-def build_observe_command(session_id: str) -> list[str]:
-    """Spawn the CLI sidecar through the current executable script."""
-    return [str(_threadhop_script_path()), "observe", "--session", session_id]
-
-
 def render_session_label_text(
     session_data: dict,
     *,
@@ -179,20 +137,8 @@ def render_session_label_text(
         status = "○"
 
     display = _session_display_name(session_data, custom_name)
-    indicator = (
-        _observation_marker_text()
-        if session_data.get("has_observations")
-        else None
-    )
-    reserved_width = 0
-    if indicator is not None:
-        reserved_width = 1 + indicator.cell_len
-    name_width = max(DISPLAY_NAME_WIDTH - reserved_width, 0)
 
-    middle = Text(display[:name_width])
-    if indicator is not None:
-        middle.append(" ")
-        middle.append_text(indicator)
+    middle = Text(display[:DISPLAY_NAME_WIDTH])
     if middle.cell_len < DISPLAY_NAME_WIDTH:
         middle.append(" " * (DISPLAY_NAME_WIDTH - middle.cell_len))
 
@@ -206,15 +152,11 @@ def render_session_label_text(
 
 __all__ = [
     "app_bindings_from_registry",
-    "build_observe_command",
     "commands_for_scope",
     "copy_to_clipboard",
     "format_age",
     "format_command_keys",
     "format_msg_clock",
     "render_session_label_text",
-    "_observation_marker_text",
     "_session_display_name",
-    "_supports_observation_emoji",
-    "_threadhop_script_path",
 ]

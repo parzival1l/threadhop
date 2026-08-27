@@ -19,10 +19,9 @@ Headers and prose are free to evolve without breaking the CLI output.
 - #51 — Lazy tail-load transcript parsing for instant session focus.
 - #42 — Context-aware help overlay with a shared command registry.
 - #32 — Trigram-based fuzzy search for typo tolerance on top of FTS5.
-- #38 — TUI conflict notifications when the reflector flags a contradiction.
 - #52 — Row-window virtualisation of TranscriptView for very long sessions.
-- #39 — Observation condensation: merge related decisions, archive done TODOs.
 - #53 — Migrate data-heavy DataTables to textual-fastdatatable.
+- #54 — Rust port parity for ADR-029: remove the observation/conflict surface, port the borrow surface (exchanges, peek/search/prepare/receive).
 
 ## Later
 

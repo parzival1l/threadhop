@@ -1,20 +1,35 @@
 # ThreadHop plugin
 
 Claude Code plugin that exposes the ThreadHop CLI as in-session entry
-points. Three things ship together under one namespace:
+points. Six commands ship together under one namespace — all thin
+`!`cmd`` wrappers, zero model-in-the-loop:
 
-| Invocation | Shape | What it does |
-|------------|-------|--------------|
-| `/threadhop:handoff <session_id> [--full]` | Skill (model-in-the-loop) | Runs `threadhop handoff`, frames the brief, suppresses auto-action on TODOs |
-| `/threadhop:observe` | Command (thin `!`cmd`` wrapper) | Starts the observer for the current Claude Code session; lifetime bound to that session |
-| `/threadhop:tag <status>` | Command (thin `!`cmd`` wrapper) | Tags the current session; argument-hint enumerates valid statuses |
-| `/threadhop:bookmark [--note <text>]` | Command (thin `!`cmd`` wrapper) | Bookmarks the latest message in the current session; optional free-text note; writes to the shared `bookmarks` SQLite table that the TUI also reads |
+| Invocation | What it does |
+|------------|--------------|
+| `/threadhop:peek <session> [--last N \| --grep <pattern>]` | Prints cleaned verbatim exchanges from another session; zero LLM |
+| `/threadhop:prepare [--session <id>] [--tail N]` | Builds a frozen transfer ticket (one Haiku call summarizes the head, last N exchanges verbatim); prints a paste-ready receive line |
+| `/threadhop:receive <ticket-id>` | Prints a transfer ticket verbatim into the current chat; zero LLM |
+| `/threadhop:tag <status>` | Tags the current session; argument-hint enumerates valid statuses |
+| `/threadhop:bookmark [--note <text>]` | Bookmarks the latest message in the current session; optional free-text note; writes to the shared `bookmarks` SQLite table that the TUI also reads |
+| `/threadhop:copy [N\|all]` | Copies the cleaned transcript (last turn / last N turns / whole session) to the clipboard as markdown |
 
-Tagging and bookmarking also remain available as `!threadhop tag <status>`
-and `!threadhop bookmark` (bash passthrough, zero LLM turn). The
-slash-command forms are the discoverable aliases — Claude Code's `/`
-picker renders the argument-hint so users don't have to memorise valid
-options (statuses for tag; the `--note` flag for bookmark).
+Everything also remains available as bash passthrough — e.g.
+`!threadhop tag <status>`, `!threadhop peek <session>` — with zero LLM
+turn. The slash-command forms are the discoverable aliases — Claude
+Code's `/` picker renders the argument-hint so users don't have to
+memorise valid options.
+
+## Transfer flow
+
+Carrying context from one chat to another takes three steps:
+
+1. In chat A, run `/threadhop:prepare` (or `!threadhop prepare`). It
+   writes a frozen ticket to `~/.config/threadhop/transfers/` and prints
+   a line like `Paste in the target chat: !threadhop receive tk_ab12cd`.
+2. Copy that printed receive line.
+3. In chat B, paste `!threadhop receive tk_ab12cd`. The ticket text is
+   printed verbatim into the new chat — works in any tool with a shell,
+   not just Claude Code.
 
 ## Bookmark targeting — where the note goes
 
@@ -60,43 +75,17 @@ Decoupling the plugin from the app means the app can repackage
 
 ```
 plugin/
-├── .claude-plugin/plugin.json   # manifest: name=threadhop, version=0.1.0
-├── skills/
-│   └── handoff/
-│       └── SKILL.md             # real skill — rich instructions, model frames the brief
+├── .claude-plugin/plugin.json   # manifest: name=threadhop
 └── commands/
+    ├── peek.md                  # !`threadhop peek`
+    ├── prepare.md               # !`threadhop prepare`
+    ├── receive.md               # !`threadhop receive`
     ├── bookmark.md              # !`threadhop bookmark`
-    ├── observe.md               # !`threadhop observe`
+    ├── copy.md                  # !`threadhop copy`
     └── tag.md                   # !`threadhop tag` with discoverable argument-hint
 ```
 
-## What is intentionally NOT shipped
-
-- **`/threadhop:insights`** — would surface captured observations back
-  into the Claude Code session that captured them, re-introducing the
-  facts the observer was distilling out of that context. Observations
-  are for *other* sessions (via `/threadhop:handoff`) or for the user
-  to review outside the session (TUI, `threadhop observations <id>`
-  CLI). There is no in-session viewer.
-- **`/threadhop:context`** — clipboard-to-markdown wrapping is not
-  worth a plugin command.
-- **`/threadhop:observe --stop` / `--stop-all`** — the observer is
-  bound to the lifetime of the Claude Code session that started it. No
-  in-session stop command is needed. `threadhop observe --stop-all`
-  remains available on the CLI for orphan cleanup from a terminal.
-
-## Observer lifecycle
-
-1. User runs `/threadhop:observe` inside a Claude Code session.
-2. `threadhop observe` detects the Claude Code session ID and starts
-   the sidecar in watch-mode.
-3. The observer stays bound to that Claude Code session's process.
-   When the Claude Code session ends, the observer ends.
-4. Captured content lives at
-   `~/.config/threadhop/observations/<session_id>.jsonl`. Consume it
-   via the TUI, the `threadhop observations|decisions|todos|conflicts`
-   CLI subcommands, or from a different Claude Code session via
-   `/threadhop:handoff <session_id>`.
+The plugin ships commands only — no skills.
 
 ## Local install for development
 
@@ -105,8 +94,8 @@ claude --plugin-dir "$(pwd)/plugin"
 # then, inside the session:
 /threadhop:tag in_progress
 /threadhop:bookmark --note "this answer is worth remembering"
-/threadhop:observe
-/threadhop:handoff <some_other_session_id>
+/threadhop:peek <some_other_session_id> --last 3
+/threadhop:prepare
 ```
 
 ## Publishing

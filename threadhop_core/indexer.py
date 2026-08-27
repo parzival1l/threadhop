@@ -57,7 +57,7 @@ SYSTEM_REMINDER_RE = re.compile(
 # Claude Code prepends ``<local-command-{caveat,stdout,stderr}>`` blocks
 # to bash-passthrough turns (``!cmd``). They are harness plumbing — the
 # user saw them as UI chrome, not as words they typed — so they pollute
-# both FTS hits and the observer feed when left in place.
+# FTS hits when left in place.
 LOCAL_COMMAND_BLOCK_RE = re.compile(
     r"<local-command-(?:caveat|stdout|stderr)>"
     r".*?"
@@ -251,7 +251,7 @@ def _extract_assistant_blocks(
     ``include_tool_calls=False`` drops ``tool_use`` blocks entirely
     rather than abbreviating them — used by the ``copy`` command so
     pasted transcripts contain only human-visible prose. Default
-    preserves the indexer/TUI/observer behaviour. Config-driven control
+    preserves the indexer/TUI behaviour. Config-driven control
     over this knob is tracked in issue #63.
     """
     content = msg.get("message", {}).get("content", [])
@@ -297,7 +297,7 @@ def parse_messages(
     not abort indexing the rest of the file.
 
     ``include_tool_calls`` is forwarded to ``_extract_assistant_blocks``.
-    Defaults to ``True`` so indexer/TUI/observer callers are unaffected;
+    Defaults to ``True`` so indexer/TUI callers are unaffected;
     ``copy.py`` passes ``False`` for clean-prose-only rendering (see
     issue #63 for config-driven evolution).
     """
@@ -511,9 +511,9 @@ def parse_byte_range(
     ``fallback_session_id`` is substituted when a line omits its own
     ``sessionId`` (rare, but happens on older transcripts).
 
-    Extracted as a public helper so the observer (ADR-018) can reuse
-    the exact rendering the FTS index uses — "observer sees what the
-    user sees."
+    Extracted as a public helper so other consumers (e.g. the future
+    ``prepare`` command) can reuse the exact rendering the FTS index
+    uses — "the consumer sees what the user sees."
     """
     raw_lines = raw_bytes.decode("utf-8", errors="replace").split("\n")
     # split() on "line1\nline2\n" → ["line1", "line2", ""] — drop trailing empty.

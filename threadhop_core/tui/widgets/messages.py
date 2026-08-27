@@ -55,17 +55,10 @@ class CommandPill(_SelectableMessage):
     pass
 
 
-class ObservationInfoHeader(Static):
-    """Passive observation metadata shown above the transcript."""
-
-    can_focus = False
-
-
 __all__ = [
     "_SelectableMessage",
     "UserMessage",
     "AssistantMessage",
     "ToolMessage",
     "CommandPill",
-    "ObservationInfoHeader",
 ]
