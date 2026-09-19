@@ -11,7 +11,7 @@
 //! are intentionally **not** computed here — `active_detector` owns the
 //! `is_active` channel, and a richer scanner in Phase 5 will compute the
 //! whole-file derived fields. This worker only fills the cheap head-scan
-//! columns plus `has_observations` (one `stat` call per session).
+//! columns.
 //!
 //! ## Topology
 //!
@@ -57,14 +57,13 @@ const MAX_CONCURRENT_SCANS: usize = 32;
 /// it cheap to swap projects directories under test.
 pub async fn run(tx: Sender<WorkerEvent>) -> anyhow::Result<()> {
     let projects_dir = paths::claude_projects_dir();
-    let observations_dir = paths::observations_dir();
     let mut ticker = interval(SCAN_INTERVAL);
     // `interval` fires immediately on first `.tick()` — desirable so the
     // sidebar populates before the user sees the empty list.
     loop {
         ticker.tick().await;
 
-        let send_result = match scan_once(&projects_dir, &observations_dir).await {
+        let send_result = match scan_once(&projects_dir).await {
             Ok(items) => tx.send(WorkerEvent::SessionsRefreshed(items)).await,
             Err(err) => {
                 tx.send(WorkerEvent::Error(format!("session_scanner: {err}")))
@@ -89,7 +88,6 @@ pub async fn run(tx: Sender<WorkerEvent>) -> anyhow::Result<()> {
 /// descending.
 pub(crate) async fn scan_once(
     projects_dir: &Path,
-    observations_dir: &Path,
 ) -> anyhow::Result<Vec<SessionListItem>> {
     let files = list_session_files(projects_dir).await?;
     if files.is_empty() {
@@ -98,7 +96,6 @@ pub(crate) async fn scan_once(
 
     let total = files.len();
     let mut join_set: JoinSet<Option<SessionListItem>> = JoinSet::new();
-    let observations_dir = observations_dir.to_path_buf();
     let mut iter = files.into_iter();
 
     // Helper: pull one entry off the iterator and spawn its head-scan.
@@ -108,8 +105,7 @@ pub(crate) async fn scan_once(
     macro_rules! spawn_next {
         () => {{
             if let Some(entry) = iter.next() {
-                let obs = observations_dir.clone();
-                join_set.spawn_blocking(move || head_scan_file(&entry, &obs));
+                join_set.spawn_blocking(move || head_scan_file(&entry));
                 true
             } else {
                 false
@@ -242,7 +238,7 @@ fn system_time_to_unix(t: SystemTime) -> Option<f64> {
 
 /// Sync head-scan invoked on a blocking pool. Returns `None` when the file
 /// is unreadable / not a valid JSONL — caller skips silently.
-fn head_scan_file(entry: &FileEntry, observations_dir: &Path) -> Option<SessionListItem> {
+fn head_scan_file(entry: &FileEntry) -> Option<SessionListItem> {
     let meta = read_session_metadata(&entry.path).ok()?;
 
     let display_name = meta
@@ -258,9 +254,6 @@ fn head_scan_file(entry: &FileEntry, observations_dir: &Path) -> Option<SessionL
                 .to_string()
         });
 
-    let observation_path = observations_dir.join(format!("{}.jsonl", meta.session_id));
-    let has_observations = observation_path.is_file();
-
     // Phase 6: stamp the project (parent directory under
     // `~/.claude/projects/<encoded-project>/`) so the App can apply the
     // `--project` filter without re-walking the filesystem.
@@ -274,7 +267,6 @@ fn head_scan_file(entry: &FileEntry, observations_dir: &Path) -> Option<SessionL
     Some(SessionListItem {
         session_id: meta.session_id,
         display_name,
-        has_observations,
         last_active_at: entry.mtime,
         project,
         ..Default::default()
@@ -357,8 +349,7 @@ mod tests {
     async fn scan_once_returns_empty_when_projects_dir_missing() {
         let tmp = tempdir().unwrap();
         let missing = tmp.path().join("does-not-exist");
-        let obs = tmp.path().join("observations");
-        let items = scan_once(&missing, &obs).await.unwrap();
+        let items = scan_once(&missing).await.unwrap();
         assert!(items.is_empty());
     }
 
@@ -366,9 +357,7 @@ mod tests {
     async fn scan_once_walks_projects_and_builds_items() {
         let tmp = tempdir().unwrap();
         let projects = tmp.path().join("projects");
-        let obs = tmp.path().join("observations");
         fs::create_dir_all(&projects).unwrap();
-        fs::create_dir_all(&obs).unwrap();
 
         // Two projects, one session each. Write s2 first then sleep so
         // its mtime is strictly older than s1 — establishes the sort order
@@ -385,34 +374,27 @@ mod tests {
         std::thread::sleep(StdDuration::from_millis(1100));
         let _s1 = write_session_jsonl(&p1, "session-aaa", "sid-aaa", "first session");
 
-        // Plant an observation file for sid-aaa so has_observations flips.
-        fs::write(obs.join("sid-aaa.jsonl"), b"{}\n").unwrap();
-
         // Plant an `agent-*.jsonl` that must be excluded.
         write_session_jsonl(&p1, "agent-skipme", "sid-skip", "do not surface");
 
-        let items = scan_once(&projects, &obs).await.unwrap();
+        let items = scan_once(&projects).await.unwrap();
         assert_eq!(items.len(), 2, "agent-*.jsonl must be filtered out");
 
         // Sorted newest-first: s1 has the later mtime.
         assert_eq!(items[0].session_id, "sid-aaa");
-        assert!(items[0].has_observations, "sid-aaa has an observation file");
         assert_eq!(items[0].display_name, "first session");
         assert!(!items[0].is_active);
         assert!(!items[0].is_working);
 
         assert_eq!(items[1].session_id, "sid-bbb");
-        assert!(!items[1].has_observations);
     }
 
     #[tokio::test]
     async fn scan_once_falls_back_to_file_stem_when_no_first_user_text() {
         let tmp = tempdir().unwrap();
         let projects = tmp.path().join("projects");
-        let obs = tmp.path().join("observations");
         let p = projects.join("proj");
         fs::create_dir_all(&p).unwrap();
-        fs::create_dir_all(&obs).unwrap();
 
         // No user lines → first_user_text stays None → display_name falls
         // back to the file stem.
@@ -424,7 +406,7 @@ mod tests {
         )
         .unwrap();
 
-        let items = scan_once(&projects, &obs).await.unwrap();
+        let items = scan_once(&projects).await.unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].session_id, "stub-stem");
         assert_eq!(items[0].display_name, "stub-stem");
@@ -435,12 +417,10 @@ mod tests {
         // A stray file directly under projects/ shouldn't crash the walk.
         let tmp = tempdir().unwrap();
         let projects = tmp.path().join("projects");
-        let obs = tmp.path().join("observations");
         fs::create_dir_all(&projects).unwrap();
-        fs::create_dir_all(&obs).unwrap();
         fs::write(projects.join("stray.txt"), b"not a project dir").unwrap();
 
-        let items = scan_once(&projects, &obs).await.unwrap();
+        let items = scan_once(&projects).await.unwrap();
         assert!(items.is_empty());
     }
 }

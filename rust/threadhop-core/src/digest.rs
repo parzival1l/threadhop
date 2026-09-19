@@ -2,8 +2,7 @@
 //! panel.
 //!
 //! Wave 3 Worker H populates [`compute_session_digest`] by walking the
-//! cleaned-transcript view from [`crate::jsonl::parse_byte_range`] and
-//! the observation file from [`crate::observations::read_entries`]. The
+//! cleaned-transcript view from [`crate::jsonl::parse_byte_range`]. The
 //! field set mirrors the Python `SessionDigest` dataclass — the
 //! computed-property names from Python (`title`, `cache_hit_ratio`,
 //! `context_fill_ratio`, `files_touched_count`,
@@ -33,17 +32,6 @@ use std::path::Path;
 use rusqlite::Connection;
 
 use crate::jsonl::{parse_byte_range, CleanedMessage};
-use crate::observations::{read_entries, Observation};
-
-/// One band of the recap timeline (Started / Earlier / Recently / Last
-/// asked). `timestamp` is the source ISO timestamp where available; the
-/// renderer uses it to compute a relative-age suffix.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct RecapEntry {
-    pub label: String,
-    pub timestamp: Option<String>,
-    pub text: String,
-}
 
 /// A single session, summarised for the right-column digest panel.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -63,10 +51,6 @@ pub struct SessionDigest {
     /// Wall-clock duration (seconds) from first user prompt to last
     /// event observed.
     pub duration_seconds: Option<u64>,
-
-    /// Recap bands in display order — empty when nothing is available
-    /// yet (fresh sessions with no completed turn).
-    pub recap: Vec<RecapEntry>,
 
     /// PR number captured from a `gh pr (create|view) ...` invocation
     /// in a tool/command row.
@@ -252,11 +236,10 @@ fn derive_title_from_first_user_text(text: &str) -> String {
 
 // ----------------------------------------------------------------- builder
 
-/// Build a session digest by walking the cleaned-transcript view and
-/// the observation JSONL for `session_id`. Errors (missing session row,
-/// unreadable JSONL, unreadable observation file) degrade silently to
-/// the slug-only stub — the caller can still render the empty-state
-/// panel without crashing.
+/// Build a session digest by walking the cleaned-transcript view for
+/// `session_id`. Errors (missing session row, unreadable JSONL) degrade
+/// silently to the slug-only stub — the caller can still render the
+/// empty-state panel without crashing.
 pub fn compute_session_digest(session_id: &str, conn: &Connection) -> SessionDigest {
     let mut digest = SessionDigest {
         session_id: session_id.to_string(),
@@ -277,12 +260,6 @@ pub fn compute_session_digest(session_id: &str, conn: &Connection) -> SessionDig
         if let Ok(bytes) = std::fs::read(path) {
             populate_from_transcript(&mut digest, &bytes, session_id);
         }
-    }
-
-    // Observations are optional — silently swallow read errors. The
-    // panel just renders an empty recap section in that case.
-    if let Ok(entries) = read_entries(session_id) {
-        populate_recap_from_observations(&mut digest, &entries);
     }
 
     digest
@@ -429,33 +406,6 @@ fn populate_from_transcript(
     digest.models_used = models_seen;
 }
 
-/// Append the most recent Decision observations to the digest recap, in
-/// timestamp DESC order, capped at 5 entries.
-fn populate_recap_from_observations(
-    digest: &mut SessionDigest,
-    entries: &[Observation],
-) {
-    let mut decisions: Vec<(&str, &str)> = entries
-        .iter()
-        .filter_map(|e| match e {
-            Observation::Decision { text, ts, .. } => Some((ts.as_str(), text.as_str())),
-            _ => None,
-        })
-        .collect();
-    // Latest decisions first.
-    decisions.sort_by(|a, b| b.0.cmp(a.0));
-    decisions.truncate(5);
-
-    digest.recap = decisions
-        .into_iter()
-        .map(|(ts, text)| RecapEntry {
-            label: "decision".to_string(),
-            timestamp: Some(ts.to_string()),
-            text: text.to_string(),
-        })
-        .collect();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,22 +541,6 @@ mod tests {
     }
 
     #[test]
-    fn compute_session_digest_falls_back_gracefully_when_observations_missing() {
-        // Session row + JSONL exist, but the observations dir has nothing.
-        // recap must be empty (no panic).
-        let jsonl = br#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"2026-01-01T00:00:00Z","message":{"content":"hello there"}}
-"#;
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("s-no-obs.jsonl");
-        std::fs::write(&path, jsonl).unwrap();
-        let conn = setup_db_with_session(&path, "s-no-obs");
-        let d = compute_session_digest("s-no-obs", &conn);
-        assert!(d.recap.is_empty(), "expected empty recap, got {:?}", d.recap);
-        // Title should still populate from the user line.
-        assert_eq!(d.title, "hello there");
-    }
-
-    #[test]
     fn compute_session_digest_no_session_row_returns_slug_stub() {
         let conn = empty_db();
         let d = compute_session_digest("ghost-session", &conn);
@@ -614,7 +548,6 @@ mod tests {
         assert_eq!(d.slug, "ghost-se");
         assert_eq!(d.total_input_tokens_billed, 0);
         assert!(d.models_used.is_empty());
-        assert!(d.recap.is_empty());
     }
 
     #[test]
@@ -720,37 +653,6 @@ mod tests {
     #[test]
     fn detect_pr_returns_none_for_unrelated_text() {
         assert!(detect_pr_from_tool_text("Running ls\n↳ ok").is_none());
-    }
-
-    #[test]
-    fn recap_filters_to_decisions_and_keeps_newest_first() {
-        // Direct unit on the recap helper.
-        let entries = vec![
-            Observation::Decision {
-                text: "older decision".into(),
-                ts: "2026-01-01T00:00:00Z".into(),
-                refs: None,
-                context: None,
-            },
-            Observation::Decision {
-                text: "newer decision".into(),
-                ts: "2026-02-01T00:00:00Z".into(),
-                refs: None,
-                context: None,
-            },
-            Observation::Todo {
-                text: "ignored".into(),
-                status: "open".into(),
-                ts: "2026-03-01T00:00:00Z".into(),
-                context: None,
-            },
-        ];
-        let mut d = SessionDigest::default();
-        populate_recap_from_observations(&mut d, &entries);
-        assert_eq!(d.recap.len(), 2);
-        assert_eq!(d.recap[0].text, "newer decision");
-        assert_eq!(d.recap[1].text, "older decision");
-        assert_eq!(d.recap[0].label, "decision");
     }
 
     // Smoke: MessageUsage round-trip through populate_from_transcript

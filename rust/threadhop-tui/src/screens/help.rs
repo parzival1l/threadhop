@@ -208,7 +208,6 @@ fn scope_label(scope: Scope) -> &'static str {
         Scope::HelpOverlay => "Help",
         Scope::LabelPrompt => "Label",
         Scope::Confirm | Scope::ConfirmModal => "Confirm",
-        Scope::ConflictViewer => "Conflicts",
         Scope::Selection => "Selection Mode",
     }
 }

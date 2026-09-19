@@ -5,9 +5,6 @@
 //!
 //! - Status icon: `◐` working / `●` active / `○` inactive (working frame
 //!   advances on a caller-supplied spinner index — Wave C ticks it).
-//! - Observation marker: `🗒` (UTF-8) or `≡` (ASCII fallback) per
-//!   ADR-021. Picked up from the `THREADHOP_ASCII_OBSERVATION_MARKER`
-//!   env var to mirror `_supports_observation_emoji` in Python.
 //! - Display name: custom_name → JSONL title → project, truncated to
 //!   `DISPLAY_NAME_WIDTH` (22 cols), padded to fixed width so ages align.
 //! - Age suffix: human-readable `Ns / Nm / Nh / Nd` from `last_active_at`.
@@ -66,16 +63,10 @@ pub const SPINNER_FRAMES: &[&str] = &[
     "⠁", "⠂", "⠄", "⠆", "⠇", "⠧", "⠷", "⠿",
 ];
 
-/// UTF-8 observation marker (ADR-021).
-pub const OBSERVATION_MARKER: &str = "🗒";
-
-/// ASCII fallback for terminals that can't encode the emoji marker.
-pub const OBSERVATION_MARKER_FALLBACK: &str = "≡";
-
 /// View-model for one sidebar row.
 ///
 /// Wave A's `threadhop_core::models::Session` lacks the runtime fields
-/// (`is_active`, `is_working`, `has_observations`, `last_active_at`) that
+/// (`is_active`, `is_working`, `last_active_at`) that
 /// drive the sidebar; those are derived by Wave C workers (active detector
 /// and session scanner). This struct is the per-row contract the widget
 /// needs. The worker layer fills it in, the App holds the resulting `Vec`.
@@ -96,9 +87,6 @@ pub struct SessionListItem {
     /// Drives the spinner instead of the static active dot.
     pub is_working: bool,
 
-    /// True when the session has observation entries (drives the marker).
-    pub has_observations: bool,
-
     /// JSONL `modified` timestamp (epoch seconds) — drives the age column.
     /// None renders as empty.
     pub last_active_at: Option<f64>,
@@ -108,11 +96,6 @@ pub struct SessionListItem {
     /// place without a worker round-trip. Default `Active` keeps existing
     /// scanner code path untouched.
     pub status: SessionStatus,
-
-    /// Count of unresolved cross-session conflicts whose origin is this
-    /// session. Populated by Phase 5 Wave 2 from `app.conflict_counts`; the
-    /// session_scanner worker leaves it at 0.
-    pub unresolved_conflict_count: u32,
 
     /// Project name (the `<encoded-project>` directory under
     /// `~/.claude/projects/`). Populated by the session_scanner so the App
@@ -130,8 +113,7 @@ pub struct SessionListWidget<'a> {
     /// `SystemTime::now()` in production; tests pass a fixed value so
     /// snapshots are stable.
     pub now: f64,
-    /// Optional theme — Phase 5 Wave 2 uses `theme.error` to color the
-    /// unresolved-conflict `!` marker. `None` keeps the marker uncolored.
+    /// Optional theme for row/status coloring. `None` renders unstyled.
     pub theme: Option<&'a threadhop_core::theme::Theme>,
     /// Phase E: whether the sidebar has focus. When true the right border
     /// renders in `theme.accent` rather than `theme.border_subtle`, mirroring
@@ -155,11 +137,6 @@ impl<'a> SessionListWidget<'a> {
 
 impl<'a> Widget for SessionListWidget<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let supports_emoji = supports_observation_emoji();
-        let error_color = self.theme.and_then(|t| {
-            hex_to_rgb(&t.error).map(|(r, g, b)| Color::Rgb(r, g, b))
-        });
-
         // Phase E: Group sessions by status. Order matches Python's
         // STATUS_ORDER (Active / InProgress / InReview / Done / Archived).
         // Headers are only emitted for groups that actually contain a row,
@@ -220,8 +197,6 @@ impl<'a> Widget for SessionListWidget<'a> {
                     it,
                     self.spinner_frame,
                     self.now,
-                    supports_emoji,
-                    error_color,
                     self.theme,
                 );
                 // Phase E row class — apply on top of the per-span theming.
@@ -338,24 +313,6 @@ pub fn status_icon(item: &SessionListItem, spinner_frame: usize) -> &'static str
     }
 }
 
-/// Whether the current terminal can encode the UTF-8 observation marker.
-/// Mirrors `_supports_observation_emoji` — opts out when the env override
-/// is set. The string-level check is implicit: we always know we have UTF-8
-/// in a Rust string, so the only signal is the env override.
-pub fn supports_observation_emoji() -> bool {
-    std::env::var("THREADHOP_ASCII_OBSERVATION_MARKER").as_deref() != Ok("1")
-}
-
-/// Resolve the observation marker glyph. Pure for testability — callers
-/// pass the `supports_emoji` flag rather than reading env state per row.
-pub fn observation_marker(supports_emoji: bool) -> &'static str {
-    if supports_emoji {
-        OBSERVATION_MARKER
-    } else {
-        OBSERVATION_MARKER_FALLBACK
-    }
-}
-
 /// Format an epoch-seconds timestamp as a human-readable age (`Ns / Nm /
 /// Nh / Nd`). Mirrors `threadhop_core.tui.utils.format_age`.
 ///
@@ -406,39 +363,17 @@ fn truncate_to_width(s: &str, budget: usize, add_ellipsis: bool) -> (String, usi
     (out, used)
 }
 
-/// Truncate-and-pad the display name so the age column stays aligned, with
-/// optional observation marker appended. The marker steals one column of
-/// width for the leading space plus its own cell width (1 for ASCII, 2 for
-/// the emoji — terminals render `🗒` as a wide glyph).
+/// Truncate-and-pad the display name so the age column stays aligned.
 ///
 /// Uses cell-width-aware truncation so CJK + emoji session names don't
 /// overflow the 22-cell display column.
-fn render_display_segment(item: &SessionListItem, supports_emoji: bool) -> String {
-    let marker = if item.has_observations {
-        Some(observation_marker(supports_emoji))
-    } else {
-        None
-    };
-
-    let reserved = match marker {
-        // " " + marker width (emoji counts as 2 cells, ascii as 1).
-        Some(m) if m == OBSERVATION_MARKER => 1 + 2,
-        Some(_) => 1 + 1,
-        None => 0,
-    };
-    let name_budget = DISPLAY_NAME_WIDTH.saturating_sub(reserved);
-
-    let (truncated, used_cells) = truncate_to_width(&item.display_name, name_budget, true);
+fn render_display_segment(item: &SessionListItem) -> String {
+    let (truncated, used_cells) = truncate_to_width(&item.display_name, DISPLAY_NAME_WIDTH, true);
 
     let mut out = String::with_capacity(DISPLAY_NAME_WIDTH * 2);
     out.push_str(&truncated);
-    if let Some(m) = marker {
-        out.push(' ');
-        out.push_str(m);
-    }
-    let used = used_cells + reserved;
-    if used < DISPLAY_NAME_WIDTH {
-        for _ in 0..(DISPLAY_NAME_WIDTH - used) {
+    if used_cells < DISPLAY_NAME_WIDTH {
+        for _ in 0..(DISPLAY_NAME_WIDTH - used_cells) {
             out.push(' ');
         }
     }
@@ -452,46 +387,19 @@ pub fn render_session_label_line<'a>(
     spinner_frame: usize,
     now: f64,
 ) -> Line<'a> {
-    render_session_label_line_with(item, spinner_frame, now, supports_observation_emoji())
-}
-
-/// Pure variant that takes the emoji-support flag explicitly. Used in
-/// tests to lock the rendered shape regardless of host terminal env.
-pub fn render_session_label_line_with<'a>(
-    item: &SessionListItem,
-    spinner_frame: usize,
-    now: f64,
-    supports_emoji: bool,
-) -> Line<'a> {
-    render_session_label_line_themed(item, spinner_frame, now, supports_emoji, None)
-}
-
-/// Variant that optionally styles a Phase-5 unresolved-conflict marker (`!`)
-/// in the supplied theme's `error` color. Pass `None` to render without
-/// styling (used by the text-only convenience helper and existing tests).
-pub fn render_session_label_line_themed<'a>(
-    item: &SessionListItem,
-    spinner_frame: usize,
-    now: f64,
-    supports_emoji: bool,
-    error_color: Option<Color>,
-) -> Line<'a> {
-    render_session_label_line_full(item, spinner_frame, now, supports_emoji, error_color, None)
+    render_session_label_line_full(item, spinner_frame, now, None)
 }
 
 /// Full-fat themed variant that also colors the leading status glyph
-/// (success / warning / muted) when a theme is supplied. The earlier
-/// `_themed` entrypoint still works — it just doesn't color the icon.
+/// (success / warning / muted) when a theme is supplied.
 pub fn render_session_label_line_full<'a>(
     item: &SessionListItem,
     spinner_frame: usize,
     now: f64,
-    supports_emoji: bool,
-    error_color: Option<Color>,
     theme: Option<&Theme>,
 ) -> Line<'a> {
     let icon = status_icon(item, spinner_frame);
-    let middle = render_display_segment(item, supports_emoji);
+    let middle = render_display_segment(item);
     let age = item
         .last_active_at
         .map(|ts| format_age(ts, now))
@@ -514,28 +422,11 @@ pub fn render_session_label_line_full<'a>(
         None => Style::default(),
     };
 
-    let mut spans = vec![
+    let spans = vec![
         Span::styled(format!("{icon} "), icon_style),
         Span::raw(middle),
         Span::styled(format!(" {age_padded}"), age_style),
     ];
-    if item.unresolved_conflict_count > 0 {
-        // Tiny red pill — bg(error) fg(background) so it reads as a deliberate
-        // chip rather than a stray glyph. Leading space separates it from the
-        // age column.
-        let bg_color = error_color.unwrap_or(Color::Red);
-        let fg_color = theme
-            .map(|t| theme_color(&t.background, Color::Black))
-            .unwrap_or(Color::Black);
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            " ! ".to_string(),
-            Style::default()
-                .bg(bg_color)
-                .fg(fg_color)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
     Line::from(spans)
 }
 
@@ -545,9 +436,8 @@ pub fn render_session_label_text(
     item: &SessionListItem,
     spinner_frame: usize,
     now: f64,
-    supports_emoji: bool,
 ) -> String {
-    render_session_label_line_with(item, spinner_frame, now, supports_emoji)
+    render_session_label_line(item, spinner_frame, now)
         .spans
         .iter()
         .map(|s| s.content.as_ref())
@@ -643,37 +533,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn conflict_marker_renders_as_pill_with_bg_and_fg() {
-        // The unresolved-conflict marker should be a bg/fg-styled pill,
-        // not just a colored character — verifies the pill upgrade lands.
-        use threadhop_core::theme::Theme;
-        let it = SessionListItem {
-            session_id: "s1".into(),
-            display_name: "n".into(),
-            unresolved_conflict_count: 2,
-            last_active_at: Some(0.0),
-            ..Default::default()
-        };
-        let theme = Theme::default_dark();
-        let err_color = hex_to_rgb(&theme.error).map(|(r, g, b)| Color::Rgb(r, g, b));
-        let line = render_session_label_line_full(&it, 0, 0.0, true, err_color, Some(&theme));
-        let pill = line
-            .spans
-            .iter()
-            .find(|s| s.content.contains('!'))
-            .expect("pill span present");
-        assert!(pill.style.bg.is_some(), "pill must have bg color");
-        assert!(pill.style.fg.is_some(), "pill must have fg color");
-        // Pill text should be 3 cells wide (` ! `) for a chip-like look.
-        assert_eq!(pill.content.as_ref(), " ! ");
-    }
 
-    #[test]
-    fn observation_marker_picks_glyph() {
-        assert_eq!(observation_marker(true), OBSERVATION_MARKER);
-        assert_eq!(observation_marker(false), OBSERVATION_MARKER_FALLBACK);
-    }
 
     #[test]
     fn render_session_label_text_layout() {
@@ -685,7 +545,7 @@ mod tests {
             ..Default::default()
         };
         // 30s ago → "30s" age.
-        let text = render_session_label_text(&it, 0, 30.0, true);
+        let text = render_session_label_text(&it, 0, 30.0);
         // status + space + 22-col name + space + 4-col right-aligned age.
         assert!(text.starts_with("● "));
         assert!(text.ends_with(" 30s"));
@@ -702,7 +562,7 @@ mod tests {
             last_active_at: Some(0.0),
             ..Default::default()
         };
-        let text = render_session_label_text(&it, 0, 0.0, true);
+        let text = render_session_label_text(&it, 0, 0.0);
         // The middle segment is exactly DISPLAY_NAME_WIDTH cells wide,
         // even when the source is far longer.
         let middle: String = text.chars().skip(2).take(DISPLAY_NAME_WIDTH).collect();
@@ -723,7 +583,7 @@ mod tests {
             last_active_at: Some(0.0),
             ..Default::default()
         };
-        let text = render_session_label_text(&it, 0, 0.0, true);
+        let text = render_session_label_text(&it, 0, 0.0);
         // Skip "○ " (status + space) then take the cell-width worth of chars.
         // We don't pin the exact rendered form — instead check that the
         // total display column width matches DISPLAY_NAME_WIDTH.
@@ -747,7 +607,7 @@ mod tests {
             last_active_at: Some(0.0),
             ..Default::default()
         };
-        let text = render_session_label_text(&it, 0, 0.0, true);
+        let text = render_session_label_text(&it, 0, 0.0);
         use unicode_width::UnicodeWidthStr;
         let trimmed = text.trim_end();
         let width = UnicodeWidthStr::width(trimmed);
@@ -757,30 +617,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn render_session_label_reserves_space_for_marker() {
-        let it = SessionListItem {
-            session_id: "s1".into(),
-            display_name: "abc".into(),
-            has_observations: true,
-            last_active_at: Some(0.0),
-            ..Default::default()
-        };
-        let text = render_session_label_text(&it, 0, 0.0, false);
-        // ASCII marker takes 1 + 1 = 2 cols → name is "abc" + padding.
-        assert!(text.contains(OBSERVATION_MARKER_FALLBACK));
-    }
 
-    #[test]
-    fn supports_observation_emoji_respects_env() {
-        // Clear, then assert UTF-8 mode.
-        std::env::remove_var("THREADHOP_ASCII_OBSERVATION_MARKER");
-        assert!(supports_observation_emoji());
-        std::env::set_var("THREADHOP_ASCII_OBSERVATION_MARKER", "1");
-        assert!(!supports_observation_emoji());
-        // Cleanup so we don't pollute other tests in the same process.
-        std::env::remove_var("THREADHOP_ASCII_OBSERVATION_MARKER");
-    }
 
     #[test]
     fn widget_renders_into_buffer_without_panic() {

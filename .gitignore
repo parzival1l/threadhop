@@ -19,6 +19,7 @@ Thumbs.db
 .claude/
 
 # Local-only docs/scripts
+docs/superpowers/
 AGENTS.md
 INSTALL-MACOS.md
 migration.py
@@ -26,4 +27,3 @@ migration.py
 
 # Rust
 rust/target/
-

@@ -16,8 +16,9 @@
 //! are escaped per FTS5 syntax. Empty queries short-circuit to `Ok(vec![])`.
 //!
 //! Filters compose with `AND` against the joined `messages` / `sessions` rows.
-//! Results are ordered by FTS5 `bm25` (ascending — lower is a better match)
-//! then by `messages.timestamp` descending, capped at 200 rows.
+//! Results are ordered most-recent-first by `messages.timestamp` descending,
+//! then by FTS5 `bm25` (ascending — lower is a better match) as a tiebreaker,
+//! capped at 200 rows.
 //!
 //! `Hit::score` is the raw `bm25(messages_fts)` value. Snippets use
 //! `snippet(messages_fts, 0, '[', ']', '...', 16)` — 16 tokens of context per
@@ -94,7 +95,8 @@ pub fn parse_query(raw: &str) -> (Filters, String) {
 ///
 /// Parses `raw` for `project:` / `user:` / `assistant:` modifiers, then runs
 /// a prefix FTS5 search against `messages_fts`. Returns at most 200 hits,
-/// ordered by relevance (bm25 ascending) then recency (timestamp descending).
+/// ordered most-recent-first (timestamp descending) then by relevance
+/// (bm25 ascending) as a tiebreaker.
 ///
 /// An empty or all-modifier query returns `Ok(vec![])` without touching the DB.
 pub fn search(conn: &Connection, raw: &str) -> Result<Vec<Hit>, FtsError> {
@@ -136,7 +138,7 @@ pub fn prefix_search(
         sql.push_str(" AND m.role = ?");
         params.push(Box::new(role_as_sql_str(r)));
     }
-    sql.push_str(" ORDER BY score ASC, m.timestamp DESC LIMIT 200");
+    sql.push_str(" ORDER BY m.timestamp DESC, score ASC LIMIT 200");
 
     let mut stmt = conn.prepare(&sql)?;
     let param_refs: Vec<&dyn ToSql> = params.iter().map(|b| b.as_ref()).collect();
@@ -163,6 +165,178 @@ fn build_fts_prefix_query(q: &str) -> String {
         .join(" ")
 }
 
+// --- CLI search lane (ADR-029 `threadhop search`) ---------------------------
+//
+// The CLI needs more columns per hit than the TUI's [`Hit`] carries (session
+// display name, project, timestamp) and mirrors the *Python* CLI's query
+// parser (`storage.search_queries._parse_search_query`) rather than the
+// modifier syntax above. Layered here, next to [`prefix_search`], so both
+// lanes share the recency-first ordering contract
+// (`ORDER BY m.timestamp DESC, rank`) established for this module.
+
+/// Sentinel characters bracketing matched spans in CLI snippets. Mirrors
+/// Python's `FTS_MATCH_START` / `FTS_MATCH_END` — the CLI converts them to
+/// `**` (text mode) or strips them (`--json`).
+pub const FTS_MATCH_START: char = '\u{1}';
+pub const FTS_MATCH_END: char = '\u{2}';
+
+/// One `threadhop search` hit — the row shape Python's `search_messages`
+/// returns (minus `session_path`, which the CLI output never surfaces).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CliHit {
+    pub uuid: String,
+    pub session_id: String,
+    pub timestamp: Option<String>,
+    /// Snippet with [`FTS_MATCH_START`] / [`FTS_MATCH_END`] sentinels.
+    pub snippet: String,
+    pub custom_name: Option<String>,
+    pub project: Option<String>,
+}
+
+/// Parsed form of a raw CLI query — mirrors Python's
+/// `_parse_search_query(raw) -> (terms, role, project)`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CliQuery {
+    pub terms: Vec<String>,
+    pub role: Option<String>,
+    pub project: Option<String>,
+}
+
+/// Parse raw input into search terms + role/project filters.
+///
+/// * `user:` / `assistant:` (case-insensitive) set the role filter.
+/// * `project:<val>` sets the project filter (substring LIKE match).
+/// * every other token is stripped of non-word characters (`[^\w]` → gone,
+///   Python parity) and, if non-empty, becomes an AND-combined prefix term.
+pub fn parse_cli_query(raw: &str) -> CliQuery {
+    let mut out = CliQuery::default();
+    for tok in raw.split_whitespace() {
+        let low = tok.to_lowercase();
+        if low == "user:" {
+            out.role = Some("user".to_string());
+        } else if low == "assistant:" {
+            out.role = Some("assistant".to_string());
+        } else if let Some(val) = tok.strip_prefix("project:") {
+            if !val.is_empty() {
+                out.project = Some(val.to_string());
+            }
+        } else {
+            let clean: String = tok
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !clean.is_empty() {
+                out.terms.push(clean);
+            }
+        }
+    }
+    out
+}
+
+/// Run the CLI search — Python's `search_messages` prefix path.
+///
+/// Term-less queries with a role/project filter fall back to a filter-only
+/// scan (newest first, 160-char raw snippets); term-less queries with no
+/// filters return no rows. The trigram fuzzy fallback the Python side layers
+/// on zero prefix hits is NOT ported yet — callers get the exact-match rows
+/// only.
+pub fn cli_search(
+    conn: &Connection,
+    query: &CliQuery,
+    limit: usize,
+) -> Result<Vec<CliHit>, FtsError> {
+    if query.terms.is_empty() {
+        if query.role.is_none() && query.project.is_none() {
+            return Ok(Vec::new());
+        }
+        return cli_filter_only(conn, query, limit);
+    }
+
+    let fts_expr = query
+        .terms
+        .iter()
+        .map(|t| format!("{t}*"))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let mut sql = String::from(
+        "SELECT m.uuid, m.session_id, m.timestamp, \
+                snippet(messages_fts, 0, ?, ?, '…', 16) AS snip, \
+                s.custom_name, s.project \
+         FROM messages_fts \
+         JOIN messages m ON m.rowid = messages_fts.rowid \
+         LEFT JOIN sessions s ON s.session_id = m.session_id \
+         WHERE messages_fts MATCH ?",
+    );
+    let mut params: Vec<Box<dyn ToSql>> = vec![
+        Box::new(FTS_MATCH_START.to_string()),
+        Box::new(FTS_MATCH_END.to_string()),
+        Box::new(fts_expr),
+    ];
+    if let Some(role) = &query.role {
+        sql.push_str(" AND m.role = ?");
+        params.push(Box::new(role.clone()));
+    }
+    if let Some(project) = &query.project {
+        sql.push_str(" AND s.project LIKE ?");
+        params.push(Box::new(format!("%{project}%")));
+    }
+    // Recency-first: newest matches lead, bm25 `rank` breaks timestamp ties
+    // (same ordering contract as `prefix_search` above).
+    sql.push_str(" ORDER BY m.timestamp DESC, rank LIMIT ?");
+    params.push(Box::new(limit as i64));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let param_refs: Vec<&dyn ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    let rows = stmt.query_map(rusqlite::params_from_iter(param_refs), map_cli_hit)?;
+    let hits: Result<Vec<CliHit>, _> = rows.collect();
+    Ok(hits?)
+}
+
+/// Filter-only scan for term-less queries — Python's `_search_filter_only`.
+fn cli_filter_only(
+    conn: &Connection,
+    query: &CliQuery,
+    limit: usize,
+) -> Result<Vec<CliHit>, FtsError> {
+    let mut sql = String::from(
+        "SELECT m.uuid, m.session_id, m.timestamp, \
+                substr(m.text, 1, 160) AS snip, \
+                s.custom_name, s.project \
+         FROM messages m \
+         LEFT JOIN sessions s ON s.session_id = m.session_id \
+         WHERE 1=1",
+    );
+    let mut params: Vec<Box<dyn ToSql>> = Vec::new();
+    if let Some(role) = &query.role {
+        sql.push_str(" AND m.role = ?");
+        params.push(Box::new(role.clone()));
+    }
+    if let Some(project) = &query.project {
+        sql.push_str(" AND s.project LIKE ?");
+        params.push(Box::new(format!("%{project}%")));
+    }
+    sql.push_str(" ORDER BY m.timestamp DESC LIMIT ?");
+    params.push(Box::new(limit as i64));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let param_refs: Vec<&dyn ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    let rows = stmt.query_map(rusqlite::params_from_iter(param_refs), map_cli_hit)?;
+    let hits: Result<Vec<CliHit>, _> = rows.collect();
+    Ok(hits?)
+}
+
+fn map_cli_hit(r: &rusqlite::Row<'_>) -> rusqlite::Result<CliHit> {
+    Ok(CliHit {
+        uuid: r.get(0)?,
+        session_id: r.get(1)?,
+        timestamp: r.get(2)?,
+        snippet: r.get(3)?,
+        custom_name: r.get(4)?,
+        project: r.get(5)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +355,7 @@ mod tests {
                 session_path TEXT,
                 project      TEXT,
                 cwd          TEXT,
+                custom_name  TEXT,
                 created_at   REAL,
                 modified_at  REAL
             );
@@ -329,6 +504,29 @@ mod tests {
         let uuids: Vec<&str> = hits.iter().map(|h| h.message_uuid.as_str()).collect();
         assert!(uuids.contains(&"u1"));
         assert!(uuids.contains(&"u2"));
+    }
+
+    #[test]
+    fn prefix_search_orders_most_recent_first() {
+        // Two matches where recency and relevance disagree: the older message
+        // is a near-exact match (better bm25), the newer one buries the term in
+        // a long sentence (worse bm25). Recency is primary, so the newer u2
+        // must come first — this would fail under score-primary ordering.
+        let c = open_in_memory_with_fts();
+        seed_session(&c, "s1", None);
+        seed_message(&c, "u1", "s1", "user", "alpha", "2026-05-20T10:00:00Z");
+        seed_message(
+            &c,
+            "u2",
+            "s1",
+            "user",
+            "lots of unrelated padding words before the alpha term appears here",
+            "2026-05-20T10:00:05Z",
+        );
+        let hits = prefix_search(&c, "alpha", &Filters::default()).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].message_uuid, "u2", "newest hit should sort first");
+        assert_eq!(hits[1].message_uuid, "u1");
     }
 
     #[test]
@@ -500,6 +698,98 @@ mod tests {
         assert_eq!(hits.len(), 1);
         // bm25 values are non-zero finite floats; we don't pin the exact value.
         assert!(hits[0].score.is_finite());
+    }
+
+    // ---------- CLI search lane (parse_cli_query / cli_search) ----------
+
+    #[test]
+    fn parse_cli_query_splits_terms_role_and_project() {
+        let q = parse_cli_query("retry backoff project:threadhop user:");
+        assert_eq!(q.terms, vec!["retry", "backoff"]);
+        assert_eq!(q.role.as_deref(), Some("user"));
+        assert_eq!(q.project.as_deref(), Some("threadhop"));
+    }
+
+    #[test]
+    fn parse_cli_query_strips_non_word_chars_from_terms() {
+        let q = parse_cli_query("retry.backoff() 'quoted'");
+        assert_eq!(q.terms, vec!["retrybackoff", "quoted"]);
+    }
+
+    #[test]
+    fn cli_search_orders_most_recent_first_with_sentinel_snippets() {
+        let c = open_in_memory_with_fts();
+        seed_session(&c, "s1", Some("proj-a"));
+        seed_message(&c, "u1", "s1", "user", "retry the request", "2026-05-20T10:00:00Z");
+        seed_message(
+            &c,
+            "u2",
+            "s1",
+            "assistant",
+            "we should retry with backoff",
+            "2026-05-20T10:00:05Z",
+        );
+        let hits = cli_search(&c, &parse_cli_query("retry"), 20).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].uuid, "u2", "newest hit sorts first");
+        assert!(
+            hits[0]
+                .snippet
+                .contains(&format!("{FTS_MATCH_START}retry{FTS_MATCH_END}")),
+            "snippet missing sentinels: {:?}",
+            hits[0].snippet
+        );
+        assert_eq!(hits[0].project.as_deref(), Some("proj-a"));
+    }
+
+    #[test]
+    fn cli_search_project_filter_is_substring_like() {
+        let c = open_in_memory_with_fts();
+        seed_session(&c, "s1", Some("-Users-alice-threadhop"));
+        seed_session(&c, "s2", Some("-Users-alice-other"));
+        seed_message(&c, "u1", "s1", "user", "shared term", "2026-05-20T10:00:00Z");
+        seed_message(&c, "u2", "s2", "user", "shared term", "2026-05-20T10:00:01Z");
+        let hits = cli_search(&c, &parse_cli_query("shared project:threadhop"), 20).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session_id, "s1");
+    }
+
+    #[test]
+    fn cli_search_respects_limit() {
+        let c = open_in_memory_with_fts();
+        seed_session(&c, "s1", None);
+        for i in 0..5 {
+            seed_message(
+                &c,
+                &format!("u{i}"),
+                "s1",
+                "user",
+                "alpha term",
+                &format!("2026-05-20T10:00:0{i}Z"),
+            );
+        }
+        let hits = cli_search(&c, &parse_cli_query("alpha"), 2).unwrap();
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn cli_search_termless_no_filters_returns_empty() {
+        // No schema needed — must short-circuit before touching the DB.
+        let c = Connection::open_in_memory().unwrap();
+        let hits = cli_search(&c, &parse_cli_query("..."), 20).unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn cli_search_termless_with_filter_scans_newest_first() {
+        let c = open_in_memory_with_fts();
+        seed_session(&c, "s1", Some("proj-a"));
+        seed_message(&c, "u1", "s1", "user", "older", "2026-05-20T10:00:00Z");
+        seed_message(&c, "u2", "s1", "user", "newer", "2026-05-20T10:00:01Z");
+        let hits = cli_search(&c, &parse_cli_query("project:proj-a"), 20).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].uuid, "u2");
+        assert_eq!(hits[0].snippet, "newer");
     }
 
     #[test]

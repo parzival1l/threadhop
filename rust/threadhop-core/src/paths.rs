@@ -17,12 +17,10 @@ pub fn config_path() -> PathBuf {
     config_dir().join("config.json")
 }
 
-pub fn observations_dir() -> PathBuf {
-    config_dir().join("observations")
-}
-
-pub fn observation_file(session_id: &str) -> PathBuf {
-    observations_dir().join(format!("{session_id}.jsonl"))
+/// Where `threadhop prepare` writes transfer tickets (ADR-029). Shared with
+/// the Python CLI's `transfers.TRANSFERS_DIR`.
+pub fn transfers_dir() -> PathBuf {
+    config_dir().join("transfers")
 }
 
 pub fn logs_dir() -> PathBuf {
@@ -44,9 +42,9 @@ mod tests {
     }
 
     #[test]
-    fn observations_dir_matches_python() {
-        let p = observations_dir();
-        assert!(p.ends_with(".config/threadhop/observations"));
+    fn transfers_dir_matches_python() {
+        let p = transfers_dir();
+        assert!(p.ends_with(".config/threadhop/transfers"));
     }
 
     #[test]

@@ -17,7 +17,6 @@ use threadhop_core::{
     digest::SessionDigest,
     jsonl::CleanedMessage,
     models::Session,
-    observations::{Observation, ObservationSummary},
     theme::Theme,
 };
 use tokio::sync::watch;
@@ -29,9 +28,6 @@ use crate::screens::bookmark_browser::{
 };
 use crate::screens::bookmark_note_prompt::{self as bnp, NoteAction};
 use crate::screens::confirm::{self as cf, ConfirmResult};
-use crate::screens::conflict_viewer::{
-    self as cv, ConflictRow, ConflictViewerResult,
-};
 use crate::screens::help::{self as hp, HelpResult};
 use crate::screens::kanban::{self as kb, KanbanItem, KanbanResult};
 use crate::screens::label_prompt::{
@@ -247,14 +243,6 @@ pub struct App {
     /// Kanban modal state — `Some` while the tag-board is open.
     pub kanban: Option<kb::State>,
 
-    /// Conflict viewer modal state — `Some` while open.
-    pub conflict_viewer: Option<cv::State>,
-
-    /// Per-session digest summary cache. Re-populated whenever a
-    /// `TranscriptRefreshed` event lands so the digest bar reflects the
-    /// freshest observation file without a per-frame disk read.
-    pub digest_summary_cache: HashMap<String, ObservationSummary>,
-
     /// Per-session [`SessionDigest`] cache for the right-column panel.
     /// **Pre-pop scaffolding.** Worker H populates entries by calling
     /// [`threadhop_core::digest::compute_session_digest`] from the
@@ -274,11 +262,6 @@ pub struct App {
     /// digest-bar `★ bookmarked` marker and avoids re-querying SQLite on
     /// every frame.
     pub has_bookmarks_for_session: HashSet<String>,
-
-    /// Per-session count of unresolved cross-session conflicts. Populated
-    /// from observation JSONLs + `conflict_reviews` when the conflict viewer
-    /// is opened or when `MarkResolved` returns.
-    pub conflict_counts: HashMap<String, u32>,
 
     // ---- Phase 6 -----------------------------------------------------------
     /// Help overlay state — `Some` while the overlay is open. The overlay
@@ -355,7 +338,7 @@ pub struct App {
 /// Phase E: an action emitted by the mouse hit-test pipeline. The variant
 /// list grows as more clickable surfaces come online — Phase E ships with
 /// the four that paid for themselves on day one (sidebar select, transcript
-/// scroll, transcript focus, find-bar close). Kanban/help/conflict viewer
+/// scroll, transcript focus, find-bar close). Kanban/help modal
 /// rectangles would push more variants here once their hit-tests land.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HitAction {
@@ -540,12 +523,9 @@ impl App {
             bookmark_note_prompt: None,
             previous_scope: None,
             kanban: None,
-            conflict_viewer: None,
-            digest_summary_cache: HashMap::new(),
             digest_cache: HashMap::new(),
             expanded_tools: HashSet::new(),
             has_bookmarks_for_session: HashSet::new(),
-            conflict_counts: HashMap::new(),
             help: None,
             project_filter: None,
             days_filter: None,
@@ -707,7 +687,6 @@ impl App {
         if self.help.is_none()
             && self.confirm.is_none()
             && self.search.is_none()
-            && self.conflict_viewer.is_none()
             && self.kanban.is_none()
             && self.label_prompt.is_none()
             && self.bookmark_note_prompt.is_none()
@@ -793,7 +772,7 @@ impl App {
     /// `None` because the modal owns its own result type.
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Command> {
         // Modal-first dispatch — most-on-top first:
-        //   help > confirm > kanban | conflict_viewer | label_prompt | bookmark_browser
+        //   help > confirm > kanban | label_prompt | bookmark_browser
         //        > search > find_bar
         // Help sits on top of everything so the user can pop it open from any
         // scope without losing the underlying modal stack.
@@ -809,10 +788,6 @@ impl App {
         }
         if self.kanban.is_some() {
             self.dispatch_kanban(key);
-            return None;
-        }
-        if self.conflict_viewer.is_some() {
-            self.dispatch_conflict_viewer(key);
             return None;
         }
         if self.label_prompt.is_some() {
@@ -986,9 +961,8 @@ impl App {
                     self.message_cursor
                 );
             }
-            // Phase 5 Wave 2: open the kanban + conflict viewer modals.
+            // Phase 5 Wave 2: open the kanban modal.
             Command::OpenKanban => self.open_kanban(),
-            Command::OpenConflictViewer => self.open_conflict_viewer(),
             // Phase 0 no-op stubs: Python has these actions; Rust doesn't
             // implement them yet. We register the bindings so muscle memory
             // works, log a warn, and surface a status_message so the user
@@ -1004,10 +978,6 @@ impl App {
             Command::GrowSidebar => self.stub_command("grow sidebar"),
             Command::RenameSession => self.stub_command("rename session"),
             Command::CopyResumeCommand => self.stub_command("copy resume"),
-            Command::ObserveSession => self.stub_command("observe session"),
-            Command::ResumeObservation => {
-                self.stub_command("resume observation")
-            }
             Command::ArchiveSession => self.stub_command("archive session"),
             Command::ToggleArchivedView => {
                 self.stub_command("toggle archived view")
@@ -1032,7 +1002,6 @@ impl App {
             // Cancel is owned by the modal-first dispatch; modal-only
             // commands never fire on the main screen.
             Command::Cancel
-            | Command::MarkConflictResolved
             | Command::KanbanColumnLeft
             | Command::KanbanColumnRight
             | Command::KanbanMoveItem
@@ -1440,7 +1409,7 @@ impl App {
     ///
     /// Phase 6 verifier: defensively check that the message uuid exists in
     /// the `messages` table before attempting the insert. The bookmarks
-    /// table has an FK on `messages.uuid`; if the Python observer/indexer
+    /// table has an FK on `messages.uuid`; if the Python indexer
     /// hasn't ingested the message yet (common race when the TUI catches a
     /// fresh tail of the JSONL before SQLite knows about it), the INSERT
     /// would fail with `FOREIGN KEY constraint failed`. Surface that as a
@@ -1732,8 +1701,8 @@ impl App {
         }
         // Pop back to the modal that opened the confirm (if any). Stackers
         // save their scope into `previous_scope` before bumping `scope =
-        // ConfirmModal`, so this branch stays generic for kanban /
-        // conflict_viewer / future modals.
+        // ConfirmModal`, so this branch stays generic for kanban and
+        // future modals.
         self.scope = match self.previous_scope.take() {
             Some(prev) => prev,
             None => Scope::MainScreen,
@@ -1873,7 +1842,7 @@ impl App {
                 // stays open so cancelling delete returns to the same
                 // selection. Saving the current scope into `previous_scope`
                 // is what lets `dispatch_confirm` pop back generically —
-                // future modals (kanban, conflict_viewer) get this for free.
+                // future modals (kanban, etc.) get this for free.
                 tracing::debug!(
                     target: "threadhop_tui",
                     "bookmark delete requested id={bookmark_id}"
@@ -1926,7 +1895,7 @@ impl App {
             .unwrap_or(keys::Scope::MainScreen);
     }
 
-    // ---- Phase 5 Wave 2: kanban + conflict viewer dispatch ----------------
+    // ---- Phase 5 Wave 2: kanban dispatch -----------------------------------
 
     /// Build kanban items from the sidebar, hydrating each row's `status`
     /// field from the DB. Misses (e.g. session not present in the DB yet
@@ -1965,116 +1934,6 @@ impl App {
         self.kanban = Some(kb::State::new(items));
         self.scope = Scope::Kanban;
         self.stamp_modal_open();
-    }
-
-    fn open_conflict_viewer(&mut self) {
-        let (rows, counts) = self.collect_conflicts();
-        let mut state = cv::State::new();
-        state.set_conflicts(rows);
-        self.conflict_counts = counts;
-        // Reflect the counts into the sidebar so the `!` marker is visible
-        // immediately. Sidebar items are clone-on-write through the worker
-        // pipeline; mutating here is safe.
-        self.sync_sidebar_conflict_counts();
-        self.previous_scope = Some(self.scope);
-        self.conflict_viewer = Some(state);
-        self.scope = Scope::ConflictViewer;
-        self.stamp_modal_open();
-    }
-
-    /// Read every session's observation JSONL, collect `Observation::Conflict`
-    /// entries, and join against `conflict_reviews` for the `reviewed` flag.
-    /// Returns `(rows, per_session_unresolved_counts)`.
-    fn collect_conflicts(&self) -> (Vec<ConflictRow>, HashMap<String, u32>) {
-        // Spec §9 leaves `conflict_reviews` writes to the Python CLI, but
-        // reads are fine. Inline raw SQL keeps the helper out of
-        // `threadhop-core` for now (see follow-up in commit body).
-        let reviewed: HashSet<(String, String, String)> =
-            match self.db.prepare(
-                "SELECT session_id, refs_key, topic FROM conflict_reviews",
-            ) {
-                Ok(mut stmt) => stmt
-                    .query_map([], |r| {
-                        Ok((
-                            r.get::<_, String>(0)?,
-                            r.get::<_, String>(1)?,
-                            r.get::<_, String>(2)?,
-                        ))
-                    })
-                    .and_then(|rows| rows.collect::<Result<HashSet<_>, _>>())
-                    .unwrap_or_default(),
-                Err(e) => {
-                    tracing::warn!("conflict_reviews query failed: {e}");
-                    HashSet::new()
-                }
-            };
-
-        let mut out: Vec<ConflictRow> = Vec::new();
-        let mut counts: HashMap<String, u32> = HashMap::new();
-        // Stable, content-derived row id — observation JSONLs are
-        // append-only and don't carry numeric ids. Hash a tuple of the
-        // origin session + refs + topic so the same conflict yields the
-        // same id across reads.
-        let mut next_synthetic_id: i64 = 1;
-
-        for item in &self.sidebar {
-            let entries = match threadhop_core::observations::read_entries(&item.session_id) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(
-                        "read_entries({}) failed: {e}",
-                        item.session_id
-                    );
-                    continue;
-                }
-            };
-            for entry in entries {
-                if let Observation::Conflict {
-                    refs,
-                    topic,
-                    ts,
-                    text,
-                    ..
-                } = entry
-                {
-                    let refs_key = normalize_conflict_refs(&refs);
-                    let reviewed_flag = reviewed.contains(&(
-                        item.session_id.clone(),
-                        refs_key.clone(),
-                        topic.clone(),
-                    ));
-                    if !reviewed_flag {
-                        *counts.entry(item.session_id.clone()).or_insert(0) += 1;
-                    }
-                    // session_ids[0] = origin; remainder = refs.
-                    let mut session_ids = Vec::with_capacity(1 + refs.len());
-                    session_ids.push(item.session_id.clone());
-                    session_ids.extend(refs);
-                    let text_str = text.unwrap_or_else(|| topic.clone());
-                    let timestamp = parse_iso8601(&ts).unwrap_or(0.0);
-                    let id = next_synthetic_id;
-                    next_synthetic_id += 1;
-                    out.push(ConflictRow {
-                        id,
-                        text: text_str,
-                        session_ids,
-                        timestamp,
-                        reviewed: reviewed_flag,
-                    });
-                }
-            }
-        }
-        (out, counts)
-    }
-
-    fn sync_sidebar_conflict_counts(&mut self) {
-        for side in &mut self.sidebar {
-            side.unresolved_conflict_count = self
-                .conflict_counts
-                .get(&side.session_id)
-                .copied()
-                .unwrap_or(0);
-        }
     }
 
     fn dispatch_kanban(&mut self, key: KeyEvent) {
@@ -2157,72 +2016,6 @@ impl App {
         }
     }
 
-    fn dispatch_conflict_viewer(&mut self, key: KeyEvent) {
-        let state = self
-            .conflict_viewer
-            .as_mut()
-            .expect("dispatch_conflict_viewer precondition");
-        let result = cv::handle_key(state, key);
-        let Some(result) = result else {
-            return;
-        };
-        match result {
-            ConflictViewerResult::Cancelled => {
-                self.conflict_viewer = None;
-                self.scope = self.previous_scope.take().unwrap_or(Scope::MainScreen);
-            }
-            ConflictViewerResult::JumpToSession { session_id } => {
-                self.conflict_viewer = None;
-                self.scope = self.previous_scope.take().unwrap_or(Scope::MainScreen);
-                if self.selected_session_id.as_deref() != Some(session_id.as_str()) {
-                    self.selected_session_id = Some(session_id.clone());
-                    let _ = self.active_session_tx.send(Some(session_id));
-                    self.set_scroll(0);
-                }
-            }
-            ConflictViewerResult::MarkResolved { conflict_id } => {
-                // Spec §9: Rust never writes `conflict_reviews`. Shell out to
-                // the Python CLI; the child uses the synthetic conflict id we
-                // generated in `collect_conflicts`. The Python CLI accepts an
-                // integer index here.
-                let cli = std::env::current_dir()
-                    .ok()
-                    .map(|d| d.join("threadhop"))
-                    .filter(|p| p.exists())
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "threadhop".to_string());
-                match std::process::Command::new(&cli)
-                    .args(["conflicts", "--resolved", &conflict_id.to_string()])
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
-                {
-                    Ok(_child) => {
-                        self.status_message = Some(format!(
-                            "resolved #{conflict_id} (running threadhop conflicts --resolved)"
-                        ));
-                        // Refresh the row set + counts. The shelled-out
-                        // process is async, so the read may race the write;
-                        // counts will reconcile on the next open.
-                        let (rows, counts) = self.collect_conflicts();
-                        if let Some(s) = self.conflict_viewer.as_mut() {
-                            s.set_conflicts(rows);
-                        }
-                        self.conflict_counts = counts;
-                        self.sync_sidebar_conflict_counts();
-                    }
-                    Err(e) => {
-                        tracing::warn!("threadhop conflicts spawn failed: {e}");
-                        self.status_message = Some(format!(
-                            "run `threadhop conflicts --resolved {conflict_id}` to resolve"
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
     /// Move sidebar selection by `delta` rows (+1 down, -1 up). No-op if the
     /// sidebar is empty. On success, retargets the fs_watcher via
     /// `active_session_tx` and resets transcript scroll.
@@ -2260,7 +2053,7 @@ impl App {
     /// will arrive in that case).
     ///
     /// Wave 2 Worker F: funnels through [`Self::set_scroll_to_message`] so
-    /// the search-modal / bookmark-browser / conflict-viewer jump paths all
+    /// the search-modal / bookmark-browser jump paths all
     /// land their target ~1/3 from the top of the viewport even on
     /// markdown-heavy bodies. Previously we set `self.scroll = source_line`
     /// directly, which under-shoots on transcripts whose visual rows
@@ -2317,53 +2110,6 @@ fn derive_project_for_session(session_id: &str) -> Option<String> {
         }
     }
     None
-}
-
-/// Mirror Python's `_normalize_conflict_refs` — trim, drop empties, sort,
-/// dedup, join on U+001F. Used by `collect_conflicts` to key the join with
-/// the `conflict_reviews` table.
-fn normalize_conflict_refs(refs: &[String]) -> String {
-    let mut canon: Vec<String> = refs
-        .iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    canon.sort();
-    canon.dedup();
-    canon.join("\u{1f}")
-}
-
-/// Tiny ISO-8601 → epoch-seconds parser — mirrors the variant in
-/// `widgets::digest_bar`. Returns `None` on malformed input. Sufficient for
-/// the observer's `YYYY-MM-DDTHH:MM:SS[.fff]Z` shape.
-fn parse_iso8601(ts: &str) -> Option<f64> {
-    let core = ts
-        .trim_end_matches('Z')
-        .trim_end_matches("+00:00")
-        .trim_end_matches("-00:00");
-    let (date, time) = core.split_once('T')?;
-    let mut dp = date.split('-');
-    let year: i64 = dp.next()?.parse().ok()?;
-    let month: i64 = dp.next()?.parse().ok()?;
-    let day: i64 = dp.next()?.parse().ok()?;
-    let (hms, frac) = match time.split_once('.') {
-        Some((a, b)) => (a, b),
-        None => (time, "0"),
-    };
-    let mut t = hms.split(':');
-    let hour: i64 = t.next()?.parse().ok()?;
-    let minute: i64 = t.next()?.parse().ok()?;
-    let second: i64 = t.next().unwrap_or("0").parse().ok()?;
-    let frac_f: f64 = format!("0.{frac}").parse().ok()?;
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let m_adj = if month > 2 { month - 3 } else { month + 9 };
-    let doy = (153 * m_adj + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days_since_epoch = era * 146_097 + doe - 719_468;
-    let seconds = days_since_epoch * 86_400 + hour * 3_600 + minute * 60 + second;
-    Some(seconds as f64 + frac_f)
 }
 
 /// Compact a message body for the bookmark browser snippet column —
@@ -3222,19 +2968,12 @@ mod tests {
     }
 
     #[test]
-    fn pressing_c_opens_conflict_viewer() {
+    fn pressing_c_is_a_no_op_after_adr_029() {
+        // The conflict viewer was removed with the observation layer —
+        // plain `c` must not open anything or change the scope.
         let (mut app, _sid, _uuid) = seeded_app();
-        let before = render_to_string(&app, 120, 30);
-        assert!(!before.contains("Conflicts"), "title shouldn't appear pre-open");
         app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
-        assert!(app.conflict_viewer.is_some(), "viewer state set");
-        assert_eq!(app.scope, Scope::ConflictViewer);
-        let after = render_to_string(&app, 120, 30);
-        assert_ne!(before, after, "modal should change frame buffer");
-        assert!(
-            after.contains("Conflicts"),
-            "expected 'Conflicts' title in frame; got:\n{after}"
-        );
+        assert_eq!(app.scope, Scope::MainScreen);
     }
 
     #[test]
@@ -3428,21 +3167,10 @@ mod tests {
     #[test]
     fn digest_bar_renders_in_main_layout() {
         let (mut app, sid, _uuid) = seeded_app();
-        // Seed a digest summary so the bar has something concrete to show.
-        let summary = ObservationSummary {
-            open_todo_count: 3,
-            ..Default::default()
-        };
-        app.digest_summary_cache.insert(sid.clone(), summary);
         app.has_bookmarks_for_session.insert(sid.clone());
         let frame = render_to_string(&app, 120, 30);
-        // The digest bar lives on row 0. Pull that row out so we don't trip
-        // on incidental "3" digits elsewhere in the layout.
+        // The digest bar lives on row 0.
         let first_row = frame.lines().next().unwrap_or("");
-        assert!(
-            first_row.contains("3 todos"),
-            "expected digest bar text on row 0; got: {first_row:?}"
-        );
         assert!(
             first_row.contains("bookmarked"),
             "expected bookmarked marker on row 0; got: {first_row:?}"

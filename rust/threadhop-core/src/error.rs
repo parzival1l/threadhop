@@ -29,16 +29,6 @@ pub enum FtsError {
 }
 
 #[derive(Debug, Error)]
-pub enum ObservationError {
-    #[error("io: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("decode: {0}")]
-    Decode(#[from] serde_json::Error),
-    #[error("db: {0}")]
-    Db(#[from] DbError),
-}
-
-#[derive(Debug, Error)]
 pub enum SessionDetectError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
@@ -116,27 +106,6 @@ mod tests {
         let sql_err = rusqlite::Error::QueryReturnedNoRows;
         let err: FtsError = sql_err.into();
         assert!(matches!(err, FtsError::Sqlite(_)));
-    }
-
-    #[test]
-    fn observation_error_from_db() {
-        let db_err = DbError::SchemaMismatch { db: 1, expected: 9 };
-        let err: ObservationError = db_err.into();
-        assert!(matches!(err, ObservationError::Db(_)));
-    }
-
-    #[test]
-    fn observation_error_from_io() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "x");
-        let err: ObservationError = io_err.into();
-        assert!(matches!(err, ObservationError::Io(_)));
-    }
-
-    #[test]
-    fn observation_error_from_serde() {
-        let serde_err = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
-        let err: ObservationError = serde_err.into();
-        assert!(matches!(err, ObservationError::Decode(_)));
     }
 
     #[test]

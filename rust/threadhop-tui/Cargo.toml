@@ -16,7 +16,11 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 # time for intervals, macros for select!, process for future worker tasks.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "process"] }
 anyhow = "1"
+serde = { workspace = true }
 serde_json = { workspace = true }
+# ADR-029 CLI: `peek --grep` compiles a case-insensitive user regex. Same
+# major as threadhop-core's regex dep.
+regex = "1"
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }

@@ -8,8 +8,8 @@
 //! have been stripped, and `tool_use` blocks have been abbreviated to one
 //! human-readable line each.
 //!
-//! Anti-pattern (from CLAUDE.md): "Don't feed the observer raw JSONL." This
-//! module is the cleaned-transcript view shared by the TUI and the observer.
+//! This module is the cleaned-transcript view shared by the TUI, the FTS
+//! index, and the exchange model behind `peek` / `prepare` (ADR-030).
 //!
 //! No DB or filesystem I/O lives here — callers stream bytes in and serialize
 //! output however they need.

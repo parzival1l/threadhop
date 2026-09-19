@@ -196,29 +196,12 @@ pub(crate) fn handle_worker_event(app: &mut App, event: WorkerEvent) {
                 }
                 // Phase 3 Wave 2: resolve any pending search-modal jump.
                 app.try_resolve_pending_jump();
-                // Phase 5 Wave 2: refresh the digest summary cache and the
-                // bookmarked-session set for the just-adopted session so the
-                // digest bar reflects the freshest observation file.
-                match threadhop_core::observations::latest_summary(
-                    &app.db,
-                    &session_id,
-                ) {
-                    Ok(summary) => {
-                        app.digest_summary_cache
-                            .insert(session_id.clone(), summary);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "latest_summary({session_id}) failed: {e}"
-                        );
-                    }
-                }
                 // Wave 3 Worker H: populate the SessionDigest cache for the
-                // right-column panel. Mirrors the digest_summary_cache path
-                // above — fires on every TranscriptRefreshed (which is what
-                // the fs_watcher delivers on each session switch and every
-                // file-change tick). The computation reads the JSONL off
-                // disk, so we only run it on the just-adopted session.
+                // right-column panel. Fires on every TranscriptRefreshed
+                // (which is what the fs_watcher delivers on each session
+                // switch and every file-change tick). The computation reads
+                // the JSONL off disk, so we only run it on the just-adopted
+                // session.
                 let digest = threadhop_core::digest::compute_session_digest(
                     &session_id,
                     &app.db,

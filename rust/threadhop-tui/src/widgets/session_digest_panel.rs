@@ -1,15 +1,13 @@
 //! Right-column session digest panel — Phase C (minimal).
 //!
-//! Mirrors `threadhop_core/tui/widgets/session_digest_bar.py` in structure:
-//! a passive, non-focusable column on the right showing the focused
-//! session's identity, a recap snippet, stub Outputs / Context rows, and a
-//! footer with a `claude -r <sid>…` resume command.
+//! A passive, non-focusable column on the right showing the focused
+//! session's identity, Outputs / Context rows fed by the
+//! [`SessionDigest`], and a footer with a `claude -r <sid>…` resume
+//! command.
 //!
-//! This is the **minimal Phase C** landing — multi-entry recap, real
-//! outputs (PR / files), real context (token usage / models), and the
-//! permission / version footer chips are deferred until `ObservationSummary`
-//! grows a `Vec<RecapEntry>` and the App carries a `SessionDigest`. See
-//! `docs/superpowers/plans/2026-05-21-rust-tui-parity-plan.md` § 4 Phase C.
+//! ADR-029 removed the observation layer, and with it the observation-fed
+//! Recap band this panel used to render. The session-metadata digest
+//! (identity, outputs, token context, resume command) survives.
 //!
 //! Layout (top → bottom inside the panel rect):
 //!
@@ -17,9 +15,6 @@
 //!  ┌ digest ─────────────────────────┐
 //!  │ <title (bold fg)>               │
 //!  │ <slug (muted)>                  │
-//!  │                                 │
-//!  │ Recap                           │
-//!  │ ▌ <newest_decision or stub>     │
 //!  │                                 │
 //!  │ Outputs                         │
 //!  │ —                               │
@@ -35,16 +30,12 @@
 //! Render rules:
 //! - Empty state (no `selected_session_id`): single muted line
 //!   "Select a session to see its digest." inside the bordered block.
-//! - Otherwise: render the five blocks. Each section header uses
-//!   `theme.foreground + bold`. The recap band has a thick left-edge
-//!   gutter (`▌`) in `theme.border_active`; band body uses `theme.foreground`.
-//!   Outputs / Context bodies stub to `—` in `theme.text_muted` until
-//!   real data lands.
+//! - Otherwise: render the blocks. Each section header uses
+//!   `theme.foreground + bold`. Outputs / Context bodies stub to `—` in
+//!   `theme.text_muted` when the digest has no data.
 //! - Footer: 8-cell `─` divider in `theme.border_active`, then the
-//!   resume command in `theme.text_muted + italic`. The footer floats
-//!   pinned to the bottom of the inner area when the panel is tall
-//!   enough; otherwise it's clipped from the top with the rest of the
-//!   blocks.
+//!   resume command in `theme.text_muted + italic`, pinned to the bottom
+//!   of the inner area when the panel is tall enough.
 //!
 //! The widget owns no state — like `DigestBarWidget`, all fields are
 //! borrowed from the App and the struct is constructed per frame.
@@ -57,7 +48,6 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Widget},
 };
 use threadhop_core::digest::SessionDigest;
-use threadhop_core::observations::ObservationSummary;
 use threadhop_core::theme::Theme;
 
 use crate::widgets::session_list::SessionListItem;
@@ -73,9 +63,6 @@ pub struct SessionDigestPanel<'a> {
     /// Sidebar row for the currently-selected session, if any. Provides
     /// `display_name` (title) and `session_id` (slug).
     pub selected_item: Option<&'a SessionListItem>,
-    /// Observation summary for the selected session. Used to populate the
-    /// recap band's body line. `None` → stub "(no recap yet)".
-    pub summary: Option<&'a ObservationSummary>,
     /// Full session digest for the selected session. Drives the Outputs
     /// (PR / files) and Context (token totals / cache / models) blocks.
     /// `None` → both blocks render their `—` stub.
@@ -131,7 +118,7 @@ impl<'a> Widget for SessionDigestPanel<'a> {
         let theme = self.theme;
         let fg = hex_to_color(&theme.foreground).unwrap_or(Color::White);
         let muted = hex_to_color(&theme.text_muted).unwrap_or(Color::DarkGray);
-        let gutter_color = hex_to_color(&theme.border_active).unwrap_or(muted);
+        let divider_color = hex_to_color(&theme.border_active).unwrap_or(muted);
 
         // We render top-down using a manual row cursor inside `inner`.
         let mut y = inner.y;
@@ -178,44 +165,6 @@ impl<'a> Widget for SessionDigestPanel<'a> {
         // resume command always fits. Footer is 2 rows (divider + command).
         let footer_reserve: u16 = 2;
         let body_max_y = max_y.saturating_sub(footer_reserve);
-
-        // 1-row gap.
-        if y < body_max_y {
-            y = y.saturating_add(1);
-        }
-
-        // ---------- Recap block ----------
-        if y < body_max_y {
-            render_row(
-                Line::from(Span::styled(
-                    "Recap",
-                    Style::default().fg(fg).add_modifier(Modifier::BOLD),
-                )),
-                &mut y,
-            );
-        }
-        if y < body_max_y {
-            // Band: gutter `▌` + space + body text. Body is the newest_decision
-            // or a muted-italic placeholder.
-            let (body_text, body_style) = match self.summary.and_then(|s| s.newest_decision.as_deref()) {
-                Some(text) => (
-                    truncate(text, w.saturating_sub(2) as usize),
-                    Style::default().fg(fg),
-                ),
-                None => (
-                    "(no recap yet)".to_string(),
-                    Style::default().fg(muted).add_modifier(Modifier::ITALIC),
-                ),
-            };
-            render_row(
-                Line::from(vec![
-                    Span::styled("▌", Style::default().fg(gutter_color)),
-                    Span::raw(" "),
-                    Span::styled(body_text, body_style),
-                ]),
-                &mut y,
-            );
-        }
 
         // 1-row gap.
         if y < body_max_y {
@@ -363,7 +312,7 @@ impl<'a> Widget for SessionDigestPanel<'a> {
             };
             Paragraph::new(Line::from(Span::styled(
                 "─".repeat(8.min(w as usize)),
-                Style::default().fg(gutter_color),
+                Style::default().fg(divider_color),
             )))
             .render(divider_rect, buf);
 
@@ -517,7 +466,6 @@ fn hex_to_color(hex: &str) -> Option<Color> {
 mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
-    use threadhop_core::observations::ObservationSummary;
 
     fn theme() -> Theme {
         Theme::default_dark()
@@ -546,9 +494,8 @@ mod tests {
         buf_h: u16,
         theme: &'a Theme,
         item: Option<&'a SessionListItem>,
-        summary: Option<&'a ObservationSummary>,
     ) -> Buffer {
-        render_panel_with_digest(buf_w, buf_h, theme, item, summary, None)
+        render_panel_with_digest(buf_w, buf_h, theme, item, None)
     }
 
     fn render_panel_with_digest<'a>(
@@ -556,7 +503,6 @@ mod tests {
         buf_h: u16,
         theme: &'a Theme,
         item: Option<&'a SessionListItem>,
-        summary: Option<&'a ObservationSummary>,
         digest: Option<&'a SessionDigest>,
     ) -> Buffer {
         let mut term = Terminal::new(TestBackend::new(buf_w, buf_h)).unwrap();
@@ -570,7 +516,6 @@ mod tests {
             let panel = SessionDigestPanel {
                 theme,
                 selected_item: item,
-                summary,
                 digest,
             };
             f.render_widget(panel, area);
@@ -594,7 +539,7 @@ mod tests {
     fn panel_renders_title_in_foreground_when_session_selected() {
         let t = theme();
         let item = sample_item();
-        let buf = render_panel_into(36, 40, &t, Some(&item), None);
+        let buf = render_panel_into(36, 40, &t, Some(&item));
         let dump = buffer_to_string(&buf);
         assert!(
             dump.contains("my-cool-session"),
@@ -610,48 +555,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn panel_renders_recap_placeholder_when_no_summary() {
-        let t = theme();
-        let item = sample_item();
-        let buf = render_panel_into(36, 40, &t, Some(&item), None);
-        let dump = buffer_to_string(&buf);
-        assert!(
-            dump.contains("(no recap yet)"),
-            "expected recap placeholder; got:\n{dump}"
-        );
-        assert!(
-            dump.contains("Recap"),
-            "expected Recap section header; got:\n{dump}"
-        );
-    }
 
-    #[test]
-    fn panel_renders_recap_text_when_summary_has_decision() {
-        let t = theme();
-        let item = sample_item();
-        let summary = ObservationSummary {
-            newest_decision: Some("switch to fts5 for snippet search".into()),
-            ..Default::default()
-        };
-        let buf = render_panel_into(50, 40, &t, Some(&item), Some(&summary));
-        let dump = buffer_to_string(&buf);
-        assert!(
-            dump.contains("switch to fts5"),
-            "expected decision text in recap; got:\n{dump}"
-        );
-        // Placeholder must NOT appear when a decision is present.
-        assert!(
-            !dump.contains("(no recap yet)"),
-            "placeholder leaked through with decision present;\n{dump}"
-        );
-    }
 
     #[test]
     fn panel_renders_resume_command_in_footer() {
         let t = theme();
         let item = sample_item();
-        let buf = render_panel_into(36, 40, &t, Some(&item), None);
+        let buf = render_panel_into(36, 40, &t, Some(&item));
         let dump = buffer_to_string(&buf);
         assert!(
             dump.contains("claude -r"),
@@ -667,15 +577,15 @@ mod tests {
     #[test]
     fn panel_renders_empty_state_when_no_session_selected() {
         let t = theme();
-        let buf = render_panel_into(36, 40, &t, None, None);
+        let buf = render_panel_into(36, 40, &t, None);
         let dump = buffer_to_string(&buf);
         assert!(
             dump.contains("Select a session"),
             "expected empty-state copy; got:\n{dump}"
         );
-        // No identity / recap / footer should appear in the empty state.
+        // No identity / section headers / footer in the empty state.
         assert!(
-            !dump.contains("Recap"),
+            !dump.contains("Outputs"),
             "empty state must not render section headers; got:\n{dump}"
         );
         assert!(
@@ -688,12 +598,14 @@ mod tests {
     fn panel_renders_outputs_and_context_stubs() {
         let t = theme();
         let item = sample_item();
-        let buf = render_panel_into(36, 40, &t, Some(&item), None);
+        let buf = render_panel_into(36, 40, &t, Some(&item));
         let dump = buffer_to_string(&buf);
         assert!(dump.contains("Outputs"), "expected Outputs header; {dump}");
         assert!(dump.contains("Context"), "expected Context header; {dump}");
         // The em-dash stub must appear (we don't have real data yet).
         assert!(dump.contains("—"), "expected stub em-dash; {dump}");
+        // ADR-029: the observation-fed Recap band is gone.
+        assert!(!dump.contains("Recap"), "Recap band removed per ADR-029; {dump}");
     }
 
     #[test]
@@ -706,7 +618,7 @@ mod tests {
             pr_repository: Some("me/proj".into()),
             ..Default::default()
         };
-        let buf = render_panel_with_digest(50, 40, &t, Some(&item), None, Some(&digest));
+        let buf = render_panel_with_digest(50, 40, &t, Some(&item), Some(&digest));
         let dump = buffer_to_string(&buf);
         assert!(
             dump.contains("PR #42"),
@@ -733,7 +645,7 @@ mod tests {
             models_used: vec!["claude-opus-4-7".into()],
             ..Default::default()
         };
-        let buf = render_panel_with_digest(50, 40, &t, Some(&item), None, Some(&digest));
+        let buf = render_panel_with_digest(50, 40, &t, Some(&item), Some(&digest));
         let dump = buffer_to_string(&buf);
         // Headline tokens line: `50.0k / 200.0k  ·  25% used`
         assert!(
@@ -755,7 +667,7 @@ mod tests {
         let t = theme();
         let item = sample_item();
         let digest = SessionDigest::default();
-        let buf = render_panel_with_digest(36, 40, &t, Some(&item), None, Some(&digest));
+        let buf = render_panel_with_digest(36, 40, &t, Some(&item), Some(&digest));
         let dump = buffer_to_string(&buf);
         assert!(dump.contains("—"), "expected em-dash; got:\n{dump}");
         // Sanity — neither populated row should appear.
@@ -784,23 +696,6 @@ mod tests {
         assert!(long.chars().count() <= 18, "got {long}");
     }
 
-    #[test]
-    fn panel_truncates_long_decision_to_fit_width() {
-        let t = theme();
-        let item = sample_item();
-        let long = "x".repeat(200);
-        let summary = ObservationSummary {
-            newest_decision: Some(long),
-            ..Default::default()
-        };
-        let buf = render_panel_into(36, 40, &t, Some(&item), Some(&summary));
-        let dump = buffer_to_string(&buf);
-        // Ellipsis should appear — the decision is way wider than 36 cells.
-        assert!(
-            dump.contains("…"),
-            "expected ellipsis on truncated recap; got:\n{dump}"
-        );
-    }
 
     #[test]
     fn panel_does_not_panic_at_tiny_size() {
@@ -808,8 +703,8 @@ mod tests {
         // below the inner-area threshold. Smoke test only.
         let t = theme();
         let item = sample_item();
-        let _ = render_panel_into(4, 3, &t, Some(&item), None);
-        let _ = render_panel_into(1, 1, &t, Some(&item), None);
+        let _ = render_panel_into(4, 3, &t, Some(&item));
+        let _ = render_panel_into(1, 1, &t, Some(&item));
     }
 
 }

@@ -14,7 +14,6 @@
 //!
 //! Rust-only extensions that survive parity:
 //!   * `Ctrl-c` — quit (KeyboardInterrupt muscle memory)
-//!   * `c` (MainScreen) — open conflict viewer (Rust feature ahead of Python)
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -44,9 +43,6 @@ pub enum Scope {
     /// Phase 5: kanban-style status board modal — sessions grouped by status
     /// column, h/l moves between columns, j/k within a column.
     Kanban,
-    /// Phase 5: conflict viewer modal — reflector-emitted cross-session
-    /// decision conflicts, Enter / `r` marks resolved.
-    ConflictViewer,
     /// Phase 0 reserves the selection-mode scope so the footer/help can
     /// advertise the bindings; real handlers land in Phase A.
     Selection,
@@ -115,10 +111,6 @@ pub enum Command {
     // ---- Phase 5 ---------------------------------------------------------
     /// Open the kanban (status board) modal. Python: `Shift+B`.
     OpenKanban,
-    /// Open the conflict viewer modal. Rust-only extension; `c` survives.
-    OpenConflictViewer,
-    /// Mark the focused conflict as resolved.
-    MarkConflictResolved,
     /// Move the kanban column focus left.
     KanbanColumnLeft,
     /// Move the kanban column focus right.
@@ -143,10 +135,6 @@ pub enum Command {
     RenameSession,
     /// Copy the resume command for the focused session (`g`). Stub.
     CopyResumeCommand,
-    /// Observe / copy observation path (`o`). Stub.
-    ObserveSession,
-    /// Resume observation (`Shift+O`). Stub.
-    ResumeObservation,
     /// Archive the focused session (`a`). Stub.
     ArchiveSession,
     /// Toggle archived view (`Shift+A`). Stub.
@@ -373,20 +361,11 @@ const MAIN_SCREEN_BINDINGS: &[CommandBinding] = &[
     },
     // Phase C task 3 (Wave 2, Worker E): `o` toggles the tool-message
     // fold when the message cursor sits on a tool/tool_result row.
-    // ObserveSession was bound to `o` in Phase 0 but is a stub today;
-    // the binding is reclaimed for the fold action until the
-    // observe-wave lands ObserveSession on a dedicated key.
     CommandBinding {
         key: key(KeyCode::Char('o'), KeyModifiers::NONE),
         scope: Scope::MainScreen,
         command: Command::ToggleToolFold,
         label: "fold tools",
-    },
-    CommandBinding {
-        key: key(KeyCode::Char('O'), KeyModifiers::SHIFT),
-        scope: Scope::MainScreen,
-        command: Command::ResumeObservation,
-        label: "resume obs",
     },
     CommandBinding {
         key: key(KeyCode::Char('s'), KeyModifiers::NONE),
@@ -482,13 +461,6 @@ const MAIN_SCREEN_BINDINGS: &[CommandBinding] = &[
         scope: Scope::MainScreen,
         command: Command::FocusList,
         label: "focus list",
-    },
-    // ---- Rust-only conflict viewer (kept; Python has no analog) ----
-    CommandBinding {
-        key: key(KeyCode::Char('c'), KeyModifiers::NONE),
-        scope: Scope::MainScreen,
-        command: Command::OpenConflictViewer,
-        label: "conflicts",
     },
     // ---- Label/rename modal opener (Rust-only; Python merges into `n`).
     //      Shift+L kept as a free key so users who want the modal still have
@@ -814,46 +786,6 @@ const KANBAN_BINDINGS: &[CommandBinding] = &[
     },
 ];
 
-/// Footer hints shown while the conflict viewer modal is open.
-const CONFLICT_VIEWER_BINDINGS: &[CommandBinding] = &[
-    CommandBinding {
-        key: key(KeyCode::Esc, KeyModifiers::NONE),
-        scope: Scope::ConflictViewer,
-        command: Command::Cancel,
-        label: "close",
-    },
-    CommandBinding {
-        key: key(KeyCode::Enter, KeyModifiers::NONE),
-        scope: Scope::ConflictViewer,
-        command: Command::Confirm,
-        label: "jump",
-    },
-    CommandBinding {
-        key: key(KeyCode::Char('j'), KeyModifiers::NONE),
-        scope: Scope::ConflictViewer,
-        command: Command::SelectNextSession,
-        label: "next",
-    },
-    CommandBinding {
-        key: key(KeyCode::Char('k'), KeyModifiers::NONE),
-        scope: Scope::ConflictViewer,
-        command: Command::SelectPrevSession,
-        label: "prev",
-    },
-    CommandBinding {
-        key: key(KeyCode::Char('r'), KeyModifiers::NONE),
-        scope: Scope::ConflictViewer,
-        command: Command::MarkConflictResolved,
-        label: "resolve",
-    },
-    CommandBinding {
-        key: key(KeyCode::Char('t'), KeyModifiers::NONE),
-        scope: Scope::ConflictViewer,
-        command: Command::Cancel,
-        label: "toggle resolved",
-    },
-];
-
 /// Footer hints shown while the help overlay is open. Python parity adds `q`
 /// as a close key (no quit-while-overlay-up surprise).
 const HELP_OVERLAY_BINDINGS: &[CommandBinding] = &[
@@ -962,7 +894,6 @@ pub fn commands_for_scope(scope: Scope) -> &'static [CommandBinding] {
         Scope::ConfirmModal => CONFIRM_MODAL_BINDINGS,
         Scope::LabelPrompt => LABEL_PROMPT_BINDINGS,
         Scope::Kanban => KANBAN_BINDINGS,
-        Scope::ConflictViewer => CONFLICT_VIEWER_BINDINGS,
         Scope::HelpOverlay => HELP_OVERLAY_BINDINGS,
         Scope::Selection => SELECTION_BINDINGS,
         _ => &[],
@@ -1008,9 +939,6 @@ mod tests {
     fn ctrl_c_quits_globally() {
         let e = ev(KeyCode::Char('c'), KeyModifiers::CONTROL);
         // Rust-only extension — Ctrl-c falls back to Global.
-        // NB: Scope::MainScreen has `c` bound to OpenConflictViewer (no
-        // modifier), but the lookup matches both code AND modifiers, so
-        // Ctrl-c still falls through to Global.
         assert_eq!(lookup(Scope::MainScreen, e), Some(Command::Quit));
     }
 
@@ -1245,10 +1173,7 @@ mod tests {
         let cases: &[(KeyEvent, Command)] = &[
             (ev(KeyCode::Char('r'), KeyModifiers::NONE), Command::RefreshSessions),
             (ev(KeyCode::Char('n'), KeyModifiers::NONE), Command::RenameSession),
-            // Wave 2 (Worker E, Phase C task 3): `o` was rebound from
-            // ObserveSession to ToggleToolFold.
             (ev(KeyCode::Char('o'), KeyModifiers::NONE), Command::ToggleToolFold),
-            (ev(KeyCode::Char('O'), KeyModifiers::SHIFT), Command::ResumeObservation),
             (ev(KeyCode::Char('a'), KeyModifiers::NONE), Command::ArchiveSession),
             (ev(KeyCode::Char('A'), KeyModifiers::SHIFT), Command::ToggleArchivedView),
             (ev(KeyCode::Char('['), KeyModifiers::NONE), Command::ShrinkSidebar),
@@ -1394,11 +1319,11 @@ mod tests {
     }
 
     #[test]
-    fn conflict_viewer_c_does_not_overlap_with_open_conflict_viewer() {
-        // Rust-only `c` opens the viewer from MainScreen; inside the viewer,
-        // `c` is unbound (no accidental nested-open).
+    fn plain_c_is_unbound_after_adr_029() {
+        // The conflict viewer (and its `c` opener) were removed with the
+        // observation layer — plain `c` must not resolve to anything.
         assert!(
-            lookup(Scope::ConflictViewer, ev(KeyCode::Char('c'), KeyModifiers::NONE)).is_none()
+            lookup(Scope::MainScreen, ev(KeyCode::Char('c'), KeyModifiers::NONE)).is_none()
         );
     }
 }

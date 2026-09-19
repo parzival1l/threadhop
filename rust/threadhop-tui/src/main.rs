@@ -4,9 +4,14 @@
 //! reserved for the alternate-screen TUI), installs a panic hook that restores
 //! the terminal, enters raw mode + alternate screen, and runs the event loop
 //! until the user quits.
+//!
+//! ADR-029: subcommands (`peek` / `search` / `prepare` / `receive`) route to
+//! CLI mode — plain stdout/stderr, no terminal setup, exit code from the
+//! handler. No subcommand → the TUI, exactly like the Python `./threadhop`.
 
 mod anim;
 mod app;
+mod cli;
 mod clipboard;
 mod event;
 mod keys;
@@ -34,9 +39,15 @@ use crate::app::App;
 #[command(
     name = "threadhop-tui",
     version,
-    about = "ThreadHop — Rust TUI for browsing Claude Code session transcripts"
+    about = "ThreadHop — Rust TUI for browsing Claude Code session transcripts.\n  \
+             No subcommand  → launch the TUI.\n  \
+             Subcommand     → CLI mode (peek, search, prepare, receive)."
 )]
 pub struct Cli {
+    /// ADR-029 borrow-surface verbs. `None` launches the TUI.
+    #[command(subcommand)]
+    pub command: Option<cli::CliCommand>,
+
     /// Filter to a single project (matches the Python --project flag).
     #[arg(long)]
     pub project: Option<String>,
@@ -59,6 +70,13 @@ pub struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // CLI mode: run the subcommand on plain stdout/stderr and exit with its
+    // code — no tracing file, no raw mode, no alternate screen.
+    if let Some(command) = cli.command {
+        std::process::exit(cli::run(command));
+    }
+
     init_tracing()?;
 
     // Panic hook MUST be installed before we touch raw mode, so a panic from

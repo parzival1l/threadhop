@@ -10,14 +10,19 @@
 //!
 //! ## Write surface
 //!
-//! Rust writes to exactly two tables:
+//! Rust writes to exactly three tables:
 //!   - `bookmarks` — INSERT / DELETE via [`toggle_bookmark`], [`upsert_bookmark`],
 //!     [`delete_bookmark`].
 //!   - `sessions` — UPDATE the `status`, `custom_name`, and `last_viewed`
 //!     columns via [`set_session_status`], [`set_custom_name`],
 //!     [`set_last_viewed`].
+//!   - `transfer_state` — the ADR-033 `prepare` summary cache via
+//!     [`upsert_transfer_state`]. [`ensure_transfer_state_table`] issues the
+//!     same idempotent `CREATE TABLE IF NOT EXISTS` DDL as Python's
+//!     migration 011 so the Rust CLI works against a DB the Python side has
+//!     not migrated yet (the migration re-running later is a no-op).
 //!
-//! Everything else (`observations`, `conflict_reviews`, schema migrations) is
+//! Everything else (schema migrations, the messages/FTS index) is
 //! Python-owned. Helpers in this module never touch those tables.
 //!
 //! ## Busy retry
@@ -81,24 +86,15 @@ fn bookmark_kind_to_sql(kind: BookmarkKind) -> &'static str {
     }
 }
 
-/// Bulk sidebar metadata for one session — what the TUI refresh loop needs in
-/// one row. Mirrors Python's `get_session_sidebar_metadata`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SidebarMeta {
-    pub session_id: String,
-    pub status: SessionStatus,
-    pub has_observations: bool,
-}
-
 // --- Task 1.6: connection + schema check + busy retry ----------------------
 
 /// Result of the schema-version handshake.
 ///
 /// `Match` is the only happy path for writes; on `Older` or `Newer` the TUI
 /// degrades to read-only and shows a banner. The variants carry the on-disk
-/// version so the banner can render specifics. The `fts` and `observations`
-/// lanes propagate [`DbError::SchemaMismatch`] through their own error enums
-/// when they use [`open_strict`].
+/// version so the banner can render specifics. The `fts` lane propagates
+/// [`DbError::SchemaMismatch`] through its own error enum when it uses
+/// [`open_strict`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaCheck {
     Match,
@@ -159,9 +155,8 @@ pub fn open_and_check(path: &Path) -> Result<(Connection, SchemaCheck), DbError>
 /// Open the DB and require the schema version match. Returns
 /// [`DbError::SchemaMismatch`] on any drift.
 ///
-/// The `fts` and `observations` lanes can propagate this typed error through
-/// `#[from]` conversions when a hard fail is preferable to the read-only
-/// banner path.
+/// The `fts` lane can propagate this typed error through `#[from]`
+/// conversions when a hard fail is preferable to the read-only banner path.
 pub fn open_strict(path: &Path) -> Result<Connection, DbError> {
     let conn = open(path)?;
     match check_schema(&conn)? {
@@ -238,31 +233,6 @@ pub fn session_by_id(conn: &Connection, session_id: &str) -> Result<Option<Sessi
         .query_row(&sql, params![session_id], map_session)
         .optional()?;
     Ok(row)
-}
-
-/// Bulk sidebar state — `(session_id, status, has_observations)` for every
-/// known session. One query for the TUI refresh loop instead of N lookups.
-pub fn session_sidebar_metadata(conn: &Connection) -> Result<Vec<SidebarMeta>, DbError> {
-    let mut stmt = conn.prepare(
-        "SELECT s.session_id, s.status,
-                CASE WHEN COALESCE(os.entry_count, 0) > 0 THEN 1 ELSE 0 END
-         FROM sessions s
-         LEFT JOIN observation_state os ON os.session_id = s.session_id",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        let status_raw: String = r.get(1)?;
-        let has_obs: i64 = r.get(2)?;
-        Ok(SidebarMeta {
-            session_id: r.get(0)?,
-            status: session_status_from_sql(&status_raw),
-            has_observations: has_obs != 0,
-        })
-    })?;
-    let mut out = Vec::new();
-    for r in rows {
-        out.push(r?);
-    }
-    Ok(out)
 }
 
 const MESSAGE_COLUMNS: &str = "uuid, session_id, role, text, timestamp, cwd, parent_uuid, \
@@ -541,6 +511,96 @@ pub fn set_last_viewed(
     Ok(())
 }
 
+// --- Transfer-state helpers (ADR-033) ---------------------------------------
+
+/// One row of the `transfer_state` table — the per-session `prepare` summary
+/// cache. Mirrors Python's migration 011 shape exactly.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransferState {
+    pub session_id: String,
+    pub source_byte_offset: u64,
+    pub cached_summary: Option<String>,
+    pub updated_at: Option<f64>,
+}
+
+/// Issue the same idempotent DDL as Python's `_migration_011_transfer_state`.
+///
+/// The Rust CLI can run `prepare` against a DB the Python side has not
+/// migrated to schema 11 yet (or against a freshly-created empty DB). The
+/// Python migration uses `CREATE TABLE IF NOT EXISTS`, so creating the table
+/// here never fights the migration — when Python later runs migration 011 it
+/// finds the table already present and moves on.
+pub fn ensure_transfer_state_table(conn: &Connection) -> Result<(), DbError> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS transfer_state (
+            session_id         TEXT PRIMARY KEY,
+            source_byte_offset INTEGER NOT NULL DEFAULT 0,
+            cached_summary     TEXT,
+            updated_at         REAL
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Return the `prepare` summary cache row for a session, or `None`.
+/// Mirrors Python's `db.get_transfer_state`.
+pub fn get_transfer_state(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<TransferState>, DbError> {
+    let row = conn
+        .query_row(
+            "SELECT session_id, source_byte_offset, cached_summary, updated_at
+             FROM transfer_state WHERE session_id = ?",
+            params![session_id],
+            |r| {
+                Ok(TransferState {
+                    session_id: r.get(0)?,
+                    source_byte_offset: r.get::<_, i64>(1)?.max(0) as u64,
+                    cached_summary: r.get(2)?,
+                    updated_at: r.get(3)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Insert or update the `prepare` summary cache for a session.
+///
+/// **Offset definition** (mirrors Python's `db.upsert_transfer_state`):
+/// `source_byte_offset` is the byte offset in the source JSONL one past the
+/// final line (including its trailing newline) of the *last head exchange*
+/// covered by `cached_summary`. Exchanges whose first JSONL line starts at
+/// an offset `>= source_byte_offset` are new head content the next `prepare`
+/// must fold in via a merge call. JSONL files are append-only, so the
+/// boundary only moves forward.
+pub fn upsert_transfer_state(
+    conn: &Connection,
+    session_id: &str,
+    source_byte_offset: u64,
+    cached_summary: &str,
+    updated_at: f64,
+) -> Result<(), DbError> {
+    conn.execute(
+        "INSERT INTO transfer_state (
+            session_id, source_byte_offset, cached_summary, updated_at
+        ) VALUES (?, ?, ?, ?)
+        ON CONFLICT(session_id) DO UPDATE SET
+            source_byte_offset = excluded.source_byte_offset,
+            cached_summary     = excluded.cached_summary,
+            updated_at         = excluded.updated_at",
+        params![
+            session_id,
+            source_byte_offset as i64,
+            cached_summary,
+            updated_at
+        ],
+    )?;
+    Ok(())
+}
+
 /// Trim a free-text input; whitespace-only or empty inputs collapse to `None`.
 fn clean_text(raw: Option<&str>) -> Option<String> {
     raw.and_then(|n| {
@@ -560,11 +620,11 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    /// Build the schema-9 shape needed by the read/write tests. This covers
+    /// Build the schema-11 shape needed by the read/write tests. This covers
     /// just the subset Rust touches — `sessions`, `messages`, `bookmarks`,
-    /// `observation_state`, `settings`. FTS shadow tables and migration
+    /// `transfer_state`, `settings`. FTS shadow tables and migration
     /// bookkeeping aren't needed here; this exercises the helpers above.
-    fn build_schema_9(conn: &Connection) {
+    fn build_schema_11(conn: &Connection) {
         conn.execute_batch(
             "PRAGMA foreign_keys = ON;
              CREATE TABLE settings (
@@ -606,20 +666,13 @@ mod tests {
                  created_at   REAL NOT NULL,
                  FOREIGN KEY (message_uuid) REFERENCES messages(uuid) ON DELETE CASCADE
              );
-             CREATE TABLE observation_state (
-                 session_id              TEXT PRIMARY KEY,
-                 source_path             TEXT NOT NULL,
-                 obs_path                TEXT NOT NULL,
-                 source_byte_offset      INTEGER NOT NULL DEFAULT 0,
-                 entry_count             INTEGER NOT NULL DEFAULT 0,
-                 reflector_entry_offset  INTEGER NOT NULL DEFAULT 0,
-                 observer_pid            INTEGER,
-                 status                  TEXT NOT NULL DEFAULT 'idle',
-                 started_at              REAL,
-                 last_observed_at        REAL,
-                 FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+             CREATE TABLE transfer_state (
+                 session_id         TEXT PRIMARY KEY,
+                 source_byte_offset INTEGER NOT NULL DEFAULT 0,
+                 cached_summary     TEXT,
+                 updated_at         REAL
              );
-             PRAGMA user_version = 9;",
+             PRAGMA user_version = 11;",
         )
         .unwrap();
     }
@@ -711,7 +764,10 @@ mod tests {
         conn.execute_batch("PRAGMA user_version = 1").unwrap();
         drop(conn);
         let err = open_strict(&path).unwrap_err();
-        assert!(matches!(err, DbError::SchemaMismatch { db: 1, expected: 9 }));
+        assert!(matches!(
+            err,
+            DbError::SchemaMismatch { db: 1, expected: EXPECTED_SCHEMA_VERSION }
+        ));
     }
 
     #[test]
@@ -725,7 +781,7 @@ mod tests {
     #[test]
     fn list_sessions_returns_seeded_row() {
         let c = Connection::open_in_memory().unwrap();
-        build_schema_9(&c);
+        build_schema_11(&c);
         seed_session(&c, "s1");
         let rows = list_sessions(&c).unwrap();
         assert_eq!(rows.len(), 1);
@@ -736,7 +792,7 @@ mod tests {
     #[test]
     fn list_sessions_orders_by_modified_at_desc() {
         let c = Connection::open_in_memory().unwrap();
-        build_schema_9(&c);
+        build_schema_11(&c);
         c.execute(
             "INSERT INTO sessions (session_id, session_path, modified_at) \
              VALUES ('old','/o',100.0)",
@@ -757,37 +813,50 @@ mod tests {
     #[test]
     fn session_by_id_returns_some_then_none() {
         let c = Connection::open_in_memory().unwrap();
-        build_schema_9(&c);
+        build_schema_11(&c);
         seed_session(&c, "s1");
         assert!(session_by_id(&c, "s1").unwrap().is_some());
         assert!(session_by_id(&c, "missing").unwrap().is_none());
     }
 
     #[test]
-    fn session_sidebar_metadata_marks_observed_sessions() {
+    fn transfer_state_upsert_and_get_round_trip() {
         let c = Connection::open_in_memory().unwrap();
-        build_schema_9(&c);
-        seed_session(&c, "s1");
-        seed_session(&c, "s2");
-        c.execute(
-            "INSERT INTO observation_state (session_id, source_path, obs_path, entry_count) \
-             VALUES ('s1','/src','/obs', 3)",
-            [],
-        )
-        .unwrap();
-        let mut meta = session_sidebar_metadata(&c).unwrap();
-        meta.sort_by(|a, b| a.session_id.cmp(&b.session_id));
-        assert_eq!(meta.len(), 2);
-        assert_eq!(meta[0].session_id, "s1");
-        assert!(meta[0].has_observations);
-        assert_eq!(meta[1].session_id, "s2");
-        assert!(!meta[1].has_observations);
+        build_schema_11(&c);
+        assert!(get_transfer_state(&c, "s1").unwrap().is_none());
+
+        upsert_transfer_state(&c, "s1", 128, "first summary", 100.0).unwrap();
+        let row = get_transfer_state(&c, "s1").unwrap().unwrap();
+        assert_eq!(row.source_byte_offset, 128);
+        assert_eq!(row.cached_summary.as_deref(), Some("first summary"));
+        assert_eq!(row.updated_at, Some(100.0));
+
+        // Upsert replaces in place — still one row.
+        upsert_transfer_state(&c, "s1", 512, "merged summary", 200.0).unwrap();
+        let row = get_transfer_state(&c, "s1").unwrap().unwrap();
+        assert_eq!(row.source_byte_offset, 512);
+        assert_eq!(row.cached_summary.as_deref(), Some("merged summary"));
+        let count: i64 = c
+            .query_row("SELECT COUNT(*) FROM transfer_state", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn ensure_transfer_state_table_is_idempotent() {
+        let c = Connection::open_in_memory().unwrap();
+        // Fresh DB with no schema at all — the guard must create the table.
+        ensure_transfer_state_table(&c).unwrap();
+        // Second call is a no-op (CREATE TABLE IF NOT EXISTS).
+        ensure_transfer_state_table(&c).unwrap();
+        upsert_transfer_state(&c, "s1", 1, "x", 1.0).unwrap();
+        assert!(get_transfer_state(&c, "s1").unwrap().is_some());
     }
 
     #[test]
     fn messages_for_session_orders_by_rowid() {
         let c = Connection::open_in_memory().unwrap();
-        build_schema_9(&c);
+        build_schema_11(&c);
         seed_session(&c, "s1");
         seed_message(&c, "u1", "s1");
         seed_message(&c, "u2", "s1");
@@ -800,7 +869,7 @@ mod tests {
     #[test]
     fn bookmarks_and_uuids_for_session_scope_correctly() {
         let c = Connection::open_in_memory().unwrap();
-        build_schema_9(&c);
+        build_schema_11(&c);
         seed_session(&c, "s1");
         seed_session(&c, "s2");
         seed_message(&c, "u1", "s1");
@@ -819,7 +888,7 @@ mod tests {
     #[test]
     fn get_setting_returns_json_value() {
         let c = Connection::open_in_memory().unwrap();
-        build_schema_9(&c);
+        build_schema_11(&c);
         c.execute(
             "INSERT INTO settings (key, value) VALUES ('theme', '\"dark\"')",
             [],
@@ -833,7 +902,7 @@ mod tests {
     #[test]
     fn get_setting_tolerates_legacy_raw_string() {
         let c = Connection::open_in_memory().unwrap();
-        build_schema_9(&c);
+        build_schema_11(&c);
         // Legacy: not JSON-encoded.
         c.execute(
             "INSERT INTO settings (key, value) VALUES ('theme', 'dark')",
@@ -849,7 +918,7 @@ mod tests {
     #[test]
     fn toggle_bookmark_creates_then_deletes() {
         let c = Connection::open_in_memory().unwrap();
-        build_schema_9(&c);
+        build_schema_11(&c);
         seed_session(&c, "s1");
         seed_message(&c, "u1", "s1");
 
@@ -872,7 +941,7 @@ mod tests {
     #[test]
     fn upsert_bookmark_creates_and_updates_in_place() {
         let c = Connection::open_in_memory().unwrap();
-        build_schema_9(&c);
+        build_schema_11(&c);
         seed_session(&c, "s1");
         seed_message(&c, "u1", "s1");
 
@@ -897,7 +966,7 @@ mod tests {
     #[test]
     fn upsert_bookmark_trims_and_nulls_blank_notes() {
         let c = Connection::open_in_memory().unwrap();
-        build_schema_9(&c);
+        build_schema_11(&c);
         seed_session(&c, "s1");
         seed_message(&c, "u1", "s1");
 
@@ -913,14 +982,14 @@ mod tests {
     #[test]
     fn delete_bookmark_is_noop_for_missing_id() {
         let c = Connection::open_in_memory().unwrap();
-        build_schema_9(&c);
+        build_schema_11(&c);
         delete_bookmark(&c, 9999).unwrap();
     }
 
     #[test]
     fn set_session_status_rejects_unknown() {
         let c = Connection::open_in_memory().unwrap();
-        build_schema_9(&c);
+        build_schema_11(&c);
         seed_session(&c, "s1");
         let err = set_session_status(&c, "s1", "backlog").unwrap_err();
         // Validation surfaces as DbError::Sqlite(InvalidParameterName(_)) —
@@ -936,7 +1005,7 @@ mod tests {
     #[test]
     fn set_session_status_updates_row() {
         let c = Connection::open_in_memory().unwrap();
-        build_schema_9(&c);
+        build_schema_11(&c);
         seed_session(&c, "s1");
         set_session_status(&c, "s1", "in_progress").unwrap();
         let session = session_by_id(&c, "s1").unwrap().unwrap();
@@ -946,7 +1015,7 @@ mod tests {
     #[test]
     fn set_session_status_typed_round_trips() {
         let c = Connection::open_in_memory().unwrap();
-        build_schema_9(&c);
+        build_schema_11(&c);
         seed_session(&c, "s1");
         set_session_status_typed(&c, "s1", SessionStatus::Done).unwrap();
         let s = session_by_id(&c, "s1").unwrap().unwrap();
@@ -956,7 +1025,7 @@ mod tests {
     #[test]
     fn set_custom_name_clears_on_empty_string() {
         let c = Connection::open_in_memory().unwrap();
-        build_schema_9(&c);
+        build_schema_11(&c);
         seed_session(&c, "s1");
         set_custom_name(&c, "s1", Some("My Session")).unwrap();
         let s = session_by_id(&c, "s1").unwrap().unwrap();
@@ -975,7 +1044,7 @@ mod tests {
     #[test]
     fn set_last_viewed_writes_timestamp() {
         let c = Connection::open_in_memory().unwrap();
-        build_schema_9(&c);
+        build_schema_11(&c);
         seed_session(&c, "s1");
         set_last_viewed(&c, "s1", 1700000000.0).unwrap();
         let s = session_by_id(&c, "s1").unwrap().unwrap();

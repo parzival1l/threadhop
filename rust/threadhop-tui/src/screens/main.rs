@@ -62,10 +62,6 @@ pub fn draw(app: &App, frame: &mut Frame) {
         .split(area);
 
     // Phase 5 Wave 2: digest bar for the currently-selected session.
-    let summary = app
-        .selected_session_id
-        .as_deref()
-        .and_then(|sid| app.digest_summary_cache.get(sid));
     let selected_item = app
         .selected_session_id
         .as_deref()
@@ -83,7 +79,6 @@ pub fn draw(app: &App, frame: &mut Frame) {
         .unwrap_or(false);
     let digest = DigestBarWidget {
         theme: &app.theme,
-        summary,
         session_display_name,
         has_bookmarks,
         context,
@@ -212,8 +207,8 @@ pub fn draw(app: &App, frame: &mut Frame) {
     }
 
     // Phase C (minimal): right-column session digest panel. Reuses the same
-    // `selected_item` and `summary` references already resolved above for the
-    // top digest bar — the App holds the data; both widgets just read.
+    // `selected_item` reference already resolved above for the top digest
+    // bar — the App holds the data; both widgets just read.
     if show_digest_panel {
         let panel_area = content[2];
         // Wave 3 Worker H: pull the populated `SessionDigest` (if any) so
@@ -226,7 +221,6 @@ pub fn draw(app: &App, frame: &mut Frame) {
         let panel = SessionDigestPanel {
             theme: &app.theme,
             selected_item,
-            summary,
             digest,
         };
         frame.render_widget(panel, panel_area);
@@ -293,16 +287,6 @@ pub fn draw(app: &App, frame: &mut Frame) {
         let modal_area =
             crate::screens::kanban::centered_rect(95, 90, frame.area());
         crate::screens::kanban::draw(
-            state,
-            &app.theme,
-            modal_area,
-            frame.buffer_mut(),
-        );
-    }
-    if let Some(state) = app.conflict_viewer.as_ref() {
-        let modal_area =
-            crate::screens::conflict_viewer::centered_rect(85, 75, frame.area());
-        crate::screens::conflict_viewer::draw(
             state,
             &app.theme,
             modal_area,
@@ -451,11 +435,10 @@ mod tests {
     }
 
     #[test]
-    fn digest_bar_first_row_has_visible_content_even_without_observations() {
-        // Regression: when no observation summary exists for a session, the
-        // digest bar row used to collapse to invisible whitespace. Verify
-        // that row 0 (the digest bar) carries the session display name and
-        // a visible status hint without any observation cache.
+    fn digest_bar_first_row_has_visible_content() {
+        // Regression: the digest bar row used to collapse to invisible
+        // whitespace. Verify that row 0 (the digest bar) carries the
+        // session display name and a visible status hint.
         use crate::widgets::session_list::SessionListItem;
         let mut app = App::new();
         app.sidebar = vec![SessionListItem {
@@ -466,8 +449,6 @@ mod tests {
             ..Default::default()
         }];
         app.selected_session_id = Some("sess-x".into());
-        // No digest_summary_cache entry — the empty-state path is what we
-        // expect when the Python observer hasn't run yet.
         let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
         term.draw(|f| draw(&app, f)).unwrap();
         let buf = term.backend().buffer();
