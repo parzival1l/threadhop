@@ -3,8 +3,9 @@
 Browse coding-agent sessions and carry useful context between them.
 
 The working Python application is preserved in [`legacy/`](legacy/README.md).
-The TypeScript successor currently contains project tooling and a small tested
-session-label helper. The transcript parser and CLI are the next learning steps.
+The TypeScript successor currently contains project tooling, a tested
+session-label helper, and minimal validated conversation values. The transcript
+parser and CLI come in later learning steps.
 
 ## Repository map
 
@@ -41,6 +42,11 @@ an optional title is trimmed, with the session ID as the fallback. Local imports
 use `.js` extensions to match Node ESM conventions; TypeScript and Vitest resolve
 them to the corresponding `.ts` source files during development. No build output
 is produced yet.
+
+`src/conversation.ts` defines Effect schemas for a session reference, user and
+assistant messages, and a turn. `tests/conversation.test.ts` contains a small
+sample and accepted/rejected inputs. These are text-facing values for peek;
+they do not yet parse a provider's native transcript format.
 
 `skipLibCheck` skips checking dependency declaration files: Vitest's benchmark
 dependency references a browser type. Our source and tests remain strictly
