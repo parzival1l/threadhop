@@ -4,8 +4,8 @@ Browse coding-agent sessions and carry useful context between them.
 
 The working Python application is preserved in [`legacy/`](legacy/README.md).
 The TypeScript successor currently contains project tooling, a tested
-session-label helper, and minimal validated conversation values. The transcript
-parser and CLI come in later learning steps.
+session-label helper, validated conversation values, and read-only Claude
+transcript parsing. The CLI is the next learning step.
 
 ## Repository map
 
@@ -46,7 +46,9 @@ is produced yet.
 `src/conversation.ts` defines Effect schemas for a session reference, user and
 assistant messages, and a turn. `tests/conversation.test.ts` contains a small
 sample and accepted/rejected inputs. These are text-facing values for peek;
-they do not yet parse a provider's native transcript format.
+native records are handled separately by `src/claude-transcript.ts`. That adapter
+groups main-agent text into turns, excludes tool results and subagents, and
+returns diagnostics for skipped records. `src/turns.ts` selects and renders turns.
 
 `skipLibCheck` skips checking dependency declaration files: Vitest's benchmark
 dependency references a browser type. Our source and tests remain strictly

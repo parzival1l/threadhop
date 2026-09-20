@@ -12,12 +12,13 @@ The repository is transitioning from Python to TypeScript incrementally.
 - One root TypeScript ESM package is configured with strict typechecking,
   Vitest, and stable Effect 3 (including Effect Schema). `src/` holds source and
   `tests/` holds TypeScript tests. Use `npm ci` and `npm run check`.
-- The first helper is `src/session-label.ts`; parsing and the CLI are not
-  implemented yet. Avoid speculative packages and frameworks.
+- The first helper is `src/session-label.ts`. Avoid speculative packages and frameworks.
 - `src/conversation.ts` defines the initial text-facing session/message/turn
-  schemas for peek. Native transcript decoding is a later lesson; do not treat
+  schemas for peek. Do not treat
   these small values as a lossless schema for every provider's data.
 - `src/turns.ts` selects and renders existing turns without filesystem access.
+- `src/claude-transcript.ts` parses main-agent Claude JSONL into turns and
+  diagnostics, with an Effect wrapper for read-only file access. The CLI is next.
 - Keep the existing Python app usable while developing its successor. Root
   launch/install and marketplace discovery paths are compatibility surfaces.
 - CI and publishing are disabled; workflows are parked in `.github/workflows-disabled/`. Do not re-enable them without an explicit request. Python tests live in `legacy/tests/`.

@@ -1,0 +1,10 @@
+{"type":"user","uuid":"u1","sessionId":"demo-session","message":{"role":"user","content":"What is ThreadHop?"}}
+{"type":"assistant","uuid":"a1","sessionId":"demo-session","message":{"id":"m1","role":"assistant","content":[{"type":"text","text":"A session browser."}]}}
+{"type":"user","uuid":"u2","sessionId":"demo-session","message":{"role":"user","content":[{"type":"text","text":"Why is search slow?"}]}}
+{"type":"assistant","uuid":"a2","sessionId":"demo-session","message":{"id":"m2","role":"assistant","content":[{"type":"text","text":"I will check the index."}]}}
+{"type":"assistant","uuid":"a3","sessionId":"demo-session","message":{"id":"m2","role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"Read","input":{"file_path":"index.ts"}}]}}
+{"type":"user","uuid":"t1","sessionId":"demo-session","toolUseResult":{"stdout":"INTERNAL TOOL OUTPUT"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":"INTERNAL TOOL OUTPUT"}]}}
+{"type":"assistant","uuid":"s1","sessionId":"demo-session","isSidechain":true,"agentId":"worker-1","message":{"id":"sm1","role":"assistant","content":[{"type":"text","text":"SUBAGENT OUTPUT"}]}}
+{"type":"assistant","uuid":"a4","sessionId":"demo-session","message":{"id":"m3","role":"assistant","content":[{"type":"text","text":"The index"}]}}
+{"type":"assistant","uuid":"a5","sessionId":"demo-session","message":{"id":"m3","role":"assistant","content":[{"type":"text","text":"is being rebuilt."}]}}
+{"type":"assistant","uuid":"a5","sessionId":"demo-session","message":{"id":"m3","role":"assistant","content":[{"type":"text","text":"is being rebuilt."}]}}
