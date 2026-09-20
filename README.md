@@ -3,23 +3,48 @@
 Browse coding-agent sessions and carry useful context between them.
 
 The working Python application is preserved in [`legacy/`](legacy/README.md).
-The next implementation will start with a small TypeScript command-line tool.
-There is no TypeScript implementation yet.
+The TypeScript successor currently contains project tooling and a small tested
+session-label helper. The transcript parser and CLI are the next learning steps.
 
 ## Repository map
 
 | Path | Purpose |
 | --- | --- |
 | `legacy/` | Python application, tests, Claude plugin, prompts, and historical documentation |
+| `src/` | TypeScript source |
+| `tests/` | TypeScript tests |
 | `docs/research/` | Transcript-format research; observations, not a mandated architecture |
 | `.github/workflows-disabled/` | Parked validation and release workflows; CI and publishing are disabled in this branch |
 | `.claude-plugin/marketplace.json` | Marketplace discovery pointing to `legacy/plugin` |
 | `threadhop` | Compatibility symlink to `legacy/threadhop` |
 | `install.sh` | Existing public installer; continues installing the Python application |
 
-Keep one TypeScript package at the repository root when implementation begins.
-Add source and tests as they become useful; no empty server, UI, or plugin
-packages are needed for the first command.
+## Work on TypeScript
+
+Use Node.js 22.12+ on the 22.x line, 24.x, or 26+ and npm.
+
+```bash
+npm ci                 # Install the exact dependencies in package-lock.json
+npm run typecheck      # Check types without executing code or emitting files
+npm test               # Run the TypeScript tests once
+npm run test:watch     # Re-run tests as you edit
+npm run check          # Typecheck, then run tests
+```
+
+This is one private ESM package. TypeScript checks only `src/`, `tests/`, and
+the Vitest configuration. Vitest executes tests in Node and does not replace
+typechecking. Effect 3 is pinned to the stable release line; Effect Schema is
+included in that dependency. Pure helpers do not need an Effect wrapper.
+
+Start by reading `src/session-label.ts` and `tests/session-label.test.ts`:
+an optional title is trimmed, with the session ID as the fallback. Local imports
+use `.js` extensions to match Node ESM conventions; TypeScript and Vitest resolve
+them to the corresponding `.ts` source files during development. No build output
+is produced yet.
+
+`skipLibCheck` skips checking dependency declaration files: Vitest's benchmark
+dependency references a browser type. Our source and tests remain strictly
+checked without adding browser globals to this Node project.
 
 ## Run the Python application
 
