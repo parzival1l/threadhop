@@ -6,7 +6,7 @@ import re
 import sys
 
 from ...config.update_check import UPDATE_REPO_URL
-from .update import _repo_root
+from .update import _app_root
 
 ROADMAP_ENTRY_RE = re.compile(r"^- #(\d+) — (.+)$")
 
@@ -14,9 +14,9 @@ ROADMAP_ENTRY_RE = re.compile(r"^- #(\d+) — (.+)$")
 def cmd_future(args) -> int:
     """Print the top 5 ROADMAP.md entries (ADR-027)."""
     del args
-    repo = _repo_root()
+    repo = _app_root()
     roadmap = repo / "ROADMAP.md"
-    full_url = f"{UPDATE_REPO_URL}/blob/main/ROADMAP.md"
+    full_url = f"{UPDATE_REPO_URL}/blob/main/legacy/ROADMAP.md"
 
     if not roadmap.exists():
         print(

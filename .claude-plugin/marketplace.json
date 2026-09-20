@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "threadhop",
-      "source": "./plugin",
+      "source": "./legacy/plugin",
       "description": "Persistent, searchable, cross-session memory for Claude Code — browse sessions, peek into other sessions verbatim, and carry context forward with transfer tickets.",
       "version": "0.4.0",
       "author": {

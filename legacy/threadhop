@@ -1,0 +1,27 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# dependencies = [
+#   "textual>=0.89.0",
+#   "watchdog>=4.0.0",
+#   "pydantic>=2.0",
+# ]
+# ///
+"""ThreadHop — cross-session context manager for Claude Code.
+
+This file is the executable shim only. All concerns live under the
+``threadhop_core`` package (see ``threadhop_core/cli/dispatch.py``).
+"""
+
+import sys
+from pathlib import Path
+
+# Make the project root importable so ``threadhop_core`` resolves when
+# the script is invoked directly (uv runs the file path, not as a
+# module under a package root).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from threadhop_core.cli.dispatch import main  # noqa: E402
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

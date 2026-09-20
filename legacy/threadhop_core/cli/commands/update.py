@@ -15,13 +15,14 @@ from ...config.update_check import (
 )
 
 
-def _repo_root() -> Path:
-    """Directory the installed `threadhop` script lives in.
-
-    Two levels up from this file: ``threadhop_core/cli/commands/update.py``
-    → ``threadhop_core/cli`` → ``threadhop_core`` → repo root.
-    """
+def _app_root() -> Path:
+    """Root of the legacy Python application and its bundled documents."""
     return Path(__file__).resolve().parents[3]
+
+
+def _repo_root() -> Path:
+    """Git checkout containing the legacy application."""
+    return _app_root().parent
 
 
 def _read_version_from_script(path: Path) -> str | None:
@@ -156,7 +157,9 @@ def cmd_update(args) -> int:
         print(f"Pinned to {args.to}.")
     else:
         new_version = _read_version_from_script(
-            repo / "threadhop_core" / "__init__.py",
+            (repo / "legacy" / "threadhop_core" / "__init__.py")
+            if (repo / "legacy" / "threadhop_core" / "__init__.py").exists()
+            else (repo / "threadhop_core" / "__init__.py"),
         ) or "unknown"
         print(f"Updated to {new_version}.")
     return 0

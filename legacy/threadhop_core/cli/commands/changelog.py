@@ -10,13 +10,13 @@ from ...config.update_check import (
     UPDATE_RAW_CHANGELOG,
     UPDATE_REPO_URL,
 )
-from .update import _repo_root
+from .update import _app_root
 
 
 def cmd_changelog(args) -> int:
     """Print CHANGELOG.md, paging through ``less -R`` on TTY (ADR-027)."""
     del args  # no flags
-    repo = _repo_root()
+    repo = _app_root()
     local = repo / "CHANGELOG.md"
     content: str | None = None
 
@@ -36,7 +36,7 @@ def cmd_changelog(args) -> int:
         except Exception:
             print(
                 "CHANGELOG not available offline. See "
-                f"{UPDATE_REPO_URL}/blob/main/CHANGELOG.md",
+                f"{UPDATE_REPO_URL}/blob/main/legacy/CHANGELOG.md",
                 file=sys.stderr,
             )
             return 1

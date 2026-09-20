@@ -22,3 +22,18 @@ Thumbs.db
 AGENTS.md
 INSTALL-MACOS.md
 migration.py
+docs/superpowers/
+.docket/
+
+# Generated caches and legacy planning notes
+.pytest_cache/
+legacy/docs/superpowers/
+
+# TypeScript build outputs (when development starts)
+node_modules/
+dist/
+coverage/
+
+# Relocated clone-local notes (not repository content)
+/legacy/local-notes/
+/docs/first-typescript-goal.md

@@ -1,6 +1,6 @@
 {
   "//": "Editor-only config for basedpyright/pyright. Runtime is uv-script (PEP 723 metadata in ./threadhop). The local .venv is created with `uv venv && uv pip install textual watchdog pydantic pytest` purely so the type-checker can resolve third-party imports — it is NOT used to launch the app.",
-  "venvPath": ".",
+  "venvPath": "..",
   "venv": ".venv",
   "pythonVersion": "3.12",
   "pythonPlatform": "Darwin",

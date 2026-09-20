@@ -23,7 +23,7 @@ from .. import __version__
 UPDATE_REPO = "parzival1l/threadhop"
 UPDATE_REPO_URL = f"https://github.com/{UPDATE_REPO}"
 UPDATE_RELEASES_API = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
-UPDATE_RAW_CHANGELOG = f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/CHANGELOG.md"
+UPDATE_RAW_CHANGELOG = f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/legacy/CHANGELOG.md"
 UPDATE_CACHE_DIR = Path.home() / ".cache" / "threadhop"
 UPDATE_CACHE_FILE = UPDATE_CACHE_DIR / "last_check"
 UPDATE_CHECK_INTERVAL_S = 24 * 60 * 60

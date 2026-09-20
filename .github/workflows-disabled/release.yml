@@ -60,18 +60,22 @@ jobs:
           FORCE: ${{ github.event.inputs.force }}
         run: |
           set -euo pipefail
-          # __version__ moved from ./threadhop (script) to threadhop_core/__init__.py
-          # in the package refactor. Read the current value from the new location;
-          # for the previous commit, try the new path first and fall back to the old
-          # path so version detection works across the refactor boundary.
-          NEW=$(grep -oE '^__version__ = "[^"]+"' threadhop_core/__init__.py | head -1 | cut -d'"' -f2)
+          # Read the Python version in legacy/. Check older package/script
+          # locations too so relocating files alone does not trigger a release.
+          NEW=$(grep -oE '^__version__ = "[^"]+"' legacy/threadhop_core/__init__.py | head -1 | cut -d'"' -f2)
           if [ -z "$NEW" ]; then
-            echo "::error::Could not read __version__ from threadhop_core/__init__.py"
+            echo "::error::Could not read __version__ from legacy/threadhop_core/__init__.py"
             exit 1
           fi
-          OLD=$(git show HEAD~1:threadhop_core/__init__.py 2>/dev/null \
+          OLD=$(git show HEAD~1:legacy/threadhop_core/__init__.py 2>/dev/null \
                 | grep -oE '^__version__ = "[^"]+"' | head -1 | cut -d'"' -f2 \
                 || echo "")
+          if [ -z "$OLD" ]; then
+            # Before the legacy move, the package was at repository root.
+            OLD=$(git show HEAD~1:threadhop_core/__init__.py 2>/dev/null \
+                  | grep -oE '^__version__ = "[^"]+"' | head -1 | cut -d'"' -f2 \
+                  || echo "")
+          fi
           if [ -z "$OLD" ]; then
             # Fallback: pre-refactor, __version__ lived in the entrypoint script.
             OLD=$(git show HEAD~1:threadhop 2>/dev/null \
@@ -112,7 +116,7 @@ jobs:
             $0 ~ "^## \\[" v "\\]" { p=1; next }
             p && $0 ~ "^## \\[" { exit }
             p { print }
-          ' CHANGELOG.md)
+          ' legacy/CHANGELOG.md)
           if [ -z "$(echo "$NOTES" | tr -d '[:space:]')" ]; then
             echo "::error::CHANGELOG.md has no '## [${RELEASE_VERSION}]' entry. Add one before bumping __version__."
             exit 1
