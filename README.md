@@ -4,14 +4,14 @@ Persistent, searchable, cross-session memory for Claude Code — a TUI, a CLI, a
 
 ![ThreadHop](assets/demo.png)
 
-Each Claude Code session ships as an isolated JSONL transcript. ThreadHop indexes them into SQLite with FTS5, runs a Haiku-powered sidecar that extracts TODOs and decisions per session, a reflector that surfaces decision conflicts across sibling sessions, and a handoff skill that compresses a session into a brief. The TUI is the main browser; most day-to-day capture happens from inside the Claude Code chat via `!threadhop …` bash passthrough or the `/threadhop:*` plugin commands.
+Each Claude Code session ships as an isolated JSONL transcript. ThreadHop indexes them into SQLite with FTS5 and lets you borrow context across sessions on a spectrum: instant, zero-LLM `peek` and `search` into any other session, and one-LLM-call transfer tickets (`prepare` → `receive`) when you want to continue work in another chat. The TUI is the main browser; most day-to-day use happens from inside the Claude Code chat via `!threadhop …` bash passthrough or the `/threadhop:*` plugin commands.
 
 ### What's in the box
 
 - **TUI** — two-column browser over `~/.claude/projects/**/*.jsonl`, with FTS search, bookmarks, status tags, message-range selection, AI-generated session titles.
-- **CLI** — `threadhop tag / bookmark / todos / decisions / observations / conflicts / observe`, all auto-detecting the current session from the parent process tree so they work inside a live `claude` chat.
-- **Observer + reflector** — background extractors that append structured JSONL per session and cross-compare decisions across sessions in a project (ADR-018 – ADR-020).
-- **Claude Code plugin** (`plugin/`) — `/threadhop:handoff` skill plus `/threadhop:observe`, `/threadhop:tag`, `/threadhop:bookmark` commands under the `/threadhop:` namespace.
+- **CLI** — `threadhop peek / search / prepare / receive / tag / bookmark / copy`, all auto-detecting the current session from the parent process tree so they work inside a live `claude` chat.
+- **Borrow surface** — `peek` and `search` read other sessions verbatim with zero LLM calls; `prepare` builds a frozen transfer ticket with exactly one Haiku call, and `receive` pastes it into any chat.
+- **Claude Code plugin** (`plugin/`) — `/threadhop:peek`, `/threadhop:prepare`, `/threadhop:receive`, `/threadhop:tag`, `/threadhop:bookmark`, `/threadhop:copy` commands under the `/threadhop:` namespace.
 
 ## Install
 
@@ -46,20 +46,14 @@ Verify with `threadhop --version`.
 
 ### Claude Code integration
 
-Once the CLI is installed, add the plugin to get the `/threadhop:*` slash commands and the handoff skill. From inside any `claude` session:
+Once the CLI is installed, add the plugin to get the `/threadhop:*` slash commands. From inside any `claude` session:
 
 ```
 /plugin marketplace add parzival1l/threadhop
 /plugin install threadhop@threadhop
 ```
 
-That registers the four primitives — `/threadhop:handoff`, `/threadhop:tag`, `/threadhop:observe`, `/threadhop:bookmark` — persistently across all future sessions. The plugin is a thin wrapper over the CLI, so the `threadhop` command must already be on your `$PATH` (see above) for the slash commands to do anything.
-
-**Skill-only alternative**: if you *only* want `/threadhop:handoff` and not the three commands, you can install just the skill via [Vercel's `skills` CLI](https://github.com/vercel-labs/skills):
-
-```bash
-npx skills add parzival1l/threadhop
-```
+That registers the six commands — `/threadhop:peek`, `/threadhop:prepare`, `/threadhop:receive`, `/threadhop:tag`, `/threadhop:bookmark`, `/threadhop:copy` — persistently across all future sessions. The plugin is a thin wrapper over the CLI, so the `threadhop` command must already be on your `$PATH` (see above) for the slash commands to do anything.
 
 **Dev / local-testing path**: if you've cloned the repo and want to load the plugin against a working-tree copy for one session, `claude --plugin-dir ~/.local/share/threadhop/plugin` loads it for that invocation only (no persistence).
 
@@ -78,9 +72,9 @@ threadhop future               # top 5 roadmap entries
 
 `threadhop update` refuses to run if the installed checkout has uncommitted changes or is on a branch other than `main`, because `git reset --hard` would silently discard that work. Use `--force` to override once you're sure.
 
-ThreadHop also checks once per 24 hours for a newer release and nudges you on the next CLI invocation (three-line stderr message) or TUI launch (transient toast). The check is suppressed inside Claude Code sessions (`!threadhop …` or `/threadhop:*`), in pipelines (`threadhop observations | jq`), and when `THREADHOP_NO_UPDATE_CHECK=1` is set in your shell environment.
+ThreadHop also checks once per 24 hours for a newer release and nudges you on the next CLI invocation (three-line stderr message) or TUI launch (transient toast). The check is suppressed inside Claude Code sessions (`!threadhop …` or `/threadhop:*`), in pipelines (`threadhop search --json | jq`), and when `THREADHOP_NO_UPDATE_CHECK=1` is set in your shell environment.
 
-The Claude Code plugin has its own update channel — run `/plugin update threadhop` from inside any `claude` session to refresh the skill prompts.
+The Claude Code plugin has its own update channel — run `/plugin update threadhop` from inside any `claude` session to refresh the slash commands.
 
 ## Usage
 
@@ -97,13 +91,16 @@ threadhop --days 7                     # last 7 days only
 All subcommands accept `--project` and `--session`; without them they auto-detect the current session.
 
 ```bash
+threadhop peek <session> [--last N] [--range A:B] [--grep PATTERN]
+                                  # print cleaned verbatim exchanges from another session (zero LLM)
+threadhop search <query> [--project P] [--limit N] [--json]
+                                  # FTS5 keyword search across all indexed sessions (zero LLM)
+threadhop prepare [--session <id>] [--tail N] [--tail-budget CHARS] [--model M]
+                                  # build a frozen transfer ticket (one Haiku call)
+threadhop receive <ticket>        # print a transfer ticket verbatim (zero LLM)
 threadhop tag <status>            # backlog | in_progress | in_review | done | archived
 threadhop bookmark [kind]         # bookmark | research — against the latest indexed message
-threadhop todos                   # open TODOs extracted by the observer
-threadhop decisions               # decisions extracted by the observer
-threadhop observations            # raw observation JSONL, newest first
-threadhop conflicts [--resolved]  # cross-session decision conflicts from the reflector
-threadhop observe [--once|--stop|--stop-all] [--watch-backend auto|poll|fsevents]
+threadhop copy [N|all]            # cleaned transcript to clipboard as markdown
 ```
 
 ## Keybindings
@@ -277,81 +274,74 @@ Prefer slash-style triggers? This hook blocks the prompt before it reaches the m
 
 This gives you two low-friction chat-side buckets now, while keeping the app-side bookmark model ready for later generalized categories.
 
-## Observer Lifecycle
+## Borrowing context from another session
 
-Start the background observer for the current Claude Code session from inside
-the chat:
+ThreadHop's borrow surface is lazy and user-intent-gated: nothing runs in the
+background, and the only LLM call in the whole system happens when you
+explicitly ask for a transfer ticket.
 
-```bash
-!threadhop observe
-```
+### Peek and search (zero LLM)
 
-Or target a specific session from another terminal:
-
-```bash
-threadhop observe --session <id> &
-```
-
-Stop and resume use the persisted `observation_state` row. The observer handles
-`SIGTERM` gracefully: it flushes any pending tail, advances
-`source_byte_offset`, marks the row `stopped`, and exits cleanly. A later
-`threadhop observe` resumes from the recorded byte offset instead of re-reading
-the full transcript.
+`threadhop peek` prints cleaned verbatim messages from another session. The
+unit is the *exchange* — one user turn plus everything until the next user
+turn. Tool results, sidechains, and system-reminders are stripped, and every
+excerpt carries a source label (session name, project, timestamp).
 
 ```bash
-threadhop observe --stop
-threadhop observe --stop --session <id>
-threadhop observe --stop-all
+threadhop peek <session>                    # last 5 exchanges (default)
+threadhop peek <session> --last 10          # last 10 exchanges
+threadhop peek <session> --range 4:8        # exchanges 4 through 8
+threadhop peek <session> --grep "migration" # matching exchanges, in full
 ```
 
-### Optional: hook-driven auto-start
-
-If you want observer auto-start on every prompt for sessions where it is
-enabled, first persist the flag:
+`threadhop search` is FTS5 keyword search across all indexed sessions:
 
 ```bash
-threadhop config set observe.enabled true
+threadhop search "retry backoff" --project myproject --limit 10
+threadhop search "retry backoff" --json     # machine-readable
 ```
 
-Then register a lightweight `UserPromptSubmit` hook that launches
-`threadhop observe` in the background. The command is safe to run repeatedly:
-it auto-detects the current session and exits immediately when an observer is
-already running for that session.
+Both work from inside a live chat too — `!threadhop peek …` is a zero-LLM-turn
+bash passthrough.
 
-1. Drop this script at `~/.claude/hooks/threadhop-observe.sh` and `chmod +x` it:
+### Transfer tickets: prepare → receive (one LLM call)
 
-    ```bash
-    #!/usr/bin/env bash
-    set -euo pipefail
+To continue a session's work in another chat, build a frozen transfer ticket:
 
-    if [[ "$(threadhop config get observe.enabled 2>/dev/null)" == "true" ]]; then
-      threadhop observe >/dev/null 2>&1 &
-    fi
-    ```
+```bash
+!threadhop prepare
+```
 
-2. Register it in `~/.claude/settings.json`:
+`prepare` auto-detects the current session (or takes `--session <id>`), makes
+exactly one `claude -p` (Haiku) call to summarize the conversation head —
+goal, current state, decisions, open items, files touched — and keeps the last
+N exchanges (default 3, `--tail N`) verbatim. The ticket lands in
+`~/.config/threadhop/transfers/tk_<id>.md`:
 
-    ```json
-    {
-      "hooks": {
-        "UserPromptSubmit": [
-          {
-            "hooks": [
-              { "type": "command", "command": "~/.claude/hooks/threadhop-observe.sh" }
-            ]
-          }
-        ]
-      }
-    }
-    ```
+```text
+✓ ticket tk_9f2c4a written (~/.config/threadhop/transfers/tk_9f2c4a.md)
+  head: 42 exchanges summarized (1 Haiku call)
+  tail: 3 exchanges kept verbatim
+
+Paste in the target chat: !threadhop receive tk_9f2c4a
+```
+
+Paste that last line into the target chat — Claude Code, or any tool with a
+shell — and `threadhop receive` prints the ticket verbatim, zero LLM:
+
+```bash
+!threadhop receive tk_9f2c4a
+```
+
+Re-preparing the same session reuses the cached summary and only summarizes
+new messages (byte-offset caching), so repeated transfers stay cheap.
 
 ## Shipped recently
 
 - SQLite + FTS5 backend with assistant-chunk merging (ADR-003).
-- Observer sidecar with poll / fsevents watch backends and byte-offset resume (ADR-018, ADR-019).
-- Reflector cross-session conflict detection, with `conflict_reviews` for resolution state (ADR-020).
-- `/threadhop:handoff` skill plus `/threadhop:observe`, `/threadhop:tag`, `/threadhop:bookmark` plugin commands.
-- Chat-side `!threadhop bookmark` / `tag` / `observe` with parent-process session auto-detect.
+- Borrow surface: `peek` / `search` (zero LLM) and `prepare` / `receive` transfer tickets with summary caching (ADR-029).
+- `/threadhop:peek`, `/threadhop:prepare`, `/threadhop:receive`, `/threadhop:tag`, `/threadhop:bookmark`, `/threadhop:copy` plugin commands.
+- Chat-side `!threadhop bookmark` / `tag` / `peek` with parent-process session auto-detect.
 - Message-range selection (`v`), status cycling, archive toggle, day-scale age display, AI-generated session titles.
 
 ## Roadmap
@@ -367,7 +357,6 @@ See [docs/DESIGN-DECISIONS.md](docs/DESIGN-DECISIONS.md) for the full architectu
 - [Origin & Attribution](docs/ORIGIN.md) — what ThreadHop inherited from [thomasrice/claude-sessions](https://github.com/thomasrice/claude-sessions) and what's new
 - [Design Decisions](docs/DESIGN-DECISIONS.md) — ADRs, schema, phase plan
 - [Skill Packaging](docs/skill-packaging.md) — how the Claude Code plugin is wired
-- [Observational Memory](docs/observational-memory.md) — observer + reflector internals
 - [Performance](docs/PERFORMANCE.md)
 - [UI Improvements](docs/UI-IMPROVEMENTS.md)
 

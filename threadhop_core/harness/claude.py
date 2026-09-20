@@ -1,9 +1,10 @@
 """Claude CLI subprocess adapter.
 
-This is the only place ThreadHop shells out to ``claude -p``. The three
-callers (``observation.observer``, ``observation.reflector``, ``handoff``)
-go through here so that adding alternative harnesses later (codex, gemini)
-is a parallel adapter rather than a hunt-and-replace.
+This is the only place ThreadHop shells out to ``claude -p``. It serves
+the ``prepare`` command (transfer-ticket compression, ADR-029), and any
+future LLM-backed verb goes through here too so that adding alternative
+harnesses later (codex, gemini) is a parallel adapter rather than a
+hunt-and-replace.
 
 For now this is a single concrete adapter — there is no Harness Protocol
 yet because we have only one adapter. The Protocol comes when the second

@@ -4,6 +4,37 @@ All notable changes to ThreadHop are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions
 follow `major.minor.patch`.
 
+## [0.4.0] — 2026-08-27
+
+### Removed
+- Observer and reflector sidecars, including the watch backends and
+  batch-threshold extraction pipeline (ADR-018 – ADR-020, superseded by
+  ADR-029).
+- Per-session observation files (`~/.config/threadhop/observations/`)
+  and the `observation_state` table.
+- CLI subcommands: `observe`, `observations`, `conflicts`, `handoff`,
+  `todos`, `decisions`, `config` (including `observe.enabled`).
+- `/threadhop:observe` plugin command and the `/threadhop:handoff`
+  plugin skill.
+- Prompt templates: `observer.md`, `reflector.md`, `handoff.md`.
+
+### Added
+- CLI: `peek` (cleaned verbatim exchanges from another session, zero
+  LLM), `search` (FTS5 keyword search across all indexed sessions, zero
+  LLM), `prepare` (frozen transfer ticket — one Haiku call summarizes
+  the conversation head, last N exchanges kept verbatim), `receive`
+  (print a ticket verbatim, zero LLM).
+- Transfer tickets stored at `~/.config/threadhop/transfers/tk_<id>.md`.
+- `transfer_state` summary caching — re-preparing a session reuses the
+  cached summary and only summarizes new messages (byte-offset caching).
+- Plugin commands: `/threadhop:peek`, `/threadhop:prepare`,
+  `/threadhop:receive`.
+
+### Rationale
+- Every LLM call is now user-intent-gated — exactly one call, at
+  `prepare`. Nothing runs in the background, and peeking or searching
+  other sessions costs zero model turns.
+
 ## [0.3.2] — 2026-05-07
 
 ### Added

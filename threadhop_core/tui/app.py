@@ -39,7 +39,6 @@ from threadhop_core.config.loader import (
     save_app_config,
 )
 from threadhop_core.config.update_check import _check_for_update
-from threadhop_core.observation.observer_state import _refresh_observer_state
 from threadhop_core.session.detection import (
     CLAUDE_PROJECTS,
     detect_project_from_cwd,
@@ -52,7 +51,6 @@ from .constants import (
     COMMAND_TAG_RE,
     LOCAL_COMMAND_RE,
     MAX_SESSIONS,
-    OBSERVER_SUBPROCESS_SIGNATURES,
     REFRESH_INTERVAL,
     SPINNER_FRAMES,
     SPINNER_INTERVAL,
@@ -72,7 +70,6 @@ from .keybindings import (
     SCOPE_TRANSCRIPT,
 )
 from .screens.bookmark import BookmarkBrowserScreen
-from .screens.confirm import ConfirmScreen
 from .screens.help import HelpScreen
 from .screens.kanban import KanbanScreen
 from .screens.label_prompt import LabelPromptScreen
@@ -80,7 +77,6 @@ from .screens.search import SearchScreen
 from .theme import get_available_themes
 from .utils import (
     app_bindings_from_registry,
-    build_observe_command,
     copy_to_clipboard,
 )
 from .widgets.contextual_footer import ContextualFooter
@@ -441,16 +437,6 @@ class ClaudeSessions(App):
                     except:
                         pass
 
-                    # Skip observer/reflector subprocess sessions. Every
-                    # `claude -p` call spawned by the observation pipeline
-                    # opens a fresh Claude Code session whose first user
-                    # message is the prompt template itself — they are
-                    # extractor traffic, not user-facing conversations.
-                    if first_user_msg and first_user_msg.startswith(
-                        OBSERVER_SUBPROCESS_SIGNATURES
-                    ):
-                        continue
-
                     # Title priority: custom > ai > first message
                     session_title = custom_title or ai_title or first_user_msg
                     if session_cwd:
@@ -536,20 +522,16 @@ class ClaudeSessions(App):
 
         # Stamp each session dict with its persisted sidebar metadata in
         # one bulk read after the upsert so new sessions get the DEFAULT
-        # 'active' status and the ADR-021 observation bit without
-        # per-session queries during the 5-second refresh cycle.
+        # 'active' status without per-session queries during the
+        # 5-second refresh cycle.
         try:
             sidebar_state = db.get_session_sidebar_metadata(self.conn)
             for s in self.sessions:
                 state = sidebar_state.get(s["session_id"], {})
                 s["status"] = state.get("status", "active")
-                s["has_observations"] = bool(
-                    state.get("has_observations", False)
-                )
         except Exception:
             for s in self.sessions:
                 s.setdefault("status", "active")
-                s.setdefault("has_observations", False)
 
         self._apply_stable_ordering()
         self._update_session_list(force_rebuild)
@@ -1021,94 +1003,6 @@ class ClaudeSessions(App):
         if custom_name and not digest.custom_title:
             digest.custom_title = str(custom_name)
         bar.set_digest(digest)
-
-    def _spawn_observer(self, session_id: str) -> bool:
-        try:
-            subprocess.Popen(
-                build_observe_command(session_id),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-            return True
-        except Exception as e:
-            self.notify(f"Failed to start observer: {e}", severity="error")
-            return False
-
-    def _refresh_session_observation(self, session_id: str) -> dict | None:
-        try:
-            return _refresh_observer_state(self.conn, session_id)
-        except Exception:
-            return None
-
-    def _confirm_observer_start(self, session_id: str, prompt: str, success_message: str) -> None:
-        def _after(confirm: bool | None) -> None:
-            if not confirm:
-                return
-            state = self._refresh_session_observation(session_id)
-            if state is not None and state.get("observer_pid") is not None:
-                self.notify("Observer already running")
-                return
-            if self._spawn_observer(session_id):
-                self.notify(success_message)
-
-        self.push_screen(ConfirmScreen(prompt), _after)
-
-    def action_observe_session(self) -> None:
-        if self._input_has_focus():
-            return
-        item = self._highlighted_session_item()
-        if item is None:
-            return
-        session = item.session_data
-        session_id = session.get("session_id", "")
-        state = self._refresh_session_observation(session_id)
-        is_observed = bool(session.get("has_observations"))
-        if state is not None and int(state.get("entry_count") or 0) > 0:
-            is_observed = True
-        if is_observed:
-            obs_path = state.get("obs_path") if state else None
-            if obs_path and copy_to_clipboard(str(obs_path)):
-                self.notify("Observation path copied")
-            elif obs_path:
-                self.notify(str(obs_path), timeout=10)
-            else:
-                self.notify("Observation path unavailable", severity="warning")
-            return
-
-        if state is not None and state.get("observer_pid") is not None:
-            self.notify("Observer already running")
-            return
-        self._confirm_observer_start(
-            session_id,
-            "No observations yet. Start observing? (y/n)",
-            "Observer starting in background",
-        )
-
-    def action_resume_observation(self) -> None:
-        if self._input_has_focus():
-            return
-        item = self._highlighted_session_item()
-        if item is None:
-            return
-        session = item.session_data
-        session_id = session.get("session_id", "")
-        state = self._refresh_session_observation(session_id)
-        entry_count = 0
-        if state is not None:
-            entry_count = int(state.get("entry_count") or 0)
-        if entry_count <= 0:
-            self.notify("No observations to resume", severity="warning")
-            return
-        if state is not None and state.get("observer_pid") is not None:
-            self.notify("Observer already running")
-            return
-        self._confirm_observer_start(
-            session_id,
-            "Resume observation from last offset? (y/n)",
-            "Observation resumed in background",
-        )
 
     def _input_has_focus(self) -> bool:
         if self.query_one("#reply-input", TextArea).has_focus:

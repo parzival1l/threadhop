@@ -57,6 +57,36 @@ def test_prefix_hit_does_not_invoke_fuzzy_fallback(conn, monkeypatch):
     assert [row["uuid"] for row in rows] == ["m1"]
 
 
+def test_prefix_results_are_recency_first(conn):
+    # Recency and relevance disagree: the older message is a tight match
+    # (better bm25), the newer one buries the term in padding (worse bm25).
+    # Recency is primary, so the newer m2 must lead — this would fail under
+    # the old rank-only ordering.
+    _seed_message(
+        conn,
+        session_id="s1",
+        project="atlas",
+        uuid="m1",
+        role="user",
+        text="alpha",
+        timestamp="2026-04-20T10:00:00Z",
+    )
+    _seed_message(
+        conn,
+        session_id="s1",
+        project="atlas",
+        uuid="m2",
+        role="user",
+        text="lots of unrelated padding words before the alpha term shows up",
+        timestamp="2026-04-20T10:00:05Z",
+    )
+
+    rows, used_fallback = search_queries.search_messages(conn, "alpha", limit=10)
+
+    assert used_fallback is False
+    assert [row["uuid"] for row in rows] == ["m2", "m1"]
+
+
 def test_trigram_fallback_matches_inserted_typo(conn):
     _seed_message(
         conn,
@@ -135,7 +165,7 @@ def test_migration_rebuilds_trigram_index_for_existing_messages(tmp_path):
             conn, "connnect", limit=10
         )
 
-        assert db.get_schema_version(conn) == 9
+        assert db.get_schema_version(conn) == db.SCHEMA_VERSION
         assert used_fallback is True
         assert [row["uuid"] for row in rows] == ["m1"]
     finally:

@@ -1,6 +1,9 @@
 # ThreadHop — Design Decisions & Implementation Plan
 
 Extracted from design discussion on 2026-04-14.
+Revised 2026-08-27: observer/reflector architecture dropped (ADR-029);
+replaced by the borrow spectrum — peek / search / prepare / receive
+(ADR-030–ADR-033).
 Status: **Design complete, implementation not started.**
 
 ---
@@ -10,7 +13,7 @@ Status: **Design complete, implementation not started.**
 - [Decisions (ADRs)](#decisions-adrs)
 - [Implementation Plan](#implementation-plan)
 - [Schema](#schema)
-- [Skill Plugin Architecture](#skill-plugin-architecture)
+- [Plugin Architecture](#plugin-architecture)
 - [TODO](#todo)
 - [Open Questions](#open-questions)
 
@@ -234,57 +237,9 @@ Two transport mechanisms, both instantaneous (no LLM).
 
 ### ADR-010: Observer-first architecture
 
-**Context:** Initial design was TUI-first — observations only happened when the
-TUI was running. But the real value is in the observations themselves, not the
-TUI. Users want to query observations from the CLI without launching the TUI.
-
-**Decision:** The observer is the core. The TUI and CLI are both consumers.
-
-```
-Chats happen → observer processes them → observations.jsonl accumulates
-                                              ↓
-                             ThreadHop TUI reads them (browsing)
-                             threadhop todos (CLI query)
-                             grep/jq reads them (raw)
-```
-
-**Observer uses Haiku via `claude -p`** (amended 2026-04-17, see ADR-018):
-- Invoked as `claude -p --model haiku --permission-mode acceptEdits`
-- NOT the Anthropic API — uses the same Claude subscription, same binary
-- ~200ms response time — fast and cheap under one subscription
-- Processes conversation chunks and outputs typed JSONL observations
-- Types: `todo | decision | done | adr | observation | conflict`
-- Prompt: extract only explicitly discussed items, do not infer
-- Reusable prompt lives at `~/.config/threadhop/prompts/observer.md`
-
-**Observations stored as per-session JSONL** (amended 2026-04-17, see ADR-019)
-at `~/.config/threadhop/observations/<session_id>.jsonl`:
-```jsonl
-{"type":"decision","text":"REST over gRPC","context":"Client SDK constraints","ts":"2026-04-14T10:30:00Z"}
-{"type":"todo","text":"Implement /workflows endpoint","context":"","ts":"2026-04-14T11:15:00Z"}
-```
-
-One file per session — the session ID is in the filename, not duplicated in
-every line. Project is looked up from the `sessions` table. Byte offsets are
-tracked in the `observation_state` table, not in observation entries. Each
-line stays minimal: type + text + context + timestamp.
-
-JSONL format means observations are queryable without any app — `grep`, `jq`,
-or the ThreadHop CLI all work. Per-session scoping means single-session
-queries read one file, not grep through a global log.
-
-**Observer triggers on CLI query or TUI launch** — not a daemon, not a hook.
-When you run `threadhop todos`, it:
-1. Checks for unprocessed messages (byte offset tracking)
-2. Runs Haiku on new batches
-3. Appends observations
-4. Filters and displays
-
-**Rationale:**
-- The value is in the data, not the UI
-- JSONL is universally queryable — no vendor lock-in to our app
-- Haiku is fast/cheap enough to run on-demand without perceptible delay
-- No daemon or background process to manage
+**Status:** Superseded by ADR-029 (2026-08-27). Established the observer
+(Haiku via `claude -p`) as the system core, with TUI and CLI as consumers
+of typed observation JSONL. Body removed — see git history.
 
 ---
 
@@ -324,6 +279,14 @@ current terminal. Same detection logic the TUI already uses.
 ---
 
 ### ADR-012: Two skills — context, handoff (tagging uses bash passthrough, not a skill)
+
+**Amended 2026-08-27 (ADR-029, ADR-031, ADR-032):** both skills are gone.
+`/threadhop:handoff` is superseded by `threadhop prepare` / `threadhop
+receive` (one LLM call, at prepare — ADR-032). `/threadhop:context`
+survives as the `/threadhop:copy` command. The plugin surface is now
+commands-only, zero skills (see [Plugin Architecture](#plugin-architecture)).
+The principle below stands: never spend an LLM turn on a one-shot write —
+the `!` passthrough remains the tagging path.
 
 **Context:** Need to interact with ThreadHop from within a Claude Code session
 without switching to the TUI or a terminal. Earlier design had three skills
@@ -421,308 +384,17 @@ drag-to-resize.
 
 ### ADR-015: Background observer-reflector as sidecar process
 
-**Context:** ADR-010 established the observer-first architecture with on-demand
-triggering (CLI query or TUI launch). But during active Claude Code sessions,
-observations only happen after the fact — never while you're working. We want
-the observer running continuously in the background, extracting observations
-in real-time, with a reflector identifying contradictory decisions across
-sessions. This should be a flag you enable — like Claude Code's remote control
-mode — and then forget about while you continue working.
-
-**Attribution:** The Observer/Reflector architecture is inspired by
-[Mastra's Observational Memory](https://mastra.ai/docs/memory/observational-memory)
-(`@mastra/memory@1.1.0`) — a three-tier system where Observer and Reflector
-agents run alongside the primary agent, compressing context and maintaining
-long-term memory. Credit to the Mastra team for the foundational pattern.
-See `docs/observational-memory.md` for the full reference.
-
-**The inherent problem with Mastra's approach:** Mastra's Observer and Reflector
-are *inline agents* — they run within the same process, share memory with the
-primary agent, and can directly modify its context window (removing old messages,
-injecting compressed observations, managing token budgets). In Claude Code, we
-have no access to the agent's context window. Claude Code is a black box that
-writes JSONL transcripts to disk. We can *read* those transcripts but cannot
-*modify* the running agent's context. This makes inline observation impossible.
-
-This constraint means ThreadHop's observer-reflector serves a fundamentally
-different purpose than Mastra's:
-
-| | Mastra OM | ThreadHop Observer-Reflector |
-|---|---|---|
-| Architecture | Inline (same process) | Sidecar (separate process) |
-| Access | Reads + writes agent context | Read-only transcript watcher |
-| Observer goal | Context compression | Knowledge extraction |
-| Reflector goal | Condense observations | Detect contradictory decisions |
-| Lifecycle | Coupled to agent | Independent of agent |
-| Value for | The agent (stays effective) | The human (understands what happened) |
-
-Mastra optimizes the agent's *ability to continue working* (context management).
-ThreadHop optimizes the human's *ability to understand what happened* across
-sessions (knowledge extraction + contradiction detection). Complementary goals,
-but architecturally distinct — which is why the inline approach was taken out
-of the design.
-
-**Decision:** Observer and Reflector run as background sidecar processes, enabled
-via a flag. The Claude Code terminal does NOT pause.
-
-**Architecture:**
-
-```
-Claude Code session (primary agent)
-    ↓ writes JSONL
-~/.claude/projects/.../<session>.jsonl
-    ↑ watches (fsevents / polling)
-Observer process (claude -p --model haiku --permission-mode acceptEdits)
-    ↓ appends typed observations
-~/.config/threadhop/observations/<session_id>.jsonl    ← per-session file (ADR-019)
-    ↑ reads periodically (every 5-6 new entries)
-Reflector process (claude -p --model haiku, companion to observer)
-    ↓ appends type:"conflict" entries to SAME file     ← unified output (ADR-020)
-~/.config/threadhop/observations/<session_id>.jsonl
-```
-
-**Enabling from Claude Code — per-session opt-in (primary, see ADR-016):**
-
-```
-/threadhop:observe
-→ Spawns observer for THIS session only. Retroactive catch-up + watch mode.
-```
-
-**Alternative entry points (power users):**
-
-```bash
-# CLI: observe a specific session from another terminal
-threadhop observe --session <id> &
-
-# Auto-observe all sessions (NOT default, opt-in via config-backed hook)
-threadhop config set observe.enabled true
-```
-
-The primary model is per-session opt-in via the skill. Most conversations
-don't warrant observation. The user chooses which ones are valuable.
-See ADR-016 for the full trigger and injection design.
-
-**Observer behaviour (background mode):**
-
-1. Targets a specific session's JSONL (not all sessions)
-2. Retroactive catch-up: reads from byte 0, processes all existing messages
-3. Sets byte offset, switches to watch mode (fsevents on macOS, polling fallback)
-4. When new messages accumulate (configurable batch size, default ~10 messages):
-   - Reads new bytes from JSONL (byte offset tracking, same as ADR-010)
-   - Sends conversation chunk to Haiku
-   - Prompt: extract only explicitly discussed items across these five types:
-     `todo | decision | done | adr | observation`
-   - Appends typed JSONL observations to `observations.jsonl`
-5. Runs until the Claude Code session exits or manually stopped
-
-**Reflector behaviour — conflict detection (amended 2026-04-17, see ADR-020):**
-
-The reflector's purpose is NOT condensation (Mastra's approach). It is
-specifically to **detect contradictory decisions** across sessions.
-
-Example conflict:
-```jsonl
-{"type":"decision","text":"REST over gRPC for client API","project":"atlas","session":"abc","ts":"..."}
-{"type":"decision","text":"gRPC for all service-to-service comms","project":"atlas","session":"def","ts":"..."}
-→ Reflector appends: {"type":"conflict","text":"REST vs gRPC scope overlap","refs":["abc","def"],...}
-```
-
-The Reflector:
-1. Runs as a companion to the observer, NOT independently triggered
-2. Accumulates like the observer — processes every 5-6 new messages, not per-decision
-3. Groups decisions by project and semantic topic
-4. Uses Haiku to identify contradictions between decisions
-5. **Appends conflict entries to the SAME per-session observation JSONL** (ADR-020) —
-   no separate `conflicts.jsonl`. Conflicts are `type: "conflict"` entries alongside
-   decisions, TODOs, etc. Forward-only, append-only — same constraints as observer.
-6. Surfaces conflicts via TUI notification or CLI query (`threadhop conflicts`)
-
-**Why NOT a daemon:**
-
-The observer is a background *process*, not a system daemon. It lives for the
-duration of a Claude Code session and exits when the session ends. No launchd
-plist, no systemd service, no process manager. Start it with `&` or a hook,
-kill it when done.
-
-**Rationale:**
-- Background process means zero friction — enable a flag and forget
-- File-watching is the only interface available (Claude Code is a black box)
-- Conflict detection is unique to ThreadHop — Mastra doesn't attempt this
-- Sidecar architecture means the observer works with any AI coding tool
-- On-demand mode (ADR-010) still works — background mode is additive
-- **Supersedes Q3** (was resolved as "no background process") — background
-  mode is now opt-in alongside the original on-demand trigger
+**Status:** Superseded by ADR-029 (2026-08-27). Background observer +
+reflector sidecar processes watching session JSONL in real time
+(Mastra-inspired). Body removed — see git history.
 
 ---
 
 ### ADR-016: Per-session opt-in trigger and pull-based context injection
 
-**Context:** ADR-015 designed the observer-reflector as a background sidecar.
-But it assumed a global flag (auto-start hook, permanent config). In practice,
-most conversations don't warrant observation — routine debugging, quick fixes,
-file edits. The user needs to *choose* which conversations are valuable enough
-to observe. And once observations exist, they need a way to pull them back
-into the conversation.
-
-**Decision:** Observation is per-session opt-in, triggered by a skill
-(`/threadhop:observe`). Context injection is pull-based, triggered by a
-second skill (`/threadhop:insights`). Neither requires the TUI.
-
-**Why per-session, not global:**
-- Most Claude Code sessions are short or routine — observing them wastes
-  Haiku calls and pollutes `observations.jsonl` with noise
-- The user knows which conversations matter — architectural discussions,
-  design decisions, complex debugging sessions
-- Per-session opt-in means zero cost for throwaway sessions
-- A global auto-observe flag remains available as a power-user option
-  (`threadhop config set observe.enabled true`) but is NOT the default
-
-**Trigger point 1 — beginning of conversation:**
-
-The user knows from the start this will be important:
-
-```
-User: /threadhop:observe
-
-1. Skill detects current session ID via ps/lsof
-2. JSONL is nearly empty (just started) — minimal retroactive work
-3. Observer starts watching in background
-4. Confirms: "Observing this session. Watching for new messages."
-5. User continues working normally
-```
-
-**Trigger point 2 — mid-conversation:**
-
-The user realizes mid-conversation that this discussion is worth capturing:
-
-```
-User: /threadhop:observe
-
-1. Skill detects current session ID
-2. Observer reads ENTIRE JSONL from byte 0 (retroactive catch-up)
-3. Processes all existing messages through Haiku — extracts observations
-4. Sets byte offset to current position
-5. Switches to watch mode for new messages
-6. Confirms: "Observing this session. 47 messages processed retroactively
-   — found 5 decisions, 3 TODOs, 1 ADR. Watching for new messages."
-7. User continues working — observer runs silently in background
-```
-
-The retroactive catch-up is identical to on-demand mode (ADR-010) — same
-incremental processing logic, same byte offset tracking. The only difference
-is that after catch-up, the observer stays resident instead of exiting.
-
-**Pull-based context injection — same session:**
-
-Claude Code is a black box — we can read its transcripts but cannot push
-into its context window. So injection is always **pull-based**: the user
-invokes a skill that reads from `observations.jsonl` / `conflicts.jsonl`
-and formats the findings into the conversation.
-
-```
-User: /threadhop:insights
-
-1. Skill reads observations.jsonl filtered by current session
-2. Reads conflicts.jsonl filtered by current project
-3. Formats and presents:
-
-   ┌─ ThreadHop Observations — this session ───────────────┐
-   │ DECISIONS:                                             │
-   │  • REST for client API (rationale: SDK constraints)    │
-   │  • Token bucket for rate limiting                      │
-   │ TODOs:                                                 │
-   │  • Implement /workflows endpoint                       │
-   │  • Write integration tests for auth flow               │
-   │ ADRs:                                                  │
-   │  • ADR-003: Chunk merging for assistant messages        │
-   │ CONFLICTS:                                             │
-   │  ⚠ Session "infra-design" decided "gRPC for all        │
-   │    services" — contradicts "REST for client API" above  │
-   └────────────────────────────────────────────────────────┘
-
-4. The model now has this context and can work with it
-```
-
-This is the same pattern as `/threadhop:context` (read data, format, inject)
-but reads from the observer's output instead of the clipboard.
-
-**Pull-based context injection — new session (handoff, amended 2026-04-17):**
-
-The handoff skill always uses the observer as its underlying function.
-There is no separate "compress from raw JSONL" path. See ADR-018 for
-the observer-as-core-function principle.
-
-```
-User (new session): /threadhop:handoff abc123
-
-If observations exist for abc123:
-  1. Read observations/<session_id>.jsonl
-  2. Observations already typed, structured, compressed
-  3. Format into handoff brief (may use Haiku for final polish)
-  4. Brief includes: decisions with rationale, open TODOs,
-     unresolved conflicts, current state
-
-If NO observations exist for abc123:
-  1. Run the observer on the full session (from byte 0)
-  2. Observer processes entire JSONL, writes observations/<session_id>.jsonl
-  3. Read the freshly-written observations
-  4. Format into handoff brief
-  → Same result as if the session had been observed all along
-```
-
-The observer is the core function — handoff is an entry point that
-runs the observer first (if needed), then formats. No separate
-compression path exists. This guarantees identical results whether
-a session was observed incrementally or in one shot at handoff time.
-
-**The complete feedback loop:**
-
-```
-Session A (architectural discussion):
-  1. Working on feature...
-  2. User realizes this is important
-  3. /threadhop:observe → retroactive catch-up + watch mode
-  4. Continue working... observer silently extracts observations
-  5. /threadhop:insights → "Here's what I've captured: 5 decisions, 3 TODOs"
-  6. User reviews, continues. Observer captures more.
-  7. Session gets long, user wants to continue elsewhere
-
-Session B (continuation):
-  1. /threadhop:handoff A → runs observer if needed, formats from observations
-  2. /threadhop:insights → includes conflict entries from the same observation file
-  3. User resolves conflict in this conversation
-  4. /threadhop:observe → now observing Session B, captures the resolution
-  5. Resolution appears in observations/<session_B_id>.jsonl as a new decision
-```
-
-The loop closes: **observe → extract → surface → resolve → observe the
-resolution**. Each session can opt in independently. Observations accumulate
-across sessions. Conflicts are detected cross-session and surfaced on demand.
-
-**Updated in-session surface — four skills + one bash passthrough for tagging:**
-
-| Surface | What it does | LLM? | New? |
-|---|---|---|---|
-| `!threadhop tag` (bash passthrough) | Tag session status | No | Existing (ADR-012, ADR-013) — replaces former `/threadhop:tag` skill |
-| `/threadhop:context` | Inject clipboard content | No | Existing (ADR-012) |
-| `/threadhop:handoff` | Generate handoff brief | Yes | Enhanced (ADR-016) |
-| `/threadhop:observe` | Start background observer for this session | No | New (ADR-016) |
-| `/threadhop:insights` | Pull observations + conflicts into conversation | No | New (ADR-016) |
-
-The bash-passthrough tag costs no LLM turn. The observe skill itself is
-instant (spawns a process). The background observer uses Haiku. The
-insights skill is instant (reads files, formats).
-
-**Rationale:**
-- Per-session opt-in respects the user's attention — only important
-  conversations get the Haiku cost
-- Mid-conversation trigger with retroactive catch-up means you never miss
-  context, even if you decide to observe 30 minutes into a discussion
-- Pull-based injection is the only model that works with Claude Code's
-  black-box architecture
-- Enhanced handoff with observations is strictly better — faster (less
-  input to process) and higher quality (structured vs raw)
-- Four skills + a bash passthrough is still manageable — each does exactly one thing
+**Status:** Superseded by ADR-029 (2026-08-27). Per-session opt-in
+observation (`/threadhop:observe`) and pull-based injection
+(`/threadhop:insights`). Body removed — see git history.
 
 ---
 
@@ -784,511 +456,41 @@ pattern as search, and back it with a shared command metadata registry.
 
 ### ADR-018: Observer as core function — `claude -p` invocation, not API
 
-**Context:** ADR-010 and ADR-015 described the observer using "Haiku" without
-specifying the invocation mechanism. There was ambiguity about whether this
-meant an Anthropic API call (requiring an API key and separate billing) or
-something else. The intent was always to use the same Claude subscription.
-
-**Decision:** The observer invokes `claude -p --model haiku --permission-mode
-acceptEdits` — headless Claude Code, not the Anthropic API.
-
-**Invocation:**
-
-```bash
-claude -p "$(cat ~/.config/threadhop/prompts/observer.md)
-
-<session_chunk>
-$(tail -c +$BYTE_OFFSET <source_jsonl_path>)
-</session_chunk>
-
-Append observations to: $OBS_FILE_PATH" \
-  --model haiku \
-  --permission-mode acceptEdits
-```
-
-**The observer prompt** lives at `~/.config/threadhop/prompts/observer.md`
-(or bundled with the app). It is a reusable, static prompt that constrains:
-
-1. **Append-only**: You may only append to the observation file. Never delete
-   or modify existing lines.
-2. **One JSON line per observation**: If you identify 3 decisions, write 3
-   separate JSON lines. Each line is a complete, self-contained JSON object.
-3. **No permission to delete**: The `acceptEdits` mode allows file writes
-   but the prompt explicitly forbids deletion or modification of existing
-   content.
-4. **Typed extraction only**: Extract items that were explicitly discussed.
-   Do not infer, speculate, or synthesize. Types:
-   `todo | decision | done | adr | observation | conflict`
-
-**Observation JSONL line format (minimal — metadata lives elsewhere):**
-
-```jsonl
-{"type":"decision","text":"REST over gRPC","context":"Client SDK constraints","ts":"2026-04-14T10:30:00Z"}
-{"type":"todo","text":"Implement /workflows endpoint","context":"","ts":"2026-04-14T11:15:00Z"}
-```
-
-Each line has only four fields: `type`, `text`, `context`, `ts`. No session ID
-(encoded in filename: `observations/<session_id>.jsonl`), no project (looked
-up from `sessions` table), no byte offset (tracked in `observation_state`
-table). This keeps every line minimal and avoids duplicating metadata that
-the caller already knows.
-
-**Why `claude -p` and not the Anthropic API:**
-- No API key management — uses the same Claude subscription
-- No separate billing — all under one account
-- Uses the same `claude` binary already installed
-- `--permission-mode acceptEdits` provides just enough filesystem access
-  to append to the observation file, nothing more
-- The observer process is just another `claude -p` invocation with a
-  crafted prompt — same as how the user uses Claude Code
-
-**The observer is the core function:**
-
-Every feature that needs observations uses the same observer logic:
-
-| Entry point | Calls observer? | Then what? |
-|---|---|---|
-| `threadhop observe --session X` (CLI) | Yes, in watch mode | Keeps running, appends as messages arrive |
-| `/threadhop:observe` (skill) | Yes, spawns background | Same as CLI but auto-detects session |
-| `/threadhop:handoff X` (skill) | Yes, if no observations exist | Runs observer on full session, then formats |
-| `threadhop todos` (CLI query) | Yes, on-demand for unprocessed | Then filters and displays |
-| TUI re-observe trigger | Yes, resumes from last offset | Same observer, picks up where it left off |
-
-All entry points produce identical observations. A session observed
-incrementally over 2 hours produces the same JSONL as one observed
-in a single shot at handoff time. The observer function is deterministic
-given the same input — entry point doesn't affect output.
-
-**Rationale:**
-- Single function, multiple entry points — no code duplication
-- Reusable prompt file means the extraction logic is testable and
-  versionable independently of the app code
-- `acceptEdits` is the minimum permission — can't read arbitrary files,
-  can't execute commands, can only write to the specified output path
-- Headless mode means the observer process is invisible to the user
+**Status:** Superseded by ADR-029 (2026-08-27). Observer as the single
+core function behind all entry points, invoked as `claude -p --model
+haiku --permission-mode acceptEdits`. Body removed — see git history.
 
 ---
 
 ### ADR-019: Per-session observation files with SQLite state tracking
 
-**Context:** ADR-010 stored all observations in a single global
-`observations.jsonl`. With per-session opt-in (ADR-016) and the observer
-as a core function (ADR-018), observations need to be scoped to individual
-sessions. The observer also needs state persistence — byte offsets, PID
-tracking, observation counts — to support stop/resume, TUI indicators,
-and handoff lookups.
-
-**Decision:** One observation file per session, state tracked in SQLite.
-
-**File layout:**
-
-```
-~/.config/threadhop/observations/
-  abc123.jsonl          ← observations for session abc123
-  def456.jsonl          ← observations for session def456
-```
-
-Per-session files make:
-- Session-scoped queries instant (read one file, not grep through global)
-- The "has observations" indicator trivial (file exists + entry count > 0)
-- Handoff a single file read
-- Cleanup straightforward (delete when session archived)
-
-**SQLite state table (`observation_state`, updated with reflector offset per ADR-022):**
-
-```sql
-CREATE TABLE observation_state (
-    session_id              TEXT PRIMARY KEY,
-    source_path             TEXT NOT NULL,       -- path to source session JSONL
-    obs_path                TEXT NOT NULL,       -- path to observations JSONL
-    source_byte_offset      INTEGER NOT NULL DEFAULT 0,  -- where observer last read
-    entry_count             INTEGER NOT NULL DEFAULT 0,   -- total observations written
-    reflector_entry_offset  INTEGER NOT NULL DEFAULT 0,   -- last entry reflector processed
-    observer_pid            INTEGER,             -- PID if running, NULL otherwise
-    status                  TEXT NOT NULL DEFAULT 'idle',
-        -- idle | running | stopped
-    started_at              REAL,                -- when observation first started
-    last_observed_at        REAL,                -- when last observation appended
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
-);
-```
-
-**State lifecycle:**
-
-```
-idle → running (observer starts, PID recorded)
-  ↓
-running → stopped (observer exits or user stops it)
-  ↓
-stopped → running (user re-observes, resumes from source_byte_offset)
-```
-
-**Re-observation from any entry point:**
-
-When the user triggers observation on a session that was previously
-observed (and stopped), the observer checks `source_byte_offset`:
-- If the source JSONL has grown since last observation → process only
-  new bytes (from offset to EOF)
-- If no new bytes → "Already up to date. N observations on file."
-- Then switches to watch mode (if background) or exits (if on-demand)
-
-This is the same incremental logic regardless of entry point. The state
-table is the single source of truth for "where did we leave off."
-
-**PID tracking for lifecycle management:**
-
-The `observer_pid` column enables:
-- TUI detection of "is this session currently being observed?"
-- `threadhop observe --stop` sends SIGTERM to the recorded PID
-- Stale PID detection: if the PID is recorded but the process is dead
-  (checked via `kill -0 $PID`), status is corrected to `stopped`
-- `threadhop observe --stop-all` queries all rows with non-null PIDs
-
-**Stop mechanisms:**
-
-```bash
-threadhop observe --stop                    # stops current session's observer
-threadhop observe --stop --session abc123   # stops specific observer
-threadhop observe --stop-all                # stops all running observers
-```
-
-All use SIGTERM to the recorded PID. Observer handles SIGTERM gracefully:
-flushes any pending observations, updates `source_byte_offset` in SQLite,
-sets `status = 'stopped'`, exits cleanly.
-
-**Rationale:**
-- Per-session files eliminate grep/filter overhead for single-session queries
-- SQLite state tracking enables stop/resume, indicator queries, stale
-  PID detection — all the lifecycle management the TUI and CLI need
-- `entry_count` is maintained alongside byte offset so the TUI indicator
-  can check "has observations" without reading the file
-- The state table bridges all entry points — CLI, skill, TUI all read
-  and write the same state
+**Status:** Superseded by ADR-029 (2026-08-27). Per-session observation
+files plus the `observation_state` SQLite table (byte offsets, PID
+lifecycle, stop/resume). Body removed — see git history.
 
 ---
 
 ### ADR-020: Unified observation JSONL — observer and reflector share one file
 
-**Context:** ADR-015 originally specified separate files: `observations.jsonl`
-for the observer and `conflicts.jsonl` for the reflector. With per-session
-files (ADR-019), a separate conflicts file per session adds storage overhead
-and query complexity. The reflector's output (conflict entries) is semantically
-an observation — it's an insight extracted from the conversation, just at a
-higher level of abstraction.
-
-**Decision:** Observer and reflector both append to the same per-session
-observation JSONL. No separate `conflicts.jsonl`. Conflicts are entries
-with `type: "conflict"` alongside all other observation types.
-
-**Unified entry types:**
-
-```jsonl
-{"type":"decision","text":"REST over gRPC","context":"SDK constraints","ts":"..."}
-{"type":"todo","text":"Implement /workflows endpoint","context":"","ts":"..."}
-{"type":"conflict","text":"REST vs gRPC scope overlap","refs":["abc123","def456"],"topic":"api-protocol","ts":"..."}
-{"type":"done","text":"Auth flow tests passing","context":"","ts":"..."}
-```
-
-Lines are minimal — session and project are NOT stored per line. Session is
-encoded in the filename. Conflict entries add `refs` and `topic` for
-cross-session linking and dedup.
-
-**Write rules (same for observer and reflector):**
-1. **Forward-only**: Append new lines. Never delete or modify existing lines.
-2. **One JSON line per entry**: Self-contained, independently parseable.
-3. **No edit permission**: Even if a TODO is marked done later, a new
-   `type: "done"` entry is appended — the original TODO line remains.
-
-**Reflector cadence:**
-
-The reflector does NOT wake on every new decision. It accumulates like
-the observer — every 5-6 new messages worth of observations, it scans
-for contradictions across the project's sessions. It is a companion
-process to the observer, not an independent daemon.
-
-```
-Observer appends observations → reflector notices growth
-  → after 5-6 new entries, reflector reads recent decisions
-  → compares with decisions from other sessions in same project
-  → appends type:"conflict" entries if contradictions found
-```
-
-**Why not a separate conflicts file:**
-- One file per session is simpler to manage, query, and clean up
-- Conflicts are semantically observations — higher-level ones
-- The insights skill reads one file, not two
-- The handoff skill reads one file, not two
-- `grep "conflict" observations/abc123.jsonl` works for quick conflict checks
-- Append-only, forward-only means no write contention between observer and
-  reflector — they can both safely append to the same file
-
-**Rejected:** Separate `conflicts.jsonl` per session (extra file overhead,
-split queries, two files to manage per session).
-**Rejected:** Global `conflicts.jsonl` (requires filtering, defeats
-per-session scoping).
+**Status:** Superseded by ADR-029 (2026-08-27). Observer and reflector
+appending to one per-session observation JSONL, conflicts as
+`type:"conflict"` entries. Body removed — see git history.
 
 ---
 
 ### ADR-022: Reflector implementation — prompt, invocation, and state tracking
 
-**Context:** ADR-015 and ADR-020 established that the reflector detects
-contradictory decisions across sessions and appends `type: "conflict"`
-entries to the same per-session observation JSONL. But the design never
-specified how the reflector is actually invoked, what input it receives,
-what its prompt looks like, or how it tracks its own state. Unlike the
-observer (which reads raw JSONL transcripts), the reflector works at the
-**observation layer** — it reads decisions from observation files, not
-source transcripts. This makes its input shape fundamentally different.
-
-**Decision:** The reflector is a second `claude -p` call, triggered by
-the observer process, with its own prompt and its own offset tracking.
-
-**Input shape — observer vs reflector:**
-
-```
-Observer reads:        Source JSONL (raw transcript) → extracts observations
-Reflector reads:       Observation JSONLs (extracted decisions) → finds contradictions
-```
-
-The reflector never touches the source transcripts. It operates entirely
-on the already-extracted observation layer. Its input is:
-
-1. **Recent decisions from the current session** — new `type: "decision"`
-   entries since the reflector last ran (tracked by `reflector_entry_offset`)
-2. **All decisions from other sessions in the same project** — gathered by
-   scanning `observations/<other_session>.jsonl` files that share the same
-   `project` value
-
-Both sets are piped into the prompt as structured input.
-
-**Invocation:**
-
-```bash
-claude -p "$(cat ~/.config/threadhop/prompts/reflector.md)
-
-<current_session_decisions>
-# Recent decisions from session abc123 (since reflector last ran)
-$(jq -c 'select(.type==\"decision\")' observations/abc123.jsonl | tail -n +$REFLECTOR_OFFSET)
-</current_session_decisions>
-
-<project_decisions>
-# All decisions from other sessions in project 'atlas'
-$(for f in observations/*.jsonl; do
-    jq -c 'select(.type==\"decision\" and .project==\"atlas\")' "$f"
-  done | grep -v '\"session\":\"abc123\"')
-</project_decisions>
-
-If you find contradictions, append conflict entries to: observations/abc123.jsonl" \
-  --model haiku \
-  --permission-mode acceptEdits
-```
-
-**The reflector prompt** lives at `~/.config/threadhop/prompts/reflector.md`
-(or bundled with the app at `prompts/reflector.md`, alongside `observer.md`).
-It constrains:
-
-1. **Append-only**: Same rules as observer — forward-only, no deletions.
-2. **One JSON line per conflict**: Each conflict is a self-contained entry.
-3. **Conflict deduplication**: Before appending, check if the same pair of
-   sessions + same topic already has a conflict entry. If yes, skip.
-   (The prompt includes existing conflict entries for this check.)
-4. **Structured conflict format**: Each conflict entry must reference both
-   sessions and explain the contradiction clearly.
-
-**Conflict entry format:**
-
-```jsonl
-{"type":"conflict","text":"REST vs gRPC scope overlap — session abc decided REST for client API, session def decided gRPC for all services","refs":["abc123","def456"],"topic":"api-protocol","ts":"2026-04-14T12:00:00Z"}
-```
-
-Fields:
-- `type`: always `"conflict"`
-- `text`: concise explanation of the contradiction
-- `refs`: array of session IDs involved in the contradiction
-- `topic`: semantic grouping key (helps dedup and display)
-- `ts`: ISO 8601 timestamp
-
-The conflict entry does **not** include inline `session` or `project` fields.
-The session is implied by which observation file the entry was appended to,
-and project context comes from SQLite session mapping.
-
-**Trigger mechanism — observer spawns reflector:**
-
-The reflector is NOT an independent process. The observer triggers it:
-
-```
-Observer loop:
-  1. Watch source JSONL for new messages
-  2. When ~3-4 new messages: run observer extraction (claude -p)
-  3. Observer appends observations, increments entry_count
-  4. Check: has entry_count grown by ≥5 since reflector_entry_offset?
-     → YES: spawn reflector (claude -p with reflector prompt)
-     → NO: continue watching
-  5. Reflector appends any conflicts, updates reflector_entry_offset
-```
-
-The observer process owns the reflector's lifecycle. There is no separate
-reflector daemon, PID, or stop mechanism. When the observer stops, the
-reflector stops. When the observer resumes, the reflector resumes from
-its own offset.
-
-**On-demand reflector (for handoff and CLI queries):**
-
-When the observer core function runs on-demand (e.g., `threadhop handoff`
-or `threadhop conflicts`), the reflector runs as a follow-up step:
-
-```
-threadhop conflicts --project atlas:
-  1. For each session in project: run observer if unprocessed messages exist
-  2. Run reflector for each session with new decisions
-  3. Display all type:"conflict" entries across project
-```
-
-Same function, different trigger — just like the observer.
-
-**State tracking — reflector offset in observation_state:**
-
-The `observation_state` table gains one column for the reflector:
-
-```sql
-ALTER TABLE observation_state ADD COLUMN
-    reflector_entry_offset  INTEGER NOT NULL DEFAULT 0;
-    -- last entry index the reflector has processed
-```
-
-This means:
-- `entry_count = 15, reflector_entry_offset = 10` → 5 unprocessed entries,
-  reflector should run
-- `entry_count = 15, reflector_entry_offset = 15` → up to date, skip
-- After reflector runs: `reflector_entry_offset = entry_count`
-
-The offset tracks entries (line count in observation JSONL), not bytes —
-because the reflector reads structured observations, not raw transcript.
-
-**Where conflicts are written — single-session scoping:**
-
-When session A said "REST" and session B said "gRPC", the conflict is
-written to **the session currently being observed** (the one whose observer
-triggered the reflector). The `refs` array links both sessions.
-
-If the other session is later observed, the reflector will discover the
-same contradiction from the other side and write its own conflict entry
-there. This is intentional — each session's observation file tells its
-own complete story, including conflicts it's involved in.
-
-**Deduplication prevents noise:** The reflector prompt includes existing
-`type: "conflict"` entries from the current session. Before writing a new
-conflict, it checks: "is there already a conflict entry with the same
-`refs` pair and `topic`?" If yes, skip. This means re-running the
-reflector is idempotent.
-
-**Prompt file layout:**
-
-```
-~/.config/threadhop/prompts/
-  observer.md           ← extraction prompt (ADR-018)
-  reflector.md          ← conflict detection prompt (this ADR)
-```
-
-**Rationale:**
-- Observer triggers reflector → no extra daemon, no extra PID management
-- Reflector operates on observation layer, not transcript layer — smaller
-  input, faster processing, and it doesn't need to understand raw JSONL
-- Entry-count offset tracking is simpler than byte offsets (observations
-  are structured, line-per-entry)
-- Single-session scoping with `refs` links means each session file is
-  self-contained while still enabling cross-session conflict queries
-- Dedup in the prompt means reflector is idempotent — safe to re-run
-- Same `claude -p --model haiku --permission-mode acceptEdits` invocation
-  as observer — no new execution model to build
+**Status:** Superseded by ADR-029 (2026-08-27). Reflector as a second
+`claude -p` call spawned by the observer, with entry-offset tracking
+and conflict dedup. Body removed — see git history.
 
 ---
 
 ### ADR-021: Observation indicator in TUI session list + transcript header
 
-**Context:** When a session has been observed (observations exist), the
-user needs a way to know this from the TUI without opening the transcript
-or running a CLI command. The existing session status circles (◐ ● ○)
-indicate process state and should not be overloaded with observation state —
-remembering what each circle variant means is already enough cognitive load.
-
-**Decision:** Add a small notepad-style icon next to the session name for
-observed sessions. Add a subtle header line in the transcript view showing
-the observation file path and entry count.
-
-**Session list indicator:**
-
-```
-● my-session 🗒             ← observed (has observations)
-○ another-session            ← not observed
-◐ active-work                ← working, no observations
-◐ active-work 🗒             ← working AND observed
-```
-
-The `🗒` (or a terminal-safe fallback like `≡` or `[O]`) appears after the
-session name when `observation_state.entry_count > 0` for that session.
-This is checked during the existing 5s refresh cycle — no extra DB queries.
-
-If emoji rendering is unreliable across terminals, fall back to a Rich
-markup colored marker: `[dim]≡[/dim]` or `[dim cyan]obs[/dim cyan]`.
-
-**Transcript header (Option B — subtle, non-interfering):**
-
-When viewing a transcript that has observations, show a one-line header
-above the first message:
-
-```
-─── 🗒 12 observations · ~/.config/threadhop/observations/abc123.jsonl ───
-```
-
-This header:
-- Is positioned above the transcript content, below the session title area
-- Does NOT interfere with the persistent search bar (which is at the bottom)
-- Is static (not a focusable widget) — purely informational
-- Shows the entry count and file path for quick reference
-- Can be selected/copied for use in another terminal
-
-**TUI action for observation path:**
-
-When an observed session is highlighted in the session list, pressing `o`
-(for "observations") copies the file path to clipboard:
-
-```
-~/.config/threadhop/observations/abc123.jsonl
-```
-
-Notification: "Observation path copied — view in terminal or IDE"
-
-This gives the user a fast path to `cat`, `jq`, or IDE-open the
-observation file without remembering the path structure.
-
-**TUI re-observe trigger:**
-
-When pressing `o` on a session that has NO observations yet, instead of
-copying a non-existent path, offer to start observation:
-
-```
-Press o on unobserved session → "No observations yet. Start observing? (y/n)"
-  y → spawns observer, same as `threadhop observe --session <id>`
-  n → dismiss
-```
-
-When pressing `o` on a session that has observations but the observer is
-stopped, offer to resume:
-
-```
-Press o on observed+stopped session → copies path (observations exist)
-Press O (shift) → "Resume observing? (y/n)"
-  y → resumes from last byte offset
-```
-
-**Rationale:**
-- The notepad icon is additive — doesn't change the meaning of existing circles
-- The transcript header is passive (no interaction needed) and positioned
-  to avoid conflicting with search or footer
-- Copying the file path is the lowest-overhead way to bridge TUI → terminal/IDE
-- Re-observe from TUI closes the loop: discover observations exist → re-observe
-  if session has grown → observations update
+**Status:** Superseded by ADR-029 (2026-08-27). 🗒 observation indicator
+in the session list, transcript header, and `o`/`O` keybindings. Body
+removed — see git history.
 
 ---
 
@@ -1543,7 +745,10 @@ at all.
 **Context:** ThreadHop shells out to `claude -p` from three sites — the
 observer (`threadhop_core/observation/observer.py`), the reflector
 (`threadhop_core/observation/reflector.py`), and handoff brief
-generation (`threadhop_core/handoff.py`). Originally each call site
+generation (`threadhop_core/handoff.py`). *(Editorial note, 2026-08-27:
+ADR-029 removed all three of those call sites; `run_claude_p` is now
+called from exactly one site — `threadhop prepare` (ADR-032). The seam
+survives unchanged and is where a second adapter will land.)* Originally each call site
 carried its own `subprocess.run` block, its own argv assembly, its own
 prompt-path resolution, and its own quirks (working directory, timeout,
 env munging). Adding a second LLM CLI (e.g. `codex`, `gemini`) under
@@ -1615,6 +820,238 @@ the right place; it just becomes load-bearing.
 
 ---
 
+### ADR-029: Drop the observer/reflector architecture — lazy compression at transfer time
+
+**Status:** Accepted (2026-08-27). Supersedes ADR-010, ADR-015, ADR-016,
+ADR-018, ADR-019, ADR-020, ADR-021, ADR-022. Amends ADR-012, ADR-028.
+
+**Context:** The observer ran Haiku every ~3-4 messages — roughly 50
+background `claude -p` calls per 200-message session — paid speculatively
+against the bet that the resulting observations would be queried later.
+Actual usage disproved the bet: observations were rarely queried, and
+handoffs are occasional events, not a continuous need. The architecture
+also carried real operational weight: sidecar processes, PID lifecycle,
+watch mode, stop/resume semantics, a companion reflector, and a state
+table — all serving queries the user never makes.
+
+**Decision:** Remove the observer/reflector architecture wholesale:
+
+- Observer and reflector processes, prompts, and watch mode
+- Per-session observation files (`~/.config/threadhop/observations/`)
+- The `observation_state` table (dropped by migration — ADR-033)
+- `/threadhop:observe` and the observer-backed `/threadhop:handoff`
+- `/threadhop:insights`
+- The `todos` / `decisions` / `conflicts` / `observations` CLI queries
+
+New invariant: **every LLM call must be user-intent-gated.** The only LLM
+call in the system is one compression call at `threadhop prepare` time
+(ADR-032), made at the moment the user proves intent to transfer.
+
+**Rationale:**
+- 1 call at proven intent vs ~50 speculative calls per session — the
+  economics only work if observations are queried often; they weren't
+- No background processes: no PID lifecycle, no watch mode, no stale-PID
+  detection, no reflector cadence — an entire failure-mode class deleted
+- What is knowingly lost: the typed decision ledger, conflict detection,
+  and insights. Lookup needs are served by FTS search over raw
+  transcripts instead (ADR-002, ADR-031) — the transcripts were always
+  the source of truth; observations were a derived cache
+
+**Rejected:**
+- Keeping the observer as a dormant opt-in — dead code with a
+  maintenance bill and a standing temptation to re-grow
+- Cheaper/batched observation — reduces the multiplier, keeps the
+  speculation
+
+---
+
+### ADR-030: Exchange as the retrieval and windowing unit
+
+**Status:** Accepted (2026-08-27). Extends ADR-003.
+
+**Context:** Pulling context out of another session needs bounds. ±N
+message windows are arbitrary — they split thoughts mid-stream and drag
+in unrelated neighbours. Embedding-based semantic boundary detection
+(TextTiling-style) solves that properly but is overkill at personal
+scale and drags model weight into a zero-LLM path.
+
+**Decision:** The retrieval unit is the **exchange** — one user turn plus
+all assistant/tool activity until the next user turn. Exchanges are
+computed structurally at parse time; no DB schema change is required
+(they may later be stamped as `exchange_id` in the `messages` table when
+FTS lands — see Q8). `peek` windows, `--grep` results, and `prepare`
+tails are all exchange-bounded.
+
+**Rationale:**
+- In agent chats, each user prompt almost always opens a topic — the
+  exchange is a natural semantic unit obtained for free
+- Zero model cost, deterministic, explainable — the same properties that
+  won FTS over embeddings in ADR-002
+- Extends ADR-003 one level up: ADR-003 merges streaming chunks into
+  logical messages; ADR-030 groups logical messages into logical topics
+
+**Rejected:** ±N message windows (arbitrary boundaries). TextTiling /
+embedding boundary detection (model weight for a problem the transcript
+structure already solves).
+
+---
+
+### ADR-031: The borrow spectrum — peek / search / transfer
+
+**Status:** Accepted (2026-08-27).
+
+**Context:** Codex CLI's #-mention (PR #17358) injects prior
+conversations verbatim — user/assistant messages only, tool calls and
+system prompts stripped — as a hidden remembered-context packet. It
+validates raw injection as a mechanism, but re-creates the context-fill
+problem by injecting whole threads. Handoff-style compression is the
+opposite extreme: an LLM call even when the user just wants to *look at*
+something. Neither extreme matches how borrowing actually happens.
+
+**Decision:** Three tiers, each matched to a question:
+
+| Question | Command | LLM cost |
+|---|---|---|
+| "Show me that part of chat A" | `threadhop peek <session> [--last N / --range A:B / --grep X]` | 0 |
+| "Where did we discuss X?" | `threadhop search <query> [--project] [--json]` (FTS5) | 0 |
+| "Continue this work over there" | `threadhop prepare` → `threadhop receive <ticket>` | exactly 1, at prepare |
+
+`--grep` results return whole exchanges (ADR-030), not the full thread —
+scoped borrowing beats Codex's whole-conversation injection. Verbatim
+output strips tool results, sidechains, and system-reminders, and
+includes source labels (session name, project, timestamp) in the ADR-008
+format.
+
+**Rationale:**
+- Most borrowing is lookup, not continuation — lookup must cost zero
+- The tier boundary is the user's question, not an implementation detail
+- Every tier is a plain CLI command, so all three work as `!threadhop …`
+  passthroughs from inside any chat
+
+**Rejected:** Making transfer the only door (rebuilds handoff friction
+for what is usually a lookup). Injecting whole conversations (Codex's
+flaw — the mechanism validated, the context-fill problem kept).
+
+---
+
+### ADR-032: prepare/receive transfer tickets
+
+**Status:** Accepted (2026-08-27).
+
+**Context:** Continuation transfers need whole-conversation context, but
+"last N messages verbatim" alone loses the arc, and a fresh summary of
+everything is the old handoff cost paid every time. There is also a
+moving-target problem with lazy pulls: if chat B pulls "the last 3
+exchanges" from chat A while chat A keeps working, the referent changes
+between glance and paste.
+
+**Decision:** Transfer is a two-command flow around a frozen ticket.
+
+**`threadhop prepare [--session id] [--tail N=3] [--tail-budget chars=8000] [--model haiku]`**
+— run from (or for) chat A:
+
+1. Auto-detects the current session when `--session` is omitted (same
+   parent-process walk as `threadhop tag`)
+2. Splits the transcript into **head** (everything but the last N
+   exchanges) and **tail** (the last N exchanges verbatim, capped at the
+   token budget, tool results stripped) — exchange-bounded per ADR-030
+3. Makes ONE `claude -p` call (via harness `run_claude_p`, ADR-028,
+   prompt at `prompts/prepare.md`) producing a narrative head summary:
+   goal, current state, decisions with rationale, open items, files
+   touched
+4. Writes a frozen ticket to `~/.config/threadhop/transfers/tk_<8hex>.md`
+5. Prints a paste-ready line:
+   `Paste in the target chat: !threadhop receive tk_xxxx`
+
+**`threadhop receive <ticket>`** — prints the ticket verbatim. Zero LLM.
+Works pasted into any tool with a shell — Claude Code, Codex, anything.
+
+**Rationale:**
+- prepare pins a snapshot at the moment of intent — no moving target;
+  the ticket says the same thing tomorrow
+- All cost lives in prepare; receive is a file read
+- No ID archaeology — prepare auto-detects the current session, and the
+  ticket ID travels in one paste-ready line
+- Summary-head + verbatim-tail is the established compaction pattern
+  (Claude Code `/compact`, Mastra OM): the head carries narrative, which
+  compresses well; the tail carries working state, which compresses badly
+
+**Rejected:** Pull-from-target ("chat B fetches from chat A") — moving
+target. Fully verbatim tickets — context fill with no arc. Fully
+summarized tickets — destroys the working state the target needs
+verbatim.
+
+---
+
+### ADR-033: Byte-offset summary caching at prepare time
+
+**Status:** Accepted (2026-08-27).
+
+**Context:** Re-preparing the same long-running session should not
+re-summarize from byte 0. Incremental processing via byte offsets was
+the observer's one genuinely good trick (former ADR-019) — salvaged
+here without the background calls that came with it.
+
+**Decision:** New SQLite table:
+
+```sql
+CREATE TABLE transfer_state (
+    session_id          TEXT PRIMARY KEY,
+    source_byte_offset  INTEGER NOT NULL DEFAULT 0,
+    cached_summary      TEXT,
+    updated_at          REAL
+);
+```
+
+On re-prepare:
+- Source JSONL grew → summarize only the new exchanges and merge with the
+  cached summary. Still one call — the merge is part of the same prompt
+  (`prompts/prepare.md` receives the cached summary + the new exchanges)
+- Source unchanged → reuse the cached summary, zero LLM calls
+
+The `observation_state` table is dropped by the same migration.
+
+**Rationale:**
+- A 400-message session re-prepared after 20 new messages costs one
+  small call, not one giant one
+- The cache is a pure optimization — deleting a row only makes the next
+  prepare slower, never wrong
+
+**Rejected:** Caching per-exchange summaries (more rows, no cheaper —
+the merge call dominates). Keeping `observation_state` for its offset
+column (wrong shape, dead columns).
+
+---
+
+### ADR-034: Vector/hybrid search tier — rejected pending evidence
+
+**Status:** Accepted (2026-08-27). Reaffirms and extends ADR-002.
+
+**Context:** The borrow-spectrum proposal considered a hybrid
+FTS+embedding search tier with semantic-boundary chunking — "RAG without
+generation." Retrieval quality would likely improve on concept-shaped
+queries ("that auth discussion") where keyword search misses.
+
+**Decision:** Rejected for now.
+
+- Embeddings are not model-free: a local encoder is ≈100MB of weights,
+  an embedding pass per indexed message, and heavier deps in a
+  `uv run --script` single file
+- FTS v1 has not shipped — ADR-002's revisit clause ("when keyword
+  search demonstrably fails") has zero evidence either way
+- Exchange chunking (ADR-030) already fixes the bounds problem
+  structurally, which was half of what semantic chunking promised
+
+**Revisit trigger:** Log searches that return zero results or are
+retried with reworded queries. If frequent, add a local encoder +
+`sqlite-vec` as a fallback/rerank tier fused with RRF — an additive
+change on top of FTS, not a redesign.
+
+**Rejected (for now):** Hybrid FTS+vector at v1 (cost before evidence).
+Embedding-based chunking (ADR-030 covers it structurally).
+
+---
+
 ## Implementation Plan
 
 ### Phase 1: SQLite Foundation + Session Tags + Archive
@@ -1650,65 +1087,48 @@ _Enables instant search and cross-session context sharing. All TUI features._
    - Footer stays minimal/contextual instead of listing every keybinding
    - One registry feeds footer hints, help content, and future docs sync
    - Trigger key intentionally left open; do not assume `H`
+12. Exchange grouping in the indexer (ADR-030): stamp or derive the exchange
+    for each message so search results, peek windows, and prepare tails all
+    share the same unit (materialize vs derive: Q8)
+13. `threadhop search <query> [--project] [--json]` CLI subcommand over the
+    same FTS index — the one-shot, scriptable counterpart to the TUI panel
 
-### Phase 3: CLI Subcommands + Observer (on-demand + background)
-_Observer-first architecture. CLI access to observations without the TUI.
-Observer uses `claude -p --model haiku --permission-mode acceptEdits` (ADR-018).
-Per-session observation files with SQLite state tracking (ADR-019)._
+### Phase 3: Borrow CLI — peek / search / prepare / receive
+_The borrow spectrum (ADR-031). Zero-LLM peek and search; exactly one LLM
+call at prepare (ADR-032), cached across re-prepares (ADR-033)._
 
 1. Add argparse subcommand routing: no subcommand = TUI, with subcommand = CLI
 2. Implement `threadhop tag <status> [--session <id>]`
    - Auto-detect session from current terminal when `--session` omitted
-3. Create reusable observer prompt at `~/.config/threadhop/prompts/observer.md`
-   - Append-only, one JSON line per observation, typed extraction only
-   - Types: `todo | decision | done | adr | observation | conflict`
-4. Add `observation_state` table to SQLite schema (ADR-019)
-5. Implement observer core function (ADR-018):
-   - Reads source JSONL from `source_byte_offset` (or byte 0 for new sessions)
-   - Invokes `claude -p --model haiku --permission-mode acceptEdits`
-   - Appends typed observations to `~/.config/threadhop/observations/<session_id>.jsonl`
-   - Updates `source_byte_offset` and `entry_count` in SQLite
-   - Same function used by all entry points (CLI, skill, handoff, TUI)
-6. Implement background observer mode (ADR-015):
-   - `threadhop observe --session <id>` — runs as background sidecar
-   - File-watching via fsevents (macOS), fallback to polling
-   - Batched extraction (configurable, default ~3-4 new messages trigger)
-   - Records PID in `observation_state.observer_pid`
-   - Exits when Claude Code session ends or `--stop` is sent
-7. Implement stop/resume lifecycle (ADR-019):
-   - `threadhop observe --stop [--session <id>]` — SIGTERM to recorded PID
-   - `threadhop observe --stop-all` — stops all running observers
-   - Resume: reads `source_byte_offset`, processes only new bytes
-   - Stale PID detection via `kill -0 $PID`
-8. Implement CLI queries:
-   - `threadhop todos [--project <name>]`
-   - `threadhop decisions [--project <name>]`
-   - `threadhop observations [--project <name>]`
-   - `threadhop conflicts [--project <name>]` (reads `type: "conflict"` entries)
-   - All trigger observer for unprocessed messages before displaying results
+3. Exchange parser (ADR-030): one user turn + all assistant/tool activity
+   until the next user turn, computed at parse time
+4. `threadhop peek <session> [--last N] [--range A:B] [--grep X]`:
+   - Verbatim, exchange-bounded output (`--grep` returns whole exchanges)
+   - Strips tool results, sidechains, system-reminders
+   - Source labels (session name, project, timestamp) per ADR-008
+5. `threadhop search <query> [--project] [--json]` over the Phase 2 FTS index
+6. `threadhop prepare [--session id] [--tail N=3] [--tail-budget chars=8000] [--model haiku]`:
+   - Head/tail split per ADR-032; ONE `claude -p` via harness
+     `run_claude_p` (ADR-028) with `prompts/prepare.md`
+   - `transfer_state` caching: summarize only new bytes, merge with the
+     cached summary in the same call (ADR-033)
+   - Write frozen ticket to `~/.config/threadhop/transfers/tk_<8hex>.md`
+   - Print the paste-ready `!threadhop receive tk_xxxx` line
+7. `threadhop receive <ticket>` — print ticket verbatim, zero LLM
+8. Transfers directory + ticket format
+9. Migration: drop the `observation_state` table (ADR-033)
 
-### Phase 4: Skill Plugin + TUI Observation Indicator
-_Four skills for in-session use (ADR-012, ADR-016), plus the
-`!threadhop tag` bash passthrough for tagging (ADR-013). TUI observation
-indicator and transcript header (ADR-021)._
+### Phase 4: Plugin refresh
+_One plugin, six commands, zero skills (ADR-029, ADR-031, ADR-032). Every
+command body is a single `!threadhop …` line the harness pre-executes (Q4)._
 
-1. Research Claude Code skill plugin packaging/distribution
-2. `!threadhop tag <status>` — document the bash passthrough + valid
-   statuses in README. Optional: sample `UserPromptSubmit` hook for
-   `/tag <status>` ergonomics. Replaces the former `/threadhop:tag` skill
-   (ADR-013).
-3. `/threadhop:context` — read clipboard, format with source labels, inject
-4. `/threadhop:handoff <id> [--full]` — runs observer first if no observations
-   exist (ADR-018), then formats from observations. No separate JSONL compression path.
-5. `/threadhop:observe` — per-session opt-in, spawns background observer
-   (retroactive catch-up + watch mode)
-6. `/threadhop:insights` — reads per-session observation file (includes conflict
-   entries from reflector), formats and injects into conversation
-7. TUI observation indicator (ADR-021):
-   - 🗒 icon next to session name when `observation_state.entry_count > 0`
-   - Subtle transcript header: entry count + file path
-   - `o` key: copy observation path to clipboard (or start observing if none)
-   - `O` key: resume observation on a stopped session
+1. Commands: `tag`, `bookmark`, `copy`, `peek`, `prepare`, `receive` — all
+   `!threadhop …` pre-executed passthroughs with `argument-hint`
+   frontmatter for `/` picker discoverability
+2. Remove the `handoff` skill and the `observe` command from the plugin
+3. All six remain available as raw `!threadhop …` passthroughs for
+   zero-turn invocation
+4. README: document the borrow spectrum and the prepare → receive flow
 
 ### Phase 5: Project Memory + Bookmarks
 _Cross-session knowledge persistence._
@@ -1717,32 +1137,10 @@ _Cross-session knowledge persistence._
 2. Bookmark action from message selection mode (`space` to toggle)
 3. Bookmark browser panel in TUI
 4. Explicit annotation detection: recognize "ADR:", "DECISION:", "TODO:" markers
-   in conversations and auto-append to observations
-5. Memory rendering: generate project memory markdown from observations for injection
-
-### Phase 6: Reflector — Conflict Detection
-_Contradiction detection across sessions. Second `claude -p` call triggered
-by the observer process (ADR-022). Writes `type: "conflict"` entries to the
-SAME per-session observation JSONL (ADR-020). Uses `reflector_entry_offset`
-for incremental processing._
-
-1. Create reflector prompt (`~/.config/threadhop/prompts/reflector.md`):
-   - Input: recent decisions from current session + all decisions from
-     other sessions in same project
-   - Constrains: append-only, dedup by `refs` pair + `topic`
-   - Output: `type: "conflict"` entries with `refs`, `topic`, `text`
-2. Build reflector core function (Haiku via `claude -p`):
-   - Reads decisions from observation files (NOT raw transcripts)
-   - Gathers cross-session decisions by scanning `observations/*.jsonl`
-   - Appends conflicts to current session's observation JSONL
-   - Updates `reflector_entry_offset` in `observation_state`
-3. Observer-triggered background mode:
-   - Observer checks: `entry_count - reflector_entry_offset >= 5`
-   - If yes: spawns reflector `claude -p` call
-   - No separate PID — observer owns reflector lifecycle
-3. TUI notification: surface unreviewed conflicts in sidebar or status bar
-4. Condensation (secondary goal): merge related decisions, archive completed
-   TODOs, produce condensed summaries with source links
+   in conversations and write directly to the `memory` table (ADR-029 —
+   observations are gone)
+5. Memory rendering: generate project memory markdown from the `memory`
+   table for injection
 
 ---
 
@@ -1826,78 +1224,68 @@ CREATE TABLE memory (
     created_at    REAL NOT NULL
 );
 
--- Observer + reflector state tracking (ADR-019, ADR-022)
-CREATE TABLE observation_state (
-    session_id              TEXT PRIMARY KEY,
-    source_path             TEXT NOT NULL,       -- path to source session JSONL
-    obs_path                TEXT NOT NULL,       -- path to per-session observations JSONL
-    source_byte_offset      INTEGER NOT NULL DEFAULT 0,  -- where observer last read in source
-    entry_count             INTEGER NOT NULL DEFAULT 0,   -- total observation entries written
-    reflector_entry_offset  INTEGER NOT NULL DEFAULT 0,   -- last entry index reflector processed
-    observer_pid            INTEGER,             -- PID if running, NULL otherwise
-    status                  TEXT NOT NULL DEFAULT 'idle',
-        -- idle | running | stopped
-    started_at              REAL,                -- when observation first started
-    last_observed_at        REAL,                -- when last observation appended
+-- Prepare-time summary cache (ADR-033)
+CREATE TABLE transfer_state (
+    session_id          TEXT PRIMARY KEY,
+    source_byte_offset  INTEGER NOT NULL DEFAULT 0,  -- where prepare last read in source JSONL
+    cached_summary      TEXT,                        -- head summary from the last prepare
+    updated_at          REAL,
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
 ```
 
 ---
 
-## Skill Plugin Architecture
+## Plugin Architecture
 
-### Principle: Four skills + bash passthrough for tagging/bookmark ingest, clear boundaries
+### Principle: one plugin, six commands, zero skills
 
-Skills are for operations invoked mid-conversation from Claude Code. The TUI
-handles everything visual and instantaneous. The CLI handles queries and tagging
-from the terminal. In-session tagging uses Claude Code's `!` bash passthrough
-rather than a skill (zero LLM turn — see ADR-013). See ADR-012 (original
-set) and ADR-016 (observe + insights).
+Everything in-session is a slash command whose body is a single
+`!threadhop …` line that the harness pre-executes before the model sees
+the prompt (Q4) — the CLI does the work, the model relays stdout. There
+are no skills: a skill spends an LLM turn framing output, and after
+ADR-029 the only LLM spend in the system is the one call inside
+`threadhop prepare` (ADR-032). The TUI handles everything visual and
+instantaneous; the CLI handles queries, tagging, and the borrow spectrum
+(ADR-031).
 
 ### Plugin: `threadhop`
 
-Final Phase 4 surface — one plugin with a hybrid of one skill and two
-commands, all under the `/threadhop:` namespace. `context` and
-`insights` from the original ADR-016 plan were dropped (see
-`skill-packaging.md` for rationale). The plugin calls bare `threadhop`
-from `$PATH` — the app is installed separately (Model B).
+One plugin, six commands under the `/threadhop:` namespace. The former
+`handoff` skill and `observe` command are removed (ADR-029). The plugin
+calls bare `threadhop` from `$PATH` — the app is installed separately
+(Model B).
 
 ```
 plugin/
-├── .claude-plugin/plugin.json           # manifest: name=threadhop, version=0.1.0
-├── skills/
-│   └── handoff/
-│       └── SKILL.md                     # /threadhop:handoff — model-framed brief
+├── .claude-plugin/plugin.json           # manifest: name=threadhop
 └── commands/
+    ├── tag.md                           # /threadhop:tag — !`threadhop tag` + argument-hint
     ├── bookmark.md                      # /threadhop:bookmark — !`threadhop bookmark`
-    ├── observe.md                       # /threadhop:observe — !`threadhop observe`
-    └── tag.md                           # /threadhop:tag — !`threadhop tag` + argument-hint
+    ├── copy.md                          # /threadhop:copy — clipboard → labelled context block
+    ├── peek.md                          # /threadhop:peek — !`threadhop peek`
+    ├── prepare.md                       # /threadhop:prepare — !`threadhop prepare`
+    └── receive.md                       # /threadhop:receive — !`threadhop receive`
 ```
 
-All three commands also remain available as bash passthroughs
-(`!threadhop tag|bookmark|observe …`) for users who prefer zero-LLM-turn
-invocation. The slash forms' advantage is discoverability through the
-`argument-hint` frontmatter shown in the `/` picker.
-
-Tagging also stays available as `!threadhop tag <status>` (bash
-passthrough, zero LLM turn). The slash form's advantage is
-discoverability — the argument-hint enumerates valid statuses.
+All six also work as raw `!threadhop …` bash passthroughs for
+zero-LLM-turn invocation. The slash forms' advantage is discoverability
+through the `argument-hint` frontmatter shown in the `/` picker.
 
 ### What lives where
 
 | Feature | Lives in | Why |
 |---------|----------|-----|
-| Search | TUI | Per-keystroke instant, visual results |
+| Search | TUI + CLI (`threadhop search`) | Per-keystroke instant in the TUI; one-shot FTS query from any terminal or `!` passthrough (ADR-031) |
 | Message select + copy | TUI | Visual selection, clipboard transport |
 | Message export to .md | TUI | Visual selection, writes to /tmp |
-| Bookmark ingest | TUI + CLI + `!` bash passthrough + `/threadhop:bookmark` | Four entry points, one `bookmarks` table — TUI selection-mode, chat passthrough, plugin slash command, and CLI all write through `db.upsert_bookmark` via the same normalization |
+| Bookmark ingest | TUI + CLI + `!` bash passthrough + `/threadhop:bookmark` | Four entry points, one `bookmarks` table — all write through `db.upsert_bookmark` via the same normalization |
 | Tag session | TUI + CLI + `!` bash passthrough + `/threadhop:tag` | Four entry points, one DB (ADR-013) |
-| Observation queries | CLI | `threadhop todos`, `threadhop decisions`, etc. |
-| Start observation | `/threadhop:observe` + TUI | Per-session opt-in; observer lifetime bound to the Claude Code session that started it |
-| View captured observations | TUI + CLI (not in-session) | Observations are for *other* sessions — surfacing them in the generating session defeats the observer's purpose |
-| Handoff (brief for another session) | `/threadhop:handoff` skill | Runs observer catch-up first, formats via Haiku for `--full`, model frames the output |
-| Observation indicator | TUI | 🗒 icon + transcript header for observed sessions |
+| Clipboard context injection | `/threadhop:copy` | Bridges TUI visual selection into the current chat |
+| Peek at another session | CLI + `/threadhop:peek` | Zero LLM, exchange-bounded verbatim output (ADR-030, ADR-031) |
+| Search from inside a chat | `!threadhop search` | Zero LLM, FTS5 over raw transcripts (ADR-031) |
+| Prepare a transfer ticket | CLI + `/threadhop:prepare` | The system's only LLM call, at proven intent (ADR-032) |
+| Receive a transfer ticket | CLI + `/threadhop:receive` | Zero-LLM file read — works in any tool with a shell |
 
 ### Tag entry point 3: `!threadhop tag <status>` (bash passthrough, zero LLM turn)
 
@@ -1920,124 +1308,50 @@ On detection failure the command exits `2` with the helpful error from
 Optional: a `UserPromptSubmit` hook can provide `/tag <status>` ergonomics
 — documented in README. Hooks do not appear in `/` autocomplete or `/help`.
 
-### Skill 1: `/threadhop:context` (instant, no LLM)
+### Command: `/threadhop:peek` (zero LLM)
 
-Bridges the TUI (visual selection) to Claude Code (context injection).
-User copies messages from the TUI, then invokes this skill to present
-them cleanly in the current conversation.
-
-```
-User (in Claude Code): /threadhop:context
-
-1. Skill reads clipboard (pbpaste)
-2. Detects ThreadHop source labels in the content
-3. Presents as a clearly bounded context block:
-
-   ┌─ From "API contracts" — ~/agent-atlas — 2026-04-12 ─┐
-   │ User: What about rate limiting?                       │
-   │ Claude: Two options: leaky bucket vs token bucket...  │
-   └───────────────────────────────────────────────────────┘
-
-4. The model now has this context and can work with it
-```
-
-### Skill 2: `/threadhop:handoff <id> [--full]` (observer + format)
-
-Uses the observer as its underlying function (ADR-018). There is no
-separate "compress raw JSONL" path — the handoff always works from
-observations, running the observer first if needed.
+Scoped borrowing — look at part of another session without paying for
+compression. `--grep` returns whole exchanges (ADR-030), not the thread.
 
 ```
-User (in Claude Code): /threadhop:handoff abc123
+User (in any chat): !threadhop peek api-contracts --grep "rate limiting"
 
-1. Skill checks observation_state for session abc123
-2. If observations exist (entry_count > 0):
-   a. Check if source JSONL has grown since last observation
-   b. If yes: run observer on new bytes (incremental catch-up)
-   c. Read observations/abc123.jsonl
-3. If NO observations exist:
-   a. Run observer on full session (from byte 0)
-   b. Observer writes observations/abc123.jsonl
-   c. Read the freshly-written observations
-4. Format observations into handoff brief:
-   - Short sets: format directly without another LLM call
-   - Large sets: spawns Haiku sub-agent for final polish/compression
-5. Brief injected into current conversation (~30-50 lines)
-
-With --full flag:
-   Sub-agent produces comprehensive handoff with rationale,
-   code references, and conversation excerpts.
+1. CLI resolves the session (name or id) and finds matching exchanges
+2. Prints them verbatim — tool results, sidechains, and system-reminders
+   stripped; source labels (session, project, timestamp) included
+3. The output lands in the conversation; the model can work with it
 ```
 
-The observer function is the same regardless of entry point.
-A session observed incrementally over 2 hours produces identical
-observations to one observed in a single shot at handoff time.
-
-### Skill 3: `/threadhop:observe` (instant, spawns background process)
-
-Per-session opt-in for background observation (ADR-016). The user decides
-which conversations are worth observing. Can be invoked at any point —
-beginning or mid-conversation.
+### Command: `/threadhop:prepare` (the one LLM call)
 
 ```
-User (in Claude Code): /threadhop:observe
+User (in chat A): !threadhop prepare
 
-1. Skill detects current session ID from process context
-2. Checks if observer is already running for this session
-   - If yes: "Already observing this session."
-3. Spawns observer as background process:
-   threadhop observe --session <session_id> &
-4. Observer performs retroactive catch-up:
-   - Reads entire JSONL from byte 0
-   - Processes all existing messages through Haiku
-   - Extracts typed observations (todo | decision | done | adr | observation)
-5. Observer switches to watch mode (fsevents / polling)
-6. Confirms: "Observing this session. 47 messages processed retroactively
-   — found 5 decisions, 3 TODOs, 1 ADR. Watching for new messages."
-7. User continues working — observer runs silently
+1. Auto-detects the current session; splits the transcript into head +
+   last 3 exchanges (tail), per ADR-032
+2. transfer_state cache: only new bytes since the last prepare are
+   summarized, merged with the cached summary in the same call (ADR-033)
+3. ONE `claude -p --model haiku` via harness `run_claude_p` with
+   `prompts/prepare.md`
+4. Writes ~/.config/threadhop/transfers/tk_<8hex>.md
+5. Prints: Paste in the target chat: !threadhop receive tk_<8hex>
 ```
 
-### Skill 4: `/threadhop:insights` (instant, no LLM)
-
-Pull-based context injection for observations and conflicts (ADR-016).
-Reads from the observer's output files and formats findings into the
-current conversation.
+### Command: `/threadhop:receive` (zero LLM)
 
 ```
-User (in Claude Code): /threadhop:insights
+User (in chat B — Claude Code, Codex, any tool with a shell):
+  !threadhop receive tk_3f9a1c2e
 
-1. Skill detects current session ID
-2. Reads observations/<session_id>.jsonl (single file contains all
-   observation types including conflicts appended by the reflector)
-3. Formats and presents:
-
-   ┌─ ThreadHop Observations — this session ───────────────┐
-   │ DECISIONS:                                             │
-   │  • REST for client API (rationale: SDK constraints)    │
-   │  • Token bucket for rate limiting                      │
-   │ TODOs:                                                 │
-   │  • Implement /workflows endpoint                       │
-   │  • Write integration tests for auth flow               │
-   │ ADRs:                                                  │
-   │  • ADR-003: Chunk merging for assistant messages        │
-   │ CONFLICTS:                                             │
-   │  ⚠ Session "infra-design" decided "gRPC for all        │
-   │    services" — contradicts "REST for client API" above  │
-   └────────────────────────────────────────────────────────┘
-
-5. The model now has this context and can work with it
+1. Reads the frozen ticket file
+2. Prints it verbatim — narrative head summary + verbatim tail with
+   source labels
+3. The target model now has the transfer context
 ```
 
-`/threadhop:insights` without an observed session shows nothing useful.
-It reads from per-session observation files that only exist because
-the observer ran (via `/threadhop:observe`, handoff, or CLI). Conflict
-entries from the reflector appear inline as `type: "conflict"` — no
-separate file to read. This coupling is intentional — no observation,
-no insights.
+### Context flows (TUI clipboard, prepare → receive)
 
-### Context injection flow (TUI → clipboard → skill)
-
-The full workflow for carrying context between sessions:
+Flow 1 — visual grab (TUI → clipboard → `/threadhop:copy`):
 
 ```
 1. Open ThreadHop TUI
@@ -2045,16 +1359,26 @@ The full workflow for carrying context between sessions:
 3. Enter message select mode (m)
 4. Select messages visually (j/k to move, v for range)
 5. Press y → copied to clipboard with source labels
-6. Switch to Claude Code session
-7. Type /threadhop:context → clipboard content formatted and injected
+6. Switch to the target chat
+7. /threadhop:copy → clipboard content formatted and injected
 ```
 
-For larger exports:
+Flow 2 — continuation transfer (prepare → receive, ADR-032):
+
+```
+Chat A:  !threadhop prepare
+         → one Haiku call → ~/.config/threadhop/transfers/tk_3f9a1c2e.md
+         → prints: Paste in the target chat: !threadhop receive tk_3f9a1c2e
+
+Chat B:  !threadhop receive tk_3f9a1c2e
+         → ticket printed verbatim: summary head + verbatim tail. Zero LLM.
+```
+
+For larger visual exports:
 ```
 5. Press e → exported to /tmp/threadhop/<id>-<ts>.md
-6. In Claude Code: "Read /tmp/threadhop/..."
+6. In the target chat: "Read /tmp/threadhop/..."
 ```
-
 ---
 
 ## TODO
@@ -2080,51 +1404,33 @@ For larger exports:
 - [ ] Jump-to-source from search results (`Enter`)
 - [ ] Search filter syntax: `project:`, `user:`, `assistant:`
 - [ ] Context-aware help overlay + shared command metadata registry
+- [ ] Exchange grouping in the indexer (ADR-030, Q8)
+- [ ] `threadhop search <query> [--project] [--json]` CLI subcommand
 
-### Phase 3: CLI + Observer (on-demand + background)
+### Phase 3: Borrow CLI — peek / search / prepare / receive (ADR-030–ADR-033)
 - [ ] Add argparse subcommand routing (no subcommand = TUI)
 - [ ] Implement `threadhop tag <status> [--session <id>]`
 - [ ] Session auto-detection from current terminal (ps/lsof)
-- [ ] Create reusable observer prompt (`~/.config/threadhop/prompts/observer.md`)
-- [ ] Add `observation_state` table to SQLite schema (ADR-019)
-- [ ] Observer core function: `claude -p --model haiku --permission-mode acceptEdits` (ADR-018)
-- [ ] Per-session observation files at `~/.config/threadhop/observations/<session_id>.jsonl` (ADR-019)
-- [ ] Incremental processing (byte offset tracking in `observation_state` table)
-- [ ] Background observer mode: `threadhop observe --session <id>` sidecar (ADR-015)
-- [ ] File-watching via fsevents (macOS) with polling fallback
-- [ ] Batched extraction: trigger on ~3-4 new messages
-- [ ] Observer stop/resume lifecycle: `--stop`, `--stop-all`, PID tracking (ADR-019)
-- [ ] Stale PID detection via `kill -0 $PID`
-- [ ] `threadhop todos [--project]` CLI query
-- [ ] `threadhop decisions [--project]` CLI query
-- [ ] `threadhop observations [--project]` CLI query
-- [ ] `threadhop conflicts [--project]` CLI query (reads `type: "conflict"` entries)
+- [ ] Exchange parser (ADR-030)
+- [ ] `threadhop peek <session> [--last N] [--range A:B] [--grep X]` — exchange-bounded, stripped, source-labelled
+- [ ] `threadhop search <query> [--project] [--json]` CLI over the FTS index
+- [ ] `threadhop prepare` — head/tail split, ONE `claude -p` via harness `run_claude_p` (ADR-032)
+- [ ] `prompts/prepare.md` prompt template
+- [ ] `transfer_state` caching: new-bytes-only summarization + cached-summary merge (ADR-033)
+- [ ] `threadhop receive <ticket>` — verbatim print, zero LLM
+- [ ] Transfers directory: `~/.config/threadhop/transfers/`
+- [ ] Migration: drop `observation_state` (ADR-033)
 
-### Phase 4: Skills + TUI Observation Indicator (ADR-012, ADR-016, ADR-021)
-- [ ] Research Claude Code skill plugin packaging
-- [ ] `!threadhop tag <status>` bash-passthrough workflow — README doc + optional UserPromptSubmit hook (ADR-013; replaces the former `/threadhop:tag` skill)
-- [ ] `/threadhop:context` skill (clipboard formatting + injection)
-- [ ] `/threadhop:handoff <id> [--full]` skill (runs observer first if needed, formats from observations)
-- [ ] `/threadhop:observe` skill (per-session opt-in, spawns background observer)
-- [ ] `/threadhop:insights` skill (reads unified per-session observation file)
-- [ ] TUI observation indicator: 🗒 icon next to observed sessions (ADR-021)
-- [ ] Transcript header: entry count + observation file path (ADR-021)
-- [ ] `o` key: copy observation path / start observing (ADR-021)
-- [ ] `O` key: resume observation on stopped session (ADR-021)
+### Phase 4: Plugin refresh (ADR-029, ADR-031, ADR-032)
+- [ ] Six commands, zero skills: `tag`, `bookmark`, `copy`, `peek`, `prepare`, `receive` — all `!threadhop …` pre-executed passthroughs
+- [ ] Remove the `handoff` skill and `observe` command from the plugin
+- [ ] `argument-hint` frontmatter for all six commands
+- [ ] README: borrow spectrum + prepare → receive flow
 
 ### Phase 5: Memory + Bookmarks
 - [ ] Build bookmark system (shared ingest primitive + TUI/browser surfaces)
-- [ ] Explicit annotation detection (ADR:, DECISION:, TODO: markers)
-- [ ] Project memory markdown rendering from observations
-
-### Phase 6: Reflector — Conflict Detection (ADR-015, ADR-020, ADR-022)
-- [ ] Create reflector prompt (`prompts/reflector.md`) — dedup, structured conflict format
-- [ ] Build reflector core function — second `claude -p` call, reads observation layer
-- [ ] Observer-triggered reflector — spawns when `entry_count - reflector_entry_offset >= 5`
-- [ ] On-demand reflector — runs as follow-up after observer in CLI queries and handoff
-- [ ] TUI notification for unreviewed `type: "conflict"` entries
-- [ ] Condensation: merge related decisions, archive completed TODOs
-- [ ] Trigram-based fuzzy search for typo tolerance
+- [ ] Explicit annotation detection (ADR:, DECISION:, TODO: markers) — writes directly to the `memory` table
+- [ ] Project memory markdown rendering from the `memory` table
 
 ---
 
@@ -2145,14 +1451,8 @@ metadata). Per-feature requires explicit tagging of sessions to features.
 is essentially a tag that groups sessions and memory entries across projects.
 
 ### Q3: Observer trigger — when does auto-observation run?
-**Revised (ADR-015 supersedes original resolution):** Two modes:
-- **On-demand (ADR-010):** CLI query or TUI launch triggers observation of
-  unprocessed messages. `threadhop todos` processes first, then displays.
-- **Background (ADR-015):** `threadhop observe` runs as a sidecar process,
-  watching the active session's JSONL via fsevents. Enabled as a flag,
-  similar to Claude Code's remote control mode. The Claude Code terminal
-  does NOT pause — the observer is a background process, not a daemon.
-Both modes coexist. Background mode is additive — on-demand still works.
+**Superseded by ADR-029 (2026-08-27).** The observer is removed — there is
+no auto-observation to trigger. Body removed — see git history.
 
 ### Q4: Skill plugin packaging — **RESOLVED (2026-04-19)**
 See [`skill-packaging.md`](skill-packaging.md) for the full writeup.
@@ -2173,9 +1473,24 @@ contents, command output) and would dominate search with noise.
 find themselves wanting to search "what was the output of that command."
 
 ### Q6: Handoff sub-agent model
-**Resolved:** Haiku for the observer (fast, cheap, structured extraction).
-Handoff skill defaults to Haiku for speed (~200ms, ~$0.25/MTok). `--full` flag
-can use a stronger model. Configurable via CLI flag or config. See ADR-010.
+**Superseded by ADR-029 (2026-08-27).** Observer-backed handoff is removed;
+the one LLM call is `threadhop prepare` (default Haiku, `--model` flag —
+ADR-032). Body removed — see git history.
+
+### Q7: Push/mailbox — should `threadhop send` exist?
+Should `threadhop send <session> "note"` exist — push a note into another
+session's mailbox, with pull-based delivery into the target chat — or is
+push out of scope? prepare/receive covers continuation and peek covers
+lookup; a mailbox adds a delivery-state machine for an unproven need.
+**Leaning:** out of scope until a concrete workflow demands it.
+
+### Q8: Materialize exchange_id or derive at parse time?
+Should `exchange_id` be stamped into the `messages` table at index time,
+or always derived structurally at parse time (ADR-030)? Stamping makes
+exchange-grouped search results a plain GROUP BY; deriving keeps the
+schema smaller and leaves the parser as the single source of truth.
+**Leaning:** derive for v1; stamp when FTS result grouping demonstrably
+needs it.
 
 ---
 

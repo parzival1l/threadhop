@@ -40,7 +40,7 @@ DB_PATH = DB_DIR / "sessions.db"
 # --- Schema version ---
 # Each migration N in MIGRATIONS moves the DB from version N to N+1.
 # The DB's current version lives in PRAGMA user_version.
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 11
 
 
 # --- Migrations -----------------------------------------------------------
@@ -529,6 +529,46 @@ def _migration_008_trigram_search(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_010_drop_observation_layer(conn: sqlite3.Connection) -> None:
+    """ADR-029: drop the speculative background-observation layer.
+
+    The observer/reflector/handoff architecture is removed in favor of a
+    lazy transfer flow (peek/search/prepare/receive). This drops the two
+    tables that only that layer wrote. Migrations 004 and 005 remain in
+    the sequence for databases that never upgraded past them; on such
+    DBs the tables are created and immediately dropped here.
+    """
+    conn.execute("DROP TABLE IF EXISTS observation_state")
+    conn.execute("DROP TABLE IF EXISTS conflict_reviews")
+
+
+def _migration_011_transfer_state(conn: sqlite3.Connection) -> None:
+    """ADR-033: per-session summary cache for ``threadhop prepare``.
+
+    ``prepare`` compresses the conversation head via one Haiku call.
+    This table lets repeat invocations reuse the previous summary:
+
+    * ``source_byte_offset`` — byte position in the source JSONL one
+      past the last exchange covered by ``cached_summary`` (see
+      ``upsert_transfer_state`` for the exact definition).
+    * ``cached_summary`` — the last successful head summary.
+
+    No FK to ``sessions`` on purpose: prepare can run against a session
+    the TUI has never scanned, and a stale cache row for a deleted
+    session is harmless.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS transfer_state (
+            session_id         TEXT PRIMARY KEY,
+            source_byte_offset INTEGER NOT NULL DEFAULT 0,
+            cached_summary     TEXT,
+            updated_at         REAL
+        )
+        """
+    )
+
+
 # Ordered list; MIGRATIONS[i] moves schema from version i to i+1.
 MIGRATIONS: list = [
     _migration_001_initial,
@@ -540,6 +580,8 @@ MIGRATIONS: list = [
     _migration_007_bookmarks,
     _migration_008_trigram_search,
     _migration_009_bookmark_kinds_and_notes,
+    _migration_010_drop_observation_layer,
+    _migration_011_transfer_state,
 ]
 
 assert len(MIGRATIONS) == SCHEMA_VERSION, (
@@ -919,6 +961,53 @@ def delete_session_messages(conn: sqlite3.Connection, session_id: str) -> None:
     conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
 
 
+# --- Transfer-state helpers (ADR-033) ---------------------------------------
+
+
+def get_transfer_state(
+    conn: sqlite3.Connection,
+    session_id: str,
+) -> dict | None:
+    """Return the ``prepare`` summary cache row for a session, or None."""
+    return query_one(
+        conn,
+        "SELECT * FROM transfer_state WHERE session_id = ?",
+        (session_id,),
+    )
+
+
+def upsert_transfer_state(
+    conn: sqlite3.Connection,
+    session_id: str,
+    source_byte_offset: int,
+    cached_summary: str,
+    updated_at: float,
+) -> None:
+    """Insert or update the ``prepare`` summary cache for a session.
+
+    **Offset definition:** ``source_byte_offset`` is the byte offset in
+    the source JSONL one past the final line (including its trailing
+    newline) of the *last head exchange* covered by ``cached_summary``.
+    Equivalently: every exchange whose first JSONL line starts at an
+    offset ``< source_byte_offset`` is already reflected in the summary;
+    exchanges starting at ``>= source_byte_offset`` are new head content
+    the next ``prepare`` must fold in via a merge call. JSONL files are
+    append-only, so the boundary only moves forward.
+    """
+    conn.execute(
+        """
+        INSERT INTO transfer_state (
+            session_id, source_byte_offset, cached_summary, updated_at
+        ) VALUES (?, ?, ?, ?)
+        ON CONFLICT(session_id) DO UPDATE SET
+            source_byte_offset = excluded.source_byte_offset,
+            cached_summary     = excluded.cached_summary,
+            updated_at         = excluded.updated_at
+        """,
+        (session_id, source_byte_offset, cached_summary, updated_at),
+    )
+
+
 # --- One-time config.json → SQLite migration (ADR-001) --------------------
 # Runs on first startup. Moves session-level keys out of config.json into
 # the `sessions` table. Keeps `theme` (and any future app-level keys like
@@ -990,25 +1079,16 @@ def get_session_sidebar_metadata(
 ) -> dict[str, dict[str, object]]:
     """Return bulk sidebar state for every known session.
 
-    The TUI refresh loop uses this to stamp persisted session status and
-    the ADR-021 observation indicator bit in one query, instead of
-    issuing row-by-row lookups during the 5-second refresh cycle.
+    The TUI refresh loop uses this to stamp persisted session status in
+    one query, instead of issuing row-by-row lookups during the
+    5-second refresh cycle.
     """
     rows = conn.execute(
-        """
-        SELECT
-            s.session_id,
-            s.status,
-            CASE WHEN COALESCE(os.entry_count, 0) > 0 THEN 1 ELSE 0 END
-                AS has_observations
-        FROM sessions s
-        LEFT JOIN observation_state os ON os.session_id = s.session_id
-        """
+        "SELECT session_id, status FROM sessions"
     ).fetchall()
     return {
         row["session_id"]: {
             "status": row["status"],
-            "has_observations": bool(row["has_observations"]),
         }
         for row in rows
     }
@@ -1254,259 +1334,6 @@ def migrate_config_json_to_sqlite(
             }
 
     return {"action": "migrated", "migrated": migrated, "skipped": skipped}
-
-
-# --- Observation state helpers (ADR-019, ADR-022) --------------------------
-
-# Directory where per-session observation JSONL files live.
-OBS_DIR = DB_DIR / "observations"
-
-
-def get_observation_state(
-    conn: sqlite3.Connection,
-    session_id: str,
-) -> dict | None:
-    """Return the observation state for a session, or None if never observed."""
-    return query_one(
-        conn,
-        "SELECT * FROM observation_state WHERE session_id = ?",
-        (session_id,),
-    )
-
-
-def upsert_observation_state(
-    conn: sqlite3.Connection,
-    session_id: str,
-    source_path: str,
-    obs_path: str,
-    *,
-    source_byte_offset: int = 0,
-    entry_count: int = 0,
-    reflector_entry_offset: int = 0,
-    observer_pid: int | None = None,
-    status: str = "idle",
-    started_at: float | None = None,
-    last_observed_at: float | None = None,
-) -> None:
-    """Insert or update the observation state for a session.
-
-    On conflict, updates all mutable fields. The caller controls which
-    fields to advance — typically ``source_byte_offset`` and ``entry_count``
-    after an observer run, or ``observer_pid`` and ``status`` on start/stop.
-    """
-    conn.execute(
-        """
-        INSERT INTO observation_state (
-            session_id, source_path, obs_path,
-            source_byte_offset, entry_count, reflector_entry_offset,
-            observer_pid, status, started_at, last_observed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(session_id) DO UPDATE SET
-            source_path            = excluded.source_path,
-            obs_path               = excluded.obs_path,
-            source_byte_offset     = excluded.source_byte_offset,
-            entry_count            = excluded.entry_count,
-            reflector_entry_offset = excluded.reflector_entry_offset,
-            observer_pid           = excluded.observer_pid,
-            status                 = excluded.status,
-            started_at             = COALESCE(excluded.started_at, observation_state.started_at),
-            last_observed_at       = COALESCE(excluded.last_observed_at, observation_state.last_observed_at)
-        """,
-        (
-            session_id, source_path, obs_path,
-            source_byte_offset, entry_count, reflector_entry_offset,
-            observer_pid, status, started_at, last_observed_at,
-        ),
-    )
-
-
-def update_observer_offset(
-    conn: sqlite3.Connection,
-    session_id: str,
-    source_byte_offset: int,
-    entry_count: int,
-    last_observed_at: float,
-) -> None:
-    """Advance the observer's position after processing a chunk.
-
-    Called after each observer extraction. Updates the byte offset (where
-    to resume reading source JSONL) and entry count (how many observations
-    have been written so far).
-    """
-    conn.execute(
-        """
-        UPDATE observation_state
-        SET source_byte_offset = ?,
-            entry_count        = ?,
-            last_observed_at   = ?
-        WHERE session_id = ?
-        """,
-        (source_byte_offset, entry_count, last_observed_at, session_id),
-    )
-
-
-def update_reflector_offset(
-    conn: sqlite3.Connection,
-    session_id: str,
-    reflector_entry_offset: int,
-    *,
-    entry_count: int | None = None,
-) -> None:
-    """Advance the reflector's position after a comparison pass.
-
-    The reflector processes observation entries (not source bytes), so its
-    offset is an entry index, not a byte offset.
-    """
-    if entry_count is None:
-        conn.execute(
-            """
-            UPDATE observation_state
-            SET reflector_entry_offset = ?
-            WHERE session_id = ?
-            """,
-            (reflector_entry_offset, session_id),
-        )
-        return
-    conn.execute(
-        """
-        UPDATE observation_state
-        SET reflector_entry_offset = ?,
-            entry_count = ?
-        WHERE session_id = ?
-        """,
-        (reflector_entry_offset, entry_count, session_id),
-    )
-
-
-def set_observer_running(
-    conn: sqlite3.Connection,
-    session_id: str,
-    pid: int,
-    started_at: float,
-) -> None:
-    """Record that the observer is now running for this session."""
-    conn.execute(
-        """
-        UPDATE observation_state
-        SET observer_pid = ?, status = 'running', started_at = ?
-        WHERE session_id = ?
-        """,
-        (pid, started_at, session_id),
-    )
-
-
-def set_observer_stopped(
-    conn: sqlite3.Connection,
-    session_id: str,
-) -> None:
-    """Record that the observer has stopped (graceful or detected stale)."""
-    conn.execute(
-        """
-        UPDATE observation_state
-        SET observer_pid = NULL, status = 'stopped'
-        WHERE session_id = ?
-        """,
-        (session_id,),
-    )
-
-
-def delete_observation_state(
-    conn: sqlite3.Connection,
-    session_id: str,
-) -> int:
-    """Remove the observation_state row so the next run starts at offset 0.
-
-    Returns the number of rows deleted (0 if no row existed).
-    The on-disk observation JSONL is NOT touched — callers decide
-    whether to wipe it.
-    """
-    cur = conn.execute(
-        "DELETE FROM observation_state WHERE session_id = ?",
-        (session_id,),
-    )
-    return cur.rowcount
-
-
-def get_observed_sessions(
-    conn: sqlite3.Connection,
-) -> list[dict]:
-    """Return all sessions that have observations (entry_count > 0).
-
-    Used by the TUI to show the observation indicator (ADR-021).
-    """
-    return query_all(
-        conn,
-        "SELECT session_id, entry_count, status, observer_pid, obs_path "
-        "FROM observation_state WHERE entry_count > 0",
-    )
-
-
-def get_running_observers(
-    conn: sqlite3.Connection,
-) -> list[dict]:
-    """Return all sessions with a running observer (for --stop-all)."""
-    return query_all(
-        conn,
-        "SELECT session_id, observer_pid "
-        "FROM observation_state WHERE status = 'running' AND observer_pid IS NOT NULL",
-    )
-
-
-def _normalize_conflict_refs(refs: Sequence[str] | None) -> str:
-    """Canonicalize a refs pair so review keys match prompt dedup semantics."""
-    if not refs:
-        return ""
-    cleaned = sorted({str(ref).strip() for ref in refs if str(ref).strip()})
-    return "\x1f".join(cleaned)
-
-
-def is_conflict_reviewed(
-    conn: sqlite3.Connection,
-    session_id: str,
-    refs: Sequence[str] | None,
-    topic: str | None,
-) -> bool:
-    """Return True when this conflict has already been marked reviewed."""
-    row = query_one(
-        conn,
-        """
-        SELECT 1
-        FROM conflict_reviews
-        WHERE session_id = ? AND refs_key = ? AND topic = ?
-        """,
-        (session_id, _normalize_conflict_refs(refs), (topic or "")),
-    )
-    return row is not None
-
-
-def mark_conflict_reviewed(
-    conn: sqlite3.Connection,
-    session_id: str,
-    refs: Sequence[str] | None,
-    topic: str | None,
-    *,
-    reviewed_at: float | None = None,
-) -> None:
-    """Mark a conflict as reviewed.
-
-    Uses INSERT .. ON CONFLICT so repeated reviews simply refresh the
-    timestamp without creating duplicates.
-    """
-    conn.execute(
-        """
-        INSERT INTO conflict_reviews (
-            session_id, refs_key, topic, reviewed_at
-        ) VALUES (?, ?, ?, ?)
-        ON CONFLICT(session_id, refs_key, topic) DO UPDATE SET
-            reviewed_at = excluded.reviewed_at
-        """,
-        (
-            session_id,
-            _normalize_conflict_refs(refs),
-            (topic or ""),
-            reviewed_at if reviewed_at is not None else datetime.now().timestamp(),
-        ),
-    )
 
 
 # --- Bookmarks ------------------------------------------------------------

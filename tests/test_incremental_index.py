@@ -205,8 +205,8 @@ def test_skips_command_only_user_lines(conn, tmp_path):
 def test_skips_skill_load_banner_user_lines(conn, tmp_path):
     """Skill-load banners inject the entire skill body as a user line.
 
-    Indexing them buries real prose under boilerplate and feeds the
-    Haiku observer pages of skill markdown to extract trivia from. The
+    Indexing them buries real prose under boilerplate — pages of skill
+    markdown drown out the words the user actually typed. The
     SKILL_LOAD_BANNER_RE detection in ``clean_user_text`` collapses the
     whole line to empty.
     """

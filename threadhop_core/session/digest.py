@@ -170,7 +170,7 @@ class SessionDigest:
 
     # Models actually used in this session, in first-seen order. Useful
     # when a session has both Opus turns (chat) and Haiku turns
-    # (observer/skill subcalls).
+    # (skill subcalls).
     models_used: list[str] = field(default_factory=list)
 
     # Footer

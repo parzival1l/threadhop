@@ -13,15 +13,14 @@ import re
 import sys
 
 from .. import __version__
-from ..observation import observer
 from ..storage import db
 from .helpers import _resolve_cli_session  # noqa: F401  — re-exported for legacy callers
 
 
 class _SuggestingParser(argparse.ArgumentParser):
     """ArgumentParser that offers a did-you-mean hint when the user supplies
-    an unknown subcommand or enum value. Example: `threadhop obsrve` →
-    \"unknown value 'obsrve'. Did you mean 'observe'?\"."""
+    an unknown subcommand or enum value. Example: `threadhop bookmrk` →
+    \"unknown value 'bookmrk'. Did you mean 'bookmark'?\"."""
 
     _INVALID_CHOICE_RE = re.compile(
         r"invalid choice: '([^']+)' \(choose from (.+?)\)"
@@ -50,9 +49,6 @@ class _SuggestingParser(argparse.ArgumentParser):
 
 
 def build_parser():
-    # Lazy import so the parser module remains import-cheap.
-    from ..config.loader import CLI_CONFIG_KEYS  # noqa: PLC0415
-
     # No-subcommand path keeps the original TUI flags (--project/--days/--all).
     # Subcommands route to CLI mode and share --project/--session via a parent
     # parser (ADR-011).
@@ -61,15 +57,15 @@ def build_parser():
         description=(
             "ThreadHop — Claude Code session browser.\n"
             "  No subcommand  → launch the TUI.\n"
-            "  Subcommand     → CLI mode (tag, bookmark, todos, decisions, observations, conflicts)."
+            "  Subcommand     → CLI mode (tag, bookmark, copy, peek, "
+            "search, prepare, receive, update)."
         ),
         epilog=(
             "Examples:\n"
             "  threadhop                                  # launch the TUI\n"
             "  threadhop --project myproject --days 7     # TUI, filtered by project\n"
             "  threadhop tag in_progress                  # tag the current session\n"
-            "  threadhop observe --session abc123         # start the observer sidecar\n"
-            "  threadhop handoff abc123                   # produce a handoff brief\n"
+            "  threadhop copy 3                           # copy the last 3 turns\n"
             "\n"
             "Run `threadhop <command> --help` for subcommand-specific examples."
         ),
@@ -211,264 +207,172 @@ def build_parser():
         ),
     )
 
-    subparsers.add_parser(
-        "todos",
-        parents=[shared],
-        help="List open TODOs from project memory",
-        description="List open TODOs. Use --project to filter.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Examples:\n"
-            "  threadhop todos\n"
-            "  threadhop todos --project myproject"
-        ),
-    )
+    # --- Lazy borrow surface (ADR-029): peek / search / prepare / receive ---
 
-    subparsers.add_parser(
-        "decisions",
-        parents=[shared],
-        help="List decisions from project memory",
-        description="List decisions. Use --project to filter.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Examples:\n"
-            "  threadhop decisions\n"
-            "  threadhop decisions --project myproject"
-        ),
-    )
-
-    subparsers.add_parser(
-        "observations",
-        parents=[shared],
-        help="Dump observations JSONL, newest first",
+    peek_p = subparsers.add_parser(
+        "peek",
+        help="Print cleaned exchanges from another session (zero LLM)",
         description=(
-            "Dump all observation entries as raw JSON lines, newest first. "
-            "Reads per-session files under ~/.config/threadhop/observations/ "
-            "and uses SQLite session metadata for --project filtering."
+            "Print cleaned verbatim messages from another Claude Code "
+            "session — zero LLM, zero writes. The unit is the exchange "
+            "(ADR-030): one real user turn plus all assistant activity "
+            "until the next real user turn. Tool calls, tool results, "
+            "sidechains, and system reminders are stripped; only user "
+            "and assistant prose survives. <session> is a full session "
+            "id or any unique prefix."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  threadhop observations\n"
-            "  threadhop observations --session abc123\n"
-            "  threadhop observations --project myproject | jq '.topic'"
+            "  threadhop peek 41f3                         # last 5 exchanges\n"
+            "  threadhop peek 41f3 --last 10\n"
+            "  threadhop peek 41f3 --range 3:7             # 1-based inclusive\n"
+            "  threadhop peek 41f3 --grep 'retry.*backoff' # matching exchanges, in full\n"
+            "  !threadhop peek 41f3 --last 3    # from inside a Claude Code session"
         ),
     )
-
-    conflicts_p = subparsers.add_parser(
-        "conflicts",
-        parents=[shared],
-        help="List unresolved cross-session decision conflicts",
-        description=(
-            "List decision conflicts detected by the reflector. "
-            "Uses --project to filter and --resolved to mark the displayed "
-            "conflicts as reviewed."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Examples:\n"
-            "  threadhop conflicts\n"
-            "  threadhop conflicts --project myproject\n"
-            "  threadhop conflicts --resolved       # mark displayed conflicts as reviewed"
-        ),
+    peek_p.add_argument(
+        "session_ref",
+        metavar="<session>",
+        help="Session id or unique prefix to read from",
     )
-    conflicts_p.add_argument(
-        "--resolved",
-        action="store_true",
-        default=False,
-        help="Mark the displayed conflicts as reviewed",
-    )
-
-    observe_p = subparsers.add_parser(
-        "observe",
-        parents=[shared],
-        help="Run the background observer sidecar for a session",
-        description=(
-            "Run the observer sidecar for a session. The process performs an "
-            "initial catch-up extraction, then watches the transcript for new "
-            "messages, appends observations into "
-            "~/.config/threadhop/observations/<id>.jsonl, and triggers the "
-            "reflector when enough new observations accumulate. Use --once "
-            "for the old on-demand single-pass mode."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Examples:\n"
-            "  threadhop observe --session abc123                 # start resident sidecar\n"
-            "  threadhop observe --session abc123 --once          # single extraction pass\n"
-            "  threadhop observe --session abc123 --stop          # stop this session's observer\n"
-            "  threadhop observe --stop-all                       # stop every running observer\n"
-            "  threadhop observe --session abc123 --model sonnet  # use a stronger extractor\n"
-            "  threadhop observe --session abc123 --reset         # wipe state and restart"
-        ),
-    )
-    mode_group = observe_p.add_mutually_exclusive_group()
-    mode_group.add_argument(
-        "--once",
-        action="store_true",
-        help="Run a single observation pass and exit",
-    )
-    mode_group.add_argument(
-        "--stop",
-        action="store_true",
-        help="Stop the observer for this session",
-    )
-    mode_group.add_argument(
-        "--stop-all",
-        action="store_true",
-        help="Stop every running observer",
-    )
-    observe_p.add_argument(
-        "--batch-threshold",
+    peek_window = peek_p.add_mutually_exclusive_group()
+    peek_window.add_argument(
+        "--last",
         type=int,
-        default=observer.BATCH_THRESHOLD,
+        default=None,
+        metavar="N",
+        help="Show the last N exchanges (default: 5)",
+    )
+    peek_window.add_argument(
+        "--range",
+        type=str,
+        default=None,
+        metavar="A:B",
+        help="Show exchanges A through B (1-based, inclusive)",
+    )
+    peek_window.add_argument(
+        "--grep",
+        type=str,
+        default=None,
+        metavar="PATTERN",
         help=(
-            f"Minimum new message turns before extraction runs "
-            f"(default {observer.BATCH_THRESHOLD}). Lower for demos."
+            "Case-insensitive regex; prints every matching exchange in "
+            "full (the window is exchange-bounded)"
         ),
     )
-    observe_p.add_argument(
-        "--poll-interval",
-        type=float,
-        default=observer.WATCH_POLL_INTERVAL_SEC,
-        help=(
-            "Watcher fallback poll interval in seconds "
-            f"(default {observer.WATCH_POLL_INTERVAL_SEC})."
+
+    search_p = subparsers.add_parser(
+        "search",
+        help="Full-text search across every indexed session",
+        description=(
+            "Search all sessions via the same FTS5 index the TUI search "
+            "panel uses (porter-stemmed prefix match, trigram fuzzy "
+            "fallback on zero hits). Runs a fast incremental index "
+            "refresh first so results include messages written since "
+            "the TUI last ran."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  threadhop search 'retry backoff'\n"
+            "  threadhop search migration --project threadhop --limit 5\n"
+            "  threadhop search sqlite --json"
         ),
     )
-    observe_p.add_argument(
-        "--watch-backend",
-        choices=[
-            observer.WATCH_BACKEND_AUTO,
-            observer.WATCH_BACKEND_POLL,
-            observer.WATCH_BACKEND_FSEVENTS,
-        ],
-        default=observer.WATCH_BACKEND_AUTO,
-        help="Watch backend for background mode (default: auto).",
+    search_p.add_argument(
+        "query",
+        metavar="<query>",
+        help="Search terms (stemmed prefix match, AND-combined)",
     )
-    observe_p.add_argument(
+    search_p.add_argument(
+        "--project",
+        type=str,
+        default=None,
+        help="Filter by project (substring match on directory name)",
+    )
+    search_p.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        metavar="N",
+        help="Maximum hits to print (default: 20)",
+    )
+    search_p.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="Emit results as a JSON list instead of text blocks",
+    )
+
+    prepare_p = subparsers.add_parser(
+        "prepare",
+        parents=[shared],
+        help="Freeze this session into a transfer ticket (one Haiku call)",
+        description=(
+            "Build a frozen transfer ticket for continuing this "
+            "session's work in another chat. At most one `claude -p` "
+            "call summarizes the conversation head (cached per session "
+            "— an unchanged head reuses the previous summary with zero "
+            "LLM calls); the last N exchanges are kept verbatim, capped "
+            "by --tail-budget. Prints the ticket path plus a paste-ready "
+            "`!threadhop receive tk_<id>` line."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  threadhop prepare                    # auto-detect current session\n"
+            "  threadhop prepare --session 41f3a2b8-...\n"
+            "  threadhop prepare --tail 5 --tail-budget 12000\n"
+            "  !threadhop prepare        # from inside a Claude Code session"
+        ),
+    )
+    prepare_p.add_argument(
+        "--tail",
+        type=int,
+        default=3,
+        metavar="N",
+        help="Exchanges to carry verbatim (default: 3)",
+    )
+    prepare_p.add_argument(
+        "--tail-budget",
+        type=int,
+        default=8000,
+        metavar="CHARS",
+        help=(
+            "Character cap for the verbatim tail; oldest tail exchanges "
+            "are dropped first (default: 8000)"
+        ),
+    )
+    prepare_p.add_argument(
         "--model",
+        type=str,
         default="haiku",
-        help=(
-            "Model to pass to `claude -p --model` (default: haiku). "
-            "Use 'sonnet' or 'opus' to get a stronger extractor."
-        ),
-    )
-    observe_p.add_argument(
-        "--claude-bin",
-        type=str,
-        default="claude",
-        help="Path to the claude CLI binary used for observer/reflector runs",
-    )
-    observe_p.add_argument(
-        "--timeout",
-        type=float,
-        default=observer.DEFAULT_TIMEOUT_SEC,
-        help=(
-            "Timeout in seconds for each observer/reflector claude call "
-            f"(default {observer.DEFAULT_TIMEOUT_SEC})."
-        ),
-    )
-    observe_p.add_argument(
-        "--reset",
-        action="store_true",
-        help=(
-            "Delete the observation_state row and the on-disk observations "
-            "JSONL for this session before running, so extraction restarts "
-            "from byte 0 with a clean output file."
-        ),
+        metavar="M",
+        help="Model passed to `claude -p` for the head summary (default: haiku)",
     )
 
-    config_p = subparsers.add_parser(
-        "config",
-        help="Read or update app-level config values",
+    receive_p = subparsers.add_parser(
+        "receive",
+        help="Print a transfer ticket verbatim (zero LLM)",
         description=(
-            "Read or update settings stored in "
-            "~/.config/threadhop/config.json. Currently the supported "
-            "CLI-managed key is `observe.enabled`, a durable flag for "
-            "hook-driven observer auto-start."
+            "Print a ThreadHop transfer ticket to stdout so this chat "
+            "can pick up where another session left off — zero LLM, "
+            "zero DB. Accepts the ticket id printed by `threadhop "
+            "prepare` (tk_xxxxxxxx or bare xxxxxxxx) or a file path."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  threadhop config get observe.enabled\n"
-            "  threadhop config set observe.enabled true\n"
-            "  threadhop config set observe.enabled false"
+            "  threadhop receive tk_ab12cd34\n"
+            "  threadhop receive ab12cd34\n"
+            "  !threadhop receive tk_ab12cd34   # in the target chat"
         ),
     )
-    config_subparsers = config_p.add_subparsers(
-        dest="config_command",
-        required=True,
-    )
-    config_get_p = config_subparsers.add_parser(
-        "get",
-        help="Print a config value",
-    )
-    config_get_p.add_argument(
-        "key",
-        choices=sorted(CLI_CONFIG_KEYS),
-    )
-    config_set_p = config_subparsers.add_parser(
-        "set",
-        help="Persist a config value",
-    )
-    config_set_p.add_argument(
-        "key",
-        choices=sorted(CLI_CONFIG_KEYS),
-    )
-    config_set_p.add_argument(
-        "value",
-        help="Value to persist (for observe.enabled: true/false).",
-    )
-
-    handoff_p = subparsers.add_parser(
-        "handoff",
-        help="Produce a handoff brief for a session",
-        description=(
-            "Run the observer (first-time or catch-up) followed by the "
-            "reflector, then print a markdown handoff brief composed "
-            "from the per-session observation JSONL. Short observation "
-            "sets format directly; larger sets (or --full) go through "
-            "a Haiku sub-agent for polish. The `/threadhop:handoff` "
-            "skill shells out to this subcommand. Unlike `tag`/`observe`, "
-            "handoff is always about a *different* session than the "
-            "caller's — pass the session id explicitly."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Examples:\n"
-            "  threadhop handoff abc123\n"
-            "  threadhop handoff abc123 --full         # rationale + transcript excerpts\n"
-            "  threadhop handoff abc123 --no-reflect   # debug: skip reflector pass\n"
-            "  /threadhop:handoff abc123               # from inside a Claude Code session"
-        ),
-    )
-    handoff_p.add_argument(
-        "session_id",
-        type=str,
-        help="Session id to hand off (required, positional)",
-    )
-    handoff_p.add_argument(
-        "--full",
-        action="store_true",
-        default=False,
-        help=(
-            "Produce a comprehensive handoff with rationale and "
-            "verbatim transcript excerpts. Always uses the Haiku "
-            "sub-agent regardless of observation count."
-        ),
-    )
-    handoff_p.add_argument(
-        "--no-reflect",
-        action="store_true",
-        default=False,
-        help=(
-            "Skip the reflector pass between observer and brief. "
-            "Defaults off — ADR-022 mandates the reflector runs as a "
-            "follow-up step for on-demand observer invocations. Flag "
-            "is primarily for debugging; production runs should leave "
-            "it disabled."
-        ),
+    receive_p.add_argument(
+        "ticket",
+        metavar="<ticket-id>",
+        help="Ticket id (tk_xxxxxxxx / xxxxxxxx) or path to a ticket file",
     )
 
     update_p = subparsers.add_parser(

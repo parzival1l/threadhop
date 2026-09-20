@@ -25,44 +25,24 @@ Module name: ``copier`` rather than ``copy`` on purpose — pytest and
 any transitive consumer of ``copy.deepcopy`` preload stdlib ``copy``
 into ``sys.modules``, so a project-level ``copy.py`` loses the
 import race. Naming also matches the existing noun-form convention
-(``indexer``, ``observer``, ``reflector``). The CLI subcommand is
-still ``threadhop copy``; only the Python module differs.
+(``indexer``). The CLI subcommand is still ``threadhop copy``; only
+the Python module differs.
 """
 
 from __future__ import annotations
 
 import os
-import re
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 
-from . import indexer
-
-
-# Claude Code surfaces several harness-tooling wrappers as plain-text
-# content inside user JSONL turns: ``!cmd`` passthroughs wrap their input
-# and captured stdout/stderr in ``<bash-input>`` / ``<bash-stdout>`` /
-# ``<bash-stderr>``; each of those chunks is also prefixed with a
-# ``<local-command-caveat>`` telling the assistant not to respond; and
-# slash-command invocations emit ``<command-name>`` / ``<command-message>``
-# / ``<command-args>``. None of this is conversation — it's plumbing the
-# user saw as UI chrome, not as words they typed. Strip on the way out
-# so a pasted transcript reads like a chat, not a shell transcript.
-#
-# Scoped to this module — the indexer, TUI, search, and observer keep
-# seeing the unfiltered bytes so session exploration still shows "you
-# ran `!threadhop tag` here" as context.
-HARNESS_TAG_RE = re.compile(
-    r"<(bash-input|bash-stdout|bash-stderr"
-    r"|local-command-caveat"
-    r"|command-name|command-message|command-args)>"
-    r".*?"
-    r"</\1>",
-    re.DOTALL,
-)
+# The harness-plumbing regex and the cleaned-row pipeline moved to
+# ``exchanges.py`` when the ADR-030 exchange model landed — ``peek`` /
+# ``prepare`` and ``copy`` must render identical text. Re-exported here
+# so existing importers keep working.
+from .exchanges import HARNESS_TAG_RE, iter_clean_rows  # noqa: F401
 
 # Fallback dump location when ``pbcopy`` fails. Matches
 # ``EXPORT_DIR`` in the ``threadhop`` script (threadhop:85) so
@@ -109,28 +89,16 @@ def parse_count_arg(raw: str | None) -> int | None:
 def _iter_rendered_turns(session_path: Path) -> Iterator[tuple[str, str]]:
     """Yield ``(role_label, text)`` pairs in file order.
 
-    Pipeline:
-    1. ``indexer.parse_messages(include_tool_calls=False)`` — merges
-       streaming chunks by ``message.id``, strips system reminders,
-       skips ``toolUseResult`` user lines, drops thinking blocks,
-       *omits* ``tool_use`` blocks entirely (not abbreviated).
-    2. Drop ``is_sidechain`` rows — sub-agent exploration isn't what the
-       human-visible conversation is about.
-    3. Drop rows that reduced to empty text after cleaning.
+    Delegates to ``exchanges.iter_clean_rows`` — the shared pipeline
+    that merges streaming chunks by ``message.id``, strips system
+    reminders, skips ``toolUseResult`` user lines, drops thinking
+    blocks and sidechains, omits ``tool_use`` blocks entirely, and
+    strips ``!cmd`` passthrough wrappers. Rows that collapsed to empty
+    text were already dropped there.
     """
-    for row in indexer.parse_messages(session_path, include_tool_calls=False):
-        if row.get("is_sidechain"):
-            continue
-        text = (row.get("text") or "").strip()
-        # Strip `!cmd` passthrough wrappers. If a turn was *only* bash
-        # tooling (e.g. a bash-stdout echo from a prior `!threadhop copy`
-        # invocation), it collapses to empty here and the turn is dropped
-        # entirely — which is what we want.
-        text = HARNESS_TAG_RE.sub("", text).strip()
-        if not text:
-            continue
+    for row in iter_clean_rows(session_path):
         label = "User" if row["role"] == "user" else "Assistant"
-        yield label, text
+        yield label, row["text"]
 
 
 def build_copy_markdown(

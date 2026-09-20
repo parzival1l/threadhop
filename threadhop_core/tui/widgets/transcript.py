@@ -1,7 +1,7 @@
 """``TranscriptView`` — the main message-list panel for the active session.
 
-Owns selection mode, range mode, find-in-transcript state, observation
-header rendering, and the JSONL → message-widget translation. Mounted by
+Owns selection mode, range mode, find-in-transcript state, and the
+JSONL → message-widget translation. Mounted by
 ``ClaudeSessions.compose`` with id ``transcript-scroll``.
 
 The host App (``ClaudeSessions``) drives loads via ``load_transcript``
@@ -29,7 +29,6 @@ from textual.widgets import ListView
 
 from threadhop_core import indexer
 from threadhop_core.cli.export_cleanup import EXPORT_DIR
-from threadhop_core.storage import db
 
 from ..constants import SYSTEM_REMINDER_RE
 from ..utils import format_msg_clock
@@ -37,7 +36,6 @@ from .find_bar import FindBar
 from .messages import (
     AssistantMessage,
     CommandPill,
-    ObservationInfoHeader,
     ToolMessage,
     UserMessage,
 )
@@ -91,37 +89,6 @@ class TranscriptView(VerticalScroll):
         self._find_query: str = ""
         self._find_matches: list[int] = []
         self._find_current: int = -1
-
-    def _format_observation_header(self, entry_count: int, obs_path: str) -> str:
-        """Return the passive transcript header for observed sessions."""
-        noun = "observation" if entry_count == 1 else "observations"
-        try:
-            display_path = str(Path(obs_path).expanduser())
-            home = str(Path.home())
-            if display_path == home:
-                display_path = "~"
-            elif display_path.startswith(home + os.sep):
-                display_path = "~" + display_path[len(home):]
-        except Exception:
-            display_path = obs_path
-        return f"─── 🗒 {entry_count} {noun} · {display_path} ───"
-
-    def _get_observation_header_text(self, session_id: str) -> str | None:
-        """Look up observation metadata for the current transcript."""
-        try:
-            state = db.get_observation_state(self.app.conn, session_id)
-        except Exception:
-            return None
-
-        if not state:
-            return None
-
-        entry_count = int(state.get("entry_count") or 0)
-        obs_path = str(state.get("obs_path") or "").strip()
-        if entry_count <= 0 or not obs_path:
-            return None
-
-        return self._format_observation_header(entry_count, obs_path)
 
     def _get_message_widgets(self):
         """Return all message widgets in order."""
@@ -503,7 +470,6 @@ class TranscriptView(VerticalScroll):
         self.current_path = session_path
 
         messages = self._parse_messages(session_path)
-        observation_header = self._get_observation_header_text(session_path.stem)
 
         # Remove all existing message widgets (await ensures completion)
         await self._remove_all_messages()
@@ -514,13 +480,6 @@ class TranscriptView(VerticalScroll):
 
         # Build widgets with visual boundaries
         widgets = []
-        if observation_header:
-            widgets.append(
-                ObservationInfoHeader(
-                    observation_header,
-                    classes="observation-info-header",
-                )
-            )
         tool_batch = []
 
         def flush_tools():
