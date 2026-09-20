@@ -4,8 +4,8 @@ Browse coding-agent sessions and carry useful context between them.
 
 The working Python application is preserved in [`legacy/`](legacy/README.md).
 The TypeScript successor currently contains project tooling, a tested
-session-label helper, validated conversation values, and read-only Claude
-transcript parsing. The CLI is the next learning step.
+session-label helper, validated conversation values, and a read-only Claude
+transcript peek CLI.
 
 ## Repository map
 
@@ -30,6 +30,7 @@ npm run typecheck      # Check types without executing code or emitting files
 npm test               # Run the TypeScript tests once
 npm run test:watch     # Re-run tests as you edit
 npm run check          # Typecheck, then run tests
+npm run build          # Compile src/ into ignored dist/
 ```
 
 This is one private ESM package. TypeScript checks only `src/`, `tests/`, and
@@ -40,8 +41,9 @@ included in that dependency. Pure helpers do not need an Effect wrapper.
 Start by reading `src/session-label.ts` and `tests/session-label.test.ts`:
 an optional title is trimmed, with the session ID as the fallback. Local imports
 use `.js` extensions to match Node ESM conventions; TypeScript and Vitest resolve
-them to the corresponding `.ts` source files during development. No build output
-is produced yet.
+them to the corresponding `.ts` source files during development. Typechecking
+does not emit files; the build command emits JavaScript into `dist/`. CLI tests
+rebuild that output on each suite run, including watch mode.
 
 `src/conversation.ts` defines Effect schemas for a session reference, user and
 assistant messages, and a turn. `tests/conversation.test.ts` contains a small
@@ -72,13 +74,28 @@ uv run --with pytest --with rich --with textual --with watchdog --with pydantic 
   python -m pytest -q legacy/tests
 ```
 
-## Next milestone
+## Try TypeScript peek
 
-Build a TypeScript CLI that reads an explicitly supplied Claude Code transcript
-and prints its last main-agent turn. A turn starts with a human prompt and
-continues through its associated last assistant response; tool cycles do not
-start new turns.
+```bash
+npm run --silent cli -- peek tests/fixtures/claude-session.jsonl --last 1
+npm run --silent cli -- peek /path/to/main-session.jsonl --last 3
+```
 
-Claude, Codex, OpenCode, and Cursor remain the intended source scope. Add the
-second source after the first command works. Pi, the new UI, a persistent
-server, and a plugin framework are deferred.
+Peek reads an explicitly supplied Claude Code transcript. A turn starts with a
+human prompt and continues through its associated last assistant response; tool
+cycles do not start new turns. The default is one turn. Tool output, injected
+skill/command text, and marked subagent records are omitted. A prompt waiting
+for a reply is printed as-is.
+
+The executable writes conversation text to stdout and skipped-record diagnostics
+to stderr. Exit codes: `0` for success/help, `1` for unreadable files or no
+main-agent turns, `2` for invalid command arguments. Use `--help` for usage.
+
+This first reader loads one file into memory. It does not discover sessions or
+reconstruct conversation branches. Leading assistant-only output is skipped
+with a diagnostic because it has no human prompt to start a turn. Use a main
+session transcript, not a subagent transcript or another provider's export.
+
+Claude, Codex, OpenCode, and Cursor remain the intended source scope. Only Claude
+is implemented in this CLI so far. Pi, the new UI, a persistent server, and a
+plugin framework are deferred.
