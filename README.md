@@ -86,6 +86,8 @@ human prompt and continues through its associated last assistant response; tool
 cycles do not start new turns. The default is one turn. Tool output, injected
 skill/command text, and marked subagent records are omitted. A prompt waiting
 for a reply is printed as-is.
+An image/document-only prompt is shown as an attachment placeholder so it still
+starts its own turn; attachment contents are not rendered.
 
 The executable writes conversation text to stdout and skipped-record diagnostics
 to stderr. Exit codes: `0` for success/help, `1` for unreadable files or no

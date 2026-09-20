@@ -12,7 +12,7 @@ const Envelope = Schema.Struct({
 const ContentBlock = Schema.Struct({
   type: Schema.String,
   text: Schema.optional(Schema.String),
-});
+}).pipe(Schema.filter((block) => block.type !== "text" || block.text !== undefined));
 const ConversationRecord = Schema.Struct({
   ...Envelope.fields,
   uuid: Schema.NonEmptyTrimmedString,
@@ -105,7 +105,12 @@ export function parseClaudeTranscript(text: string, fallbackSession: SessionRefe
     const prose = typeof content === "string"
       ? content
       : content.filter((block) => block.type === "text").map((block) => block.text ?? "").join("\n\n");
-    const cleaned = cleanText(prose, role);
+    let cleaned = cleanText(prose, role);
+    if (!cleaned && role === "user" && typeof content !== "string" &&
+      content.some((block) => block.type === "image" || block.type === "document")) {
+      cleaned = "[User attachment; content omitted]";
+      report("Non-text user content omitted");
+    }
     if (!cleaned) continue;
 
     if (role === "user") {

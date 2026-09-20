@@ -77,6 +77,16 @@ describe("Claude transcript reading", () => {
     expect(result.diagnostics[0]?.reason).toMatch(/session/i);
   });
 
+  it("reports a text block with no text instead of silently discarding it", () => {
+    const result = parseClaudeTranscript(jsonl(
+      user("u1", "Question"),
+      { type: "assistant", uuid: "bad", message: { content: [{ type: "text" }] } },
+      assistant("a1", "Answer"),
+    ), session);
+    expect(result.diagnostics).toContainEqual({ line: 2, reason: "Invalid conversation record" });
+    expect(result.turns[0]?.responses[0]?.text).toBe("Answer");
+  });
+
   it("preserves a pending prompt, repeated human text, and a fallback session ID", () => {
     const result = parseClaudeTranscript(jsonl(user("u1", "Again"), user("u2", "Again")), session);
     expect(result.turns.map((turn) => turn.prompt.id)).toEqual(["u1", "u2"]);
@@ -88,6 +98,23 @@ describe("Claude transcript reading", () => {
     const result = parseClaudeTranscript(jsonl(assistant("a1", "Resumed output")), session);
     expect(result.turns).toEqual([]);
     expect(result.diagnostics).toHaveLength(1);
+  });
+
+  it.each([true, false])("keeps an attachment-only user turn with reply=%s", (hasReply) => {
+    const records = [
+      user("u1", "First question"), assistant("a1", "First answer"),
+      user("u2", [{ type: "image", source: { type: "base64", data: "omitted" } }]),
+      ...(hasReply ? [assistant("a2", "The image has a cat.")] : []),
+    ];
+    const result = parseClaudeTranscript(jsonl(...records), session);
+    expect(result.turns).toHaveLength(2);
+    expect(result.turns[1]?.prompt.id).toBe("u2");
+    expect(result.turns[1]?.prompt.text).toBe("[User attachment; content omitted]");
+    expect(result.turns[1]?.responses.map((message) => message.text)).toEqual(
+      hasReply ? ["The image has a cat."] : [],
+    );
+    expect(renderTurns(selectLastTurns(result.turns, 1))).not.toContain("First question");
+    expect(result.diagnostics).toContainEqual({ line: 3, reason: "Non-text user content omitted" });
   });
 
   it("fails clearly for an unreadable path", async () => {
